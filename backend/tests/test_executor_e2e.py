@@ -184,7 +184,12 @@ async def test_delivery_workflow_pauses_for_ambiguous_scope_and_resumes_from_che
     assert waiting["clarification"]["status"] == "OPEN"
     assert not any(agent_id == "architect_agent" for agent_id, _ in provider.calls)
 
-    await executor.clarify("run_clarification", {"option": "full_stack_h2"})
+    with pytest.raises(ValueError, match="已更新"):
+        await executor.clarify("run_clarification", {"option": "full_stack_h2", "request_id": "stale"})
+    await executor.clarify("run_clarification", {
+        "option": "full_stack_h2",
+        "request_id": waiting["clarification"]["request_id"],
+    })
     await asyncio.sleep(0.1)
     resumed = repo.get_run("run_clarification")
     assert resumed["status"] == RunStatus.WAITING_APPROVAL.value

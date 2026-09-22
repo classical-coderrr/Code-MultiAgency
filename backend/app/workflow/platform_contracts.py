@@ -36,6 +36,7 @@ class ClarificationRequest(BaseModel):
     options: list[dict[str, Any]] = Field(default_factory=list, max_length=16)
     recommended_default: dict[str, Any] = Field(default_factory=dict)
     prompt_reference: str = ""
+    field_prompts: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
     status: ClarificationStatus = "OPEN"
     created_at: str = Field(default_factory=utc_now)
     answered_at: str | None = None

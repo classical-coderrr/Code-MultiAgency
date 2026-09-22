@@ -374,6 +374,7 @@ const clarificationError = ref('')
 const clarificationRequest = ref<Record<string, any> | null>(null)
 const clarificationOption = ref('full_stack_h2')
 const clarificationEntityInput = ref('')
+const clarificationCustomAnswers = ref<Record<string, string>>({})
 const logsByStep = ref<Record<string, LogItem[]>>({})
 const expandedLogNodeId = ref<string | null>(null)
 const logs = ref<LogItem[]>([
@@ -670,7 +671,15 @@ function setClarificationRequest(request: Record<string, any> | null | undefined
   const previousId = String(clarificationRequest.value?.request_id ?? '')
   clarificationRequest.value = request ?? null
   if (!request) return
-  if (String(request.request_id ?? '') !== previousId) clarificationEntityInput.value = ''
+  if (String(request.request_id ?? '') !== previousId) {
+    clarificationEntityInput.value = ''
+    clarificationCustomAnswers.value = {}
+    for (const prompt of request.field_prompts ?? []) {
+      if (prompt?.field && prompt?.recommended != null) {
+        clarificationCustomAnswers.value[String(prompt.field)] = String(prompt.recommended)
+      }
+    }
+  }
   const options = Array.isArray(request.options) ? request.options : []
   const current = String(clarificationOption.value ?? '')
   const currentExists = options.some((option: any) => String(option?.value ?? '') === current)
@@ -1622,17 +1631,37 @@ async function resolveApproval(decision: 'approve' | 'reject') {
   }
 }
 
+function clarificationFieldPrompt(field: string) {
+  return (clarificationRequest.value?.field_prompts ?? []).find((item: any) => String(item?.field ?? '') === field) ?? { field, label: field, type: 'text' }
+}
+
+function clarificationCustomComplete() {
+  if (clarificationOption.value !== 'custom') return true
+  return (clarificationRequest.value?.unresolved_fields ?? []).every((field: string) => {
+    if (field === 'primary_entity') return Boolean(clarificationEntityInput.value.trim())
+    return Boolean(String(clarificationCustomAnswers.value[field] ?? '').trim())
+  })
+}
+
 async function submitClarification() {
   if (runStatus.value !== 'WAITING_CLARIFICATION' || !runId.value || !clarificationRequest.value) return
   clarificationError.value = ''
-  const answers: Record<string, string> = { option: clarificationOption.value }
-  if (clarificationOption.value === 'custom' && clarificationRequest.value.unresolved_fields?.includes('primary_entity')) {
-    const entity = clarificationEntityInput.value.trim()
-    if (!entity) {
-      clarificationError.value = '请填写你想管理的对象，例如客房（Room）。'
+  const answers: Record<string, any> = {
+    option: clarificationOption.value,
+    request_id: String(clarificationRequest.value.request_id ?? ''),
+  }
+  if (clarificationOption.value === 'custom') {
+    for (const field of clarificationRequest.value.unresolved_fields ?? []) {
+      if (field === 'primary_entity') {
+        answers.primary_entity = clarificationEntityInput.value.trim()
+      } else {
+        answers[field] = clarificationCustomAnswers.value[field]
+      }
+    }
+    if (!clarificationCustomComplete()) {
+      clarificationError.value = '请填写全部待确认项后再继续。'
       return
     }
-    answers.primary_entity = entity
   }
   try {
     const response = await fetch(`${API_BASE}/runs/${runId.value}/clarification`, {
@@ -2374,9 +2403,21 @@ onBeforeUnmount(() => {
             <label class="clarification-modal-field"><span>请选择执行方案</span><select v-model="clarificationOption" class="clarification-select"><option v-for="option in clarificationRequest.options ?? []" :key="String(option.value)" :value="String(option.value)">{{ option.label }}</option></select></label>
             <p v-if="clarificationOption === 'use_recommended' && clarificationRequest.recommended_default?.primary_entity" class="clarification-suggestion">将按你确认的对象“{{ clarificationRequest.recommended_default.primary_entity }}”继续；可切换为自行填写。</p>
             <label v-if="clarificationOption === 'custom' && clarificationRequest.unresolved_fields?.includes('primary_entity')" class="clarification-modal-field"><span>你想管理的对象是什么？</span><input v-model.trim="clarificationEntityInput" class="clarification-input" type="text" autocomplete="off" placeholder="例如：客房、客房（Room）或预订（Booking）" /><small>常见对象可直接写中文；其他对象请附英文名称，例如“预订（Booking）”。</small></label>
+            <template v-if="clarificationOption === 'custom'">
+              <label v-for="field in (clarificationRequest.unresolved_fields ?? []).filter((item: string) => item !== 'primary_entity')" :key="field" class="clarification-modal-field">
+                <span>{{ clarificationFieldPrompt(field).label }}</span>
+                <select v-if="clarificationFieldPrompt(field).type === 'select'" v-model="clarificationCustomAnswers[field]" class="clarification-select">
+                  <option value="" disabled>请选择</option>
+                  <option v-for="option in clarificationFieldPrompt(field).options ?? []" :key="String(option.value)" :value="String(option.value)">{{ option.label }}</option>
+                </select>
+                <textarea v-else-if="clarificationFieldPrompt(field).type === 'textarea'" v-model.trim="clarificationCustomAnswers[field]" class="clarification-input" :placeholder="clarificationFieldPrompt(field).placeholder" rows="3"></textarea>
+                <input v-else v-model.trim="clarificationCustomAnswers[field]" class="clarification-input" type="text" autocomplete="off" :placeholder="clarificationFieldPrompt(field).placeholder" />
+                <small v-if="clarificationFieldPrompt(field).recommended != null">平台建议：{{ clarificationFieldPrompt(field).recommended }}</small>
+              </label>
+            </template>
             <p v-if="clarificationRequest.unresolved_fields?.length" class="clarification-modal-fields">待确认：{{ clarificationRequest.unresolved_fields.join('、') }}</p>
             <p v-if="clarificationError" class="approval-error">{{ clarificationError }}</p>
-            <div class="clarification-modal-actions"><button type="button" class="approve-button" :disabled="!runId || !clarificationOption || (clarificationOption === 'custom' && clarificationRequest.unresolved_fields?.includes('primary_entity') && !clarificationEntityInput.trim())" @click="submitClarification"><Check :size="15" /> 确认并继续</button></div>
+            <div class="clarification-modal-actions"><button type="button" class="approve-button" :disabled="!runId || !clarificationOption || !clarificationCustomComplete()" @click="submitClarification"><Check :size="15" /> 确认并继续</button></div>
           </section>
         </div>
       </Transition>

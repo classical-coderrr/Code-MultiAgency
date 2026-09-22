@@ -591,6 +591,10 @@ class WorkflowExecutor:
             raise ValueError("Clarification is already being resolved")
         if state.requirement_spec is None or not state.clarification_request:
             raise ValueError("需求确认状态不完整，请刷新运行状态后重试。")
+        submitted_request_id = str((answers or {}).get("request_id") or "").strip()
+        current_request_id = str(state.clarification_request.get("request_id") or "").strip()
+        if submitted_request_id and submitted_request_id != current_request_id:
+            raise ValueError("需求确认请求已更新，请刷新后按当前问题重新提交。")
         # Reject an empty/invalid custom answer before scheduling graph resume.
         # Otherwise the HTTP endpoint reports success while the Run fails later.
         self.clarification_service.apply_answer(

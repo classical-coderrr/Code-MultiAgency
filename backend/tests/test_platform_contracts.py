@@ -36,6 +36,46 @@ def test_clarification_answer_becomes_requirement_state_and_blueprint():
     assert blueprint["status"] == "DRAFT"
 
 
+def test_clarification_exposes_recommendation_reference_and_custom_fields():
+    spec = CapabilityRouter().route("开发一个学生管理系统，需要增删改查")
+    service = RequirementClarificationService()
+    _, request = service.assess(spec)
+
+    assert request is not None
+    assert request.prompt_reference
+    assert any(option["value"] == "custom" for option in request.options)
+    prompts = {item["field"]: item for item in request.field_prompts}
+    assert prompts["backend_required"]["type"] == "select"
+    assert prompts["frontend_stack"]["recommended"] == "html"
+    assert prompts["database_mode"]["recommended"] == "h2"
+
+    updated, answered, _ = service.apply_answer(spec, request, {
+        "option": "custom",
+        "backend_required": "true",
+        "frontend_stack": "vue",
+        "database_mode": "h2",
+    })
+
+    assert answered.answers["backend_required"] is True
+    assert updated.backend_required is True
+    assert updated.safe_defaults["frontend_stack"] == "vue"
+
+
+def test_custom_clarification_requires_every_unresolved_field():
+    spec = CapabilityRouter().route("开发一个学生管理系统，需要增删改查")
+    service = RequirementClarificationService()
+    _, request = service.assess(spec)
+    assert request is not None
+
+    try:
+        service.apply_answer(spec, request, {"option": "custom", "frontend_stack": "vue"})
+    except ValueError as exc:
+        assert "backend_required" in str(exc)
+        assert "database_mode" in str(exc)
+    else:
+        raise AssertionError("incomplete custom clarification must fail")
+
+
 def test_clarified_database_boundary_overrides_model_database_suggestion():
     spec = CapabilityRouter().route("开发一个学生信息展示系统")
     service = RequirementClarificationService()

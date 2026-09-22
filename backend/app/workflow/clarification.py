@@ -75,8 +75,10 @@ class RequirementClarificationService:
                     {"value": "full_stack_h2", "label": "保留前后端，使用 H2 进行本地联调"},
                     {"value": "backend_html", "label": "Spring Boot 后端 + HTML 页面"},
                     {"value": "frontend_only", "label": "仅前端，本地数据存储"},
+                    {"value": "custom", "label": "自行填写技术边界"},
                 ],
                 {"backend_required": True, "frontend_stack": "html", "database_mode": "h2"},
+                "请确认是否需要后端、前端技术栈以及数据存储方式；可采用平台推荐，也可逐项自定义。",
             )
         return "CLEAR", None
 
@@ -154,8 +156,70 @@ class RequirementClarificationService:
             payload.update({"backend_required": True, "frontend_stack": "html", "database_mode": payload.get("database_mode") or "h2"})
         elif option == "frontend_only":
             payload.update({"backend_required": False, "frontend_stack": payload.get("frontend_stack") or "html", "database_mode": "none"})
+        elif option == "custom":
+            missing = [
+                field for field in request.unresolved_fields
+                if payload.get(field) is None or str(payload.get(field)).strip() == ""
+            ]
+            if missing:
+                raise ValueError("请补充全部待确认项：" + "、".join(missing))
+        if "backend_required" in payload and not isinstance(payload["backend_required"], bool):
+            normalized_bool = str(payload["backend_required"]).strip().lower()
+            if normalized_bool not in {"true", "false", "1", "0", "yes", "no"}:
+                raise ValueError("backend_required 必须选择需要或不需要后端。")
+            payload["backend_required"] = normalized_bool in {"true", "1", "yes"}
         allowed = set(request.unresolved_fields) | {"option", "mode", "primary_entity"}
         return {key: value for key, value in payload.items() if key in allowed}
+
+    @staticmethod
+    def _field_prompts(fields: list[str], default: dict[str, Any]) -> list[dict[str, Any]]:
+        definitions: dict[str, dict[str, Any]] = {
+            "requirement": {
+                "label": "请补充完整目标、技术栈和期望交付物",
+                "placeholder": "例如：开发酒店客房管理系统，Vue + Spring Boot + H2，支持客房增删改查",
+                "type": "textarea",
+            },
+            "primary_entity": {
+                "label": "你想管理的主要对象是什么？",
+                "placeholder": "例如：客房（Room）、预订（Booking）或订单（Order）",
+                "type": "text",
+            },
+            "backend_required": {
+                "label": "是否需要真实后端 API？",
+                "type": "select",
+                "options": [
+                    {"value": "true", "label": "需要后端"},
+                    {"value": "false", "label": "不需要，仅前端本地存储"},
+                ],
+            },
+            "frontend_stack": {
+                "label": "前端技术栈",
+                "type": "select",
+                "options": [
+                    {"value": "vue", "label": "Vue"},
+                    {"value": "html", "label": "HTML/CSS/JavaScript"},
+                ],
+            },
+            "database_mode": {
+                "label": "数据存储方式",
+                "type": "select",
+                "options": [
+                    {"value": "h2", "label": "H2（平台推荐的本地联调数据库）"},
+                    {"value": "none", "label": "无独立数据库"},
+                ],
+            },
+        }
+        prompts: list[dict[str, Any]] = []
+        for field in fields:
+            item = {"field": field, **definitions.get(field, {
+                "label": field,
+                "placeholder": f"请输入 {field}",
+                "type": "text",
+            })}
+            if field in default:
+                item["recommended"] = default[field]
+            prompts.append(item)
+        return prompts
 
     @staticmethod
     def _request(
@@ -176,4 +240,5 @@ class RequirementClarificationService:
             options=options,
             recommended_default=default,
             prompt_reference=prompt_reference,
+            field_prompts=RequirementClarificationService._field_prompts(fields, default),
         )
