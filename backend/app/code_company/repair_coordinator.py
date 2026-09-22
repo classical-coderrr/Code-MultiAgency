@@ -147,8 +147,17 @@ class RepairCoordinator:
                 result = await validate_target(plan, attempt)
                 progress = self.repair_engine.made_progress(before, result)
             history = list(state.get("history", []))
+            previous_failure_keys = sorted(self.repair_engine.compiler_failure_keys(before))
+            current_failure_keys = sorted(self.repair_engine.compiler_failure_keys(result))
+            resolved_failure_keys = sorted(set(previous_failure_keys) - set(current_failure_keys))
             if history:
-                history[-1] = {**history[-1], "targetGate": "PASSED" if result.passed else "FAILED", "madeProgress": progress}
+                history[-1] = {
+                    **history[-1],
+                    "targetGate": "PASSED" if result.passed else "FAILED",
+                    "madeProgress": progress,
+                    "resolvedFailureKeys": resolved_failure_keys,
+                    "currentFailureKeys": current_failure_keys,
+                }
             no_progress = 0 if progress else int(state.get("no_progress_count", 0)) + 1
             if not progress and reject_candidate:
                 await reject_candidate(plan, attempt)
@@ -157,6 +166,8 @@ class RepairCoordinator:
                 "owners": plan.get("owners", []),
                 "passed": result.passed,
                 "madeProgress": progress,
+                "resolvedFailureKeys": resolved_failure_keys,
+                "currentFailureKeys": current_failure_keys,
                 "stageTransition": (
                     "已通过：" + ("、".join(check.label for check in result.checks if check.status == "passed")[:120]
                                  or "上轮错误已消除")

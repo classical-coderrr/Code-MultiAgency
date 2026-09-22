@@ -215,21 +215,48 @@ class RepairEngine:
             for check in after.checks
         ):
             return False
-        def missing_classes(result: ArtifactValidationResult) -> set[str]:
-            return {
-                symbol
-                for check in result.checks if check.status == "failed"
-                for symbol in re.findall(
-                    r"(?im)^\[ERROR\]\s*(?:symbol\s*:\s*class|符号\s*:\s*类)\s+([A-Za-z_][A-Za-z0-9_]*)",
-                    str(check.output or ""),
-                )
-            }
-
-        old_missing = missing_classes(before)
-        new_missing = missing_classes(after)
-        # A compiler can expose the next missing declaration only after the
-        # previous one is fixed; that is progress even at the same build gate.
-        if (old_missing and not (new_missing & old_missing)
+        old_compiler = cls.compiler_failure_keys(before)
+        new_compiler = cls.compiler_failure_keys(after)
+        # Compilers expose errors progressively.  A newly visible missing
+        # method/type error after the previous concrete defect disappeared is
+        # progress at the same build Gate, so keep the current candidate.
+        if (old_compiler and not (new_compiler & old_compiler)
                 and cls.quality(after)[0] >= cls.quality(before)[0]):
             return True
         return after.passed or cls.quality(after) > cls.quality(before)
+
+    @staticmethod
+    def compiler_failure_keys(validation: ArtifactValidationResult) -> set[str]:
+        """Extract stable compiler defect identities for progressive repair."""
+        keys: set[str] = set()
+        for check in validation.checks:
+            if check.status != "failed":
+                continue
+            output = str(check.output or "").replace("\\", "/")
+            for symbol in re.findall(
+                r"(?im)^\[ERROR\]\s*(?:symbol\s*:\s*class|符号\s*:\s*类)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                output,
+            ):
+                keys.add(f"missing-class:{symbol}")
+            for symbol in re.findall(
+                r"(?im)^\[ERROR\]\s*(?:symbol\s*:\s*method|符号\s*:\s*方法)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                output,
+            ):
+                keys.add(f"missing-method:{symbol}")
+            for constructor in re.findall(
+                r"(?im)(?:constructor|构造函数)\s+([A-Za-z_][A-Za-z0-9_]*)\s+.*?(?:cannot be applied|无法应用)",
+                output,
+            ):
+                keys.add(f"constructor:{constructor}")
+            for source, message in re.findall(
+                r"(?im)^\[ERROR\]\s+([^\r\n]+?\.(?:java|kt)):\[\d+(?:,\d+)?\]\s+([^\r\n]+)",
+                output,
+            ):
+                normalized_message = re.sub(r"\s+", " ", message).strip().lower()
+                if any(marker in normalized_message for marker in (
+                    "incompatible types", "不兼容的类型", "cannot be converted", "无法转换",
+                    "does not override", "未覆盖", "cannot be applied", "无法应用",
+                )):
+                    relative_source = re.sub(r"^.*?/(src/(?:main|test)/)", r"\1", source)
+                    keys.add(f"compiler:{relative_source}:{normalized_message}")
+        return keys

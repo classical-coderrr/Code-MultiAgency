@@ -153,6 +153,7 @@ def test_progressive_repairs_keep_same_candidate_until_full_regression_passes():
     assert outcome.passed and outcome.attempts == 2
     assert discarded == []
     assert any("后端 Maven 测试" in transition for transition in transitions)
+    assert outcome.history[1]["resolvedFailureKeys"] == ["missing-class:ProductNotFoundException"]
 
 
 def test_full_regression_that_breaks_passing_gate_rejects_only_last_round():

@@ -307,6 +307,29 @@ def test_resolving_one_missing_symbol_can_progress_to_next_at_same_build_gate():
     assert not RepairEngine.made_progress(failed_symbol("FirstException"), failed_symbol("FirstException"))
 
 
+def test_progressive_compilation_tracks_missing_methods_and_type_errors():
+    missing_method = ArtifactValidationResult("failed", "compile", ("backend",), (
+        ValidationCheck(
+            "backend-test", "backend", "后端 Maven 测试", "failed", "编译失败",
+            output=(
+                "[ERROR] C:/tmp/src/main/java/app/RoomService.java:[20,15] cannot find symbol\n"
+                "[ERROR]   symbol: method updateRoom()"
+            ),
+        ),
+    ))
+    type_error = ArtifactValidationResult("failed", "compile", ("backend",), (
+        ValidationCheck(
+            "backend-test", "backend", "后端 Maven 测试", "failed", "编译失败",
+            output="[ERROR] C:/tmp/src/main/java/app/RoomService.java:[24,18] incompatible types: String cannot be converted to BigDecimal",
+        ),
+    ))
+
+    assert RepairEngine.compiler_failure_keys(missing_method) == {"missing-method:updateRoom"}
+    assert any(key.startswith("compiler:src/main/java/app/RoomService.java:") for key in RepairEngine.compiler_failure_keys(type_error))
+    assert RepairEngine.made_progress(missing_method, type_error)
+    assert not RepairEngine.made_progress(missing_method, missing_method)
+
+
 def test_repair_context_excludes_unrelated_large_files():
     files = [
         {"name": "pom.xml", "content": "pom", "step_id": "backend"},
