@@ -1344,3 +1344,18 @@ Agent Team 错误分析记录（历史重总结版）
 根因分析：Architecture 返回了描述型技术栈 `Spring Boot + Spring Data JPA + H2` 和 `HTML/CSS/JavaScript，static/index.html，同源 REST`。交付合同没有将它们规范化为平台内部枚举 `springboot` 与 `html`，导致 Blueprint 使用普通 Python 后端的 Ownership，ContractCompiler 不能产生 Spring Boot 文件 DAG；Backend Agent 收到空文件计划后仍被标记成功。验证器随后按静态页面运行，真实 REST 地址自然返回 404。浏览器超时是下游症状，不是单纯的前端刷新问题，也不是模型强度或 Token 不足。
 实际解决步骤：1. 在合同冻结层增加 Backend/Frontend 技术栈规范化，兼容模型返回的描述性名称。2. `DeliveryContract` 自身加入字段规范化，确保其他入口也只能向下游提供稳定枚举。3. ContractCompiler 为 Python 后端补齐确定性文件 DAG，并在 Architecture 冻结前检查所有必需 Agent 必须拥有非空 `file_plan`；空计划直接回退 Architecture，不再生成“0 文件成功”。4. Spring Boot + HTML 现在确定生成 `pom.xml`、Application、Entity、Repository、Service、Controller、application.yml，以及 `src/main/resources/static` 下的前端文件。5. FailureClassifier 识别浏览器日志中的 `/api/...=HTTP 404/405/5xx`，同时归责 Backend 与 Frontend，允许联合修复接口实现、路径和代理，而不是只改表单。6. 增加描述型技术栈、Blueprint Ownership、文件计划和浏览器 API 404 责任路由回归测试。
 验证结果：合同、Blueprint、Artifact、Architecture 和 Repair 专项测试通过；后端全量测试 693 项通过、0 失败、1 项按环境跳过。历史失败 Run 使用的是已经冻结的错误合同，不应只重试 Tester；需要从原始需求创建新 Run，或显式从 Architecture 重新生成合同。
+
+【2026-09-22】* 全链路失败分流仍有盲区，恢复能力扩展后 Executor 再次膨胀
+错误要点：成果物验证后的文件修复已经较成熟，但架构合同、冻结合同、Provider/环境、最终交付压缩包和旧版 FailureFact 的处理口径不统一；部分失败会重试错误 Agent，最终交付缺证据时直接结束，历史 Run 也可能因失败记录字段不同而无法恢复。连续增加恢复逻辑后， WorkflowExecutor 又增长到 3904 行并突破结构守卫。
+根因分析：失败事实缺少统一兼容入口，Retry 仍部分依赖节点状态和错误字符串；Architecture、交付门禁和普通成果物修复各自维护回退逻辑；候选修复缺少足够严格的文件证据、原子提交和责任边界；新增功能继续直接写入 Executor，导致已拆分的调度门面重新承担恢复细节。全量回归还发现：自定义主要实体留空时提示过于泛化，以及冻结合同已损坏时，旧目标推断仍可能把 Backend 暴露成下游修复目标。
+实际解决步骤：
+1. 扩展 Architecture 合同错误分类与有界回边；冻结后的合同缺陷可重新打开、要求再次审批，并使下游成果物与旧验证证据失效。错误指纹重复且无推进时熔断，不能绕过 entity_id 等约束。
+2. Retry 统一读取 FailureFact 决定恢复边界；旧格式失败记录在读取时规范化并保留证据。平台、验证器、环境和 Provider 配置错误不会再盲目改业务代码。
+3. Candidate Workspace 使用结构化文件操作、全包原子提交和 Owner/Ownership 校验；优先使用验证器证据与编译器精确路径定位文件。缺少类、方法、构造器或类型不匹配时允许在同一候选中逐步推进编译 Gate，无推进或破坏已通过 Gate 才撤回。
+4. 跨层 API 与数据库失败支持多责任 Agent；Backend 合同已通过时只修 Frontend。责任 Agent 重放不得修改冻结合同或其他 Owner 文件。
+5. 浏览器验证持久化截图、DOM、Console、Network、表单值和 CRUD 状态；最终交付门禁可有界回修，ZIP 损坏或清单不一致由平台重新物化、打包和复验，不派给代码生成 Agent。
+6. 需求确认改为 Schema 驱动，展示平台推荐、参考提示和用户自定义输入；自定义管理对象为空时给出明确提示并拒绝继续。
+7. 取消流程先持久化取消意图，等待底层任务结束后再写 STOPPED；重复停止保持幂等。运行统计覆盖失败位置、责任方、修复轮次、目标 Gate、完整回归、自动修复率、熔断、耗时和 Token。
+8. 将重试/合同重开/失效清理抽到 run_recovery.py，将证据定位/Owner 重放保护/修复候选选择抽到 artifact_repair_support.py；WorkflowExecutor 从 3904 行降到 2909 行，恢复为编排门面。
+9. 新增企业恢复矩阵，覆盖静态 HTML、localStorage、Spring Boot + HTML、Vue + Spring Boot、双实体 CRUD，以及故意注入的漏 entity_id、漏文件、错误路由和验证器内部故障；所有失败必须保持 Gate=failed，禁止改成 skipped 伪造通过。
+验证结果：定向恢复、Artifact、责任路由、需求确认与结构守卫测试 111 项通过；企业恢复矩阵 12 项通过；后端全量测试 737 项通过、0 失败、1 项按环境跳过；前端 TypeScript 检查和 Vite 生产构建通过。真实云端模型输出质量与第三方服务波动仍需通过实际 Run 持续观察，但失败将保留证据、有限回退并可恢复，不再无限循环或静默改错 Agent。

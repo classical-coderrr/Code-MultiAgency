@@ -87,11 +87,25 @@ class RepairEngine:
         """Return repair owners, not merely validator target labels."""
         owners: list[str] = []
         statuses = {check.id: check.status for check in validation.checks}
+        has_contract_or_platform_defect = any(
+            check.status == "failed"
+            and self.classifier.classify_check(check).defect_scope in {"contract", "platform"}
+            for check in validation.checks
+        )
         for check in validation.checks:
             if check.status != "failed":
                 continue
             classification = self.classifier.classify_check(check)
             if classification.defect_scope in {"contract", "platform"}:
+                continue
+            # Once a frozen contract itself is invalid, cross-layer owner
+            # inference is unsafe. Keep the observed downstream target only
+            # for diagnostics; the repair plan remains blocked until the
+            # Architecture contract is reopened.
+            if has_contract_or_platform_defect:
+                target = str(check.target or "").strip().lower()
+                if target in self._AGENT_OWNERS:
+                    owners.append(target)
                 continue
             # The cross-agent route check is attributed to backend for legacy
             # reporting, but a passing backend contract plus a failing frontend

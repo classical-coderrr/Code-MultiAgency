@@ -162,6 +162,8 @@ class RequirementClarificationService:
                 if payload.get(field) is None or str(payload.get(field)).strip() == ""
             ]
             if missing:
+                if missing == ["primary_entity"]:
+                    raise ValueError("请填写要管理的对象。")
                 raise ValueError("请补充全部待确认项：" + "、".join(missing))
         if "backend_required" in payload and not isinstance(payload["backend_required"], bool):
             normalized_bool = str(payload["backend_required"]).strip().lower()
