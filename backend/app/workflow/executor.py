@@ -1262,39 +1262,191 @@ class WorkflowExecutor:
             archive = None
             if self.artifact_service:
                 archive = await asyncio.to_thread(self.artifact_service.create_archive, state.run_id, strict=True)
-            proof = dict(snapshot.get("artifact_validation") or {})
-            if any(step.type == StepType.APPROVAL for step in state.workflow.steps):
-                proof["checks"] = [*proof.get("checks", []), {"id": "capability-human_approval", "status": "passed" if all(state.results.get(step.id) == StepStatus.SUCCESS for step in state.workflow.steps if step.type == StepType.APPROVAL) else "blocked", "message": "人工审批结果"}]
+            proof = self._delivery_proof(state)
             state.context.set("artifact_validation", proof)
             gate = evaluate_delivery(snapshot, proof, archive)
             state.context.set("delivery_gate", gate)
-            delivery_checks = gate.get("checks") if isinstance(gate, dict) else []
-            if isinstance(delivery_checks, list):
-                delivery_evidence = [evidence_from_check(item, gate="delivery", index=index) for index, item in enumerate(delivery_checks) if isinstance(item, dict)]
-                delivery_failures = [failure_fact_from_check(item, gate="delivery", owner="integration_gate", index=index) for index, item in enumerate(delivery_checks) if isinstance(item, dict) and str(item.get("status")) != "passed"]
-                state.context.set("delivery_evidence", delivery_evidence)
-                current_evidence = state.context.snapshot().get("evidence")
-                all_evidence = [*(current_evidence if isinstance(current_evidence, list) else []), *delivery_evidence]
-                state.context.set("evidence", all_evidence)
-                current_failures = state.context.snapshot().get("failure_facts")
-                all_failures = [*(current_failures if isinstance(current_failures, list) else []), *delivery_failures]
-                state.context.set("failure_facts", all_failures)
-                self.repository.update_run(
-                    state.run_id,
-                    evidence_json=json.dumps(all_evidence, ensure_ascii=False),
-                    failure_facts_json=json.dumps(all_failures, ensure_ascii=False),
-                )
-                await self.event_bus.emit("integration.evidence", state.run_id, {"evidence": delivery_evidence, "failureFacts": delivery_failures})
             if self.artifact_service:
                 await self.artifact_delivery.materialize(state, str(final_report or ""))
                 archive = await asyncio.to_thread(self.artifact_service.create_archive, state.run_id, strict=True)
                 gate = evaluate_delivery(state.context.snapshot(), proof, archive)
                 state.context.set("delivery_gate", gate)
+            if not gate["deliverable"]:
+                gate = await self._attempt_delivery_gate_repair(state, gate, str(final_report or ""))
+            await self._record_delivery_gate_evidence(state, gate)
             await self.event_bus.emit("workflow.delivery_checked", state.run_id, gate)
             if not gate["deliverable"]:
                 await self._finish(state, RunStatus.FAILED, "交付门禁未通过：" + "；".join(gate["missing"]))
                 return
         await self._finish(state, RunStatus.SUCCESS, final_report=final_report)
+
+    @staticmethod
+    def _delivery_proof(state: RunState) -> dict[str, Any]:
+        proof = dict(state.context.snapshot().get("artifact_validation") or {})
+        checks = [item for item in proof.get("checks", []) if isinstance(item, dict)]
+        approval_steps = [step for step in state.workflow.steps if step.type == StepType.APPROVAL]
+        if approval_steps and not any(item.get("id") == "capability-human_approval" for item in checks):
+            checks.append(
+                {
+                    "id": "capability-human_approval",
+                    "status": "passed"
+                    if all(state.results.get(step.id) == StepStatus.SUCCESS for step in approval_steps)
+                    else "blocked",
+                    "message": "人工审批结果",
+                }
+            )
+        proof["checks"] = checks
+        return proof
+
+    async def _attempt_delivery_gate_repair(
+        self,
+        state: RunState,
+        gate: dict[str, Any],
+        final_report: str,
+    ) -> dict[str, Any]:
+        """Re-enter the existing Tester repair loop for late delivery defects.
+
+        A frozen contract defect is intentionally excluded: it must reopen the
+        Architecture contract and obtain human approval instead of asking code
+        Agents to implement around a bad contract.
+        """
+        max_attempts = max(
+            0,
+            min(2, int(state.workflow.meta.get("delivery_repair_attempts", 1) or 0)),
+        )
+        if not max_attempts:
+            return gate
+        missing = {str(item) for item in gate.get("missing", [])}
+        if {"delivery-contract", "delivery-api-contract"} & missing:
+            return gate
+        tester = next(
+            (
+                step
+                for step in state.workflow.steps
+                if step.type == StepType.AGENT
+                and (step.id == "tester" or step.agent_id == "tester_agent")
+                and isinstance(step.validation, dict)
+                and bool(step.validation.get("enabled"))
+            ),
+            None,
+        )
+        if tester is None:
+            return gate
+
+        from .delivery_gate import evaluate_delivery
+
+        previous_missing = sorted(missing)
+        for attempt in range(1, max_attempts + 1):
+            await self.event_bus.emit(
+                "delivery.repair_started",
+                state.run_id,
+                {
+                    "stepId": tester.id,
+                    "repairAttempt": attempt,
+                    "missing": previous_missing,
+                    "reason": "最终交付门禁发现了 Tester 需要重新验证的成果物或证据缺陷",
+                },
+            )
+            state.results[tester.id] = StepStatus.PENDING
+            await self._execute_step(state, tester)
+            if state.results.get(tester.id) != StepStatus.SUCCESS:
+                await self.event_bus.emit(
+                    "delivery.repair_completed",
+                    state.run_id,
+                    {
+                        "stepId": tester.id,
+                        "repairAttempt": attempt,
+                        "passed": False,
+                        "madeProgress": False,
+                        "missing": previous_missing,
+                    },
+                )
+                return gate
+
+            proof = self._delivery_proof(state)
+            state.context.set("artifact_validation", proof)
+            archive = None
+            if self.artifact_service:
+                await self.artifact_delivery.materialize(state, final_report)
+                archive = await asyncio.to_thread(
+                    self.artifact_service.create_archive,
+                    state.run_id,
+                    strict=True,
+                )
+            repaired_gate = evaluate_delivery(state.context.snapshot(), proof, archive)
+            state.context.set("delivery_gate", repaired_gate)
+            repaired_missing = sorted(str(item) for item in repaired_gate.get("missing", []))
+            made_progress = repaired_gate.get("deliverable") or repaired_missing != previous_missing
+            await self.event_bus.emit(
+                "delivery.repair_completed",
+                state.run_id,
+                {
+                    "stepId": tester.id,
+                    "repairAttempt": attempt,
+                    "passed": bool(repaired_gate.get("deliverable")),
+                    "madeProgress": bool(made_progress),
+                    "missing": repaired_missing,
+                },
+            )
+            gate = repaired_gate
+            if repaired_gate.get("deliverable") or not made_progress:
+                return repaired_gate
+            previous_missing = repaired_missing
+        return gate
+
+    async def _record_delivery_gate_evidence(
+        self,
+        state: RunState,
+        gate: dict[str, Any],
+    ) -> None:
+        delivery_checks = gate.get("checks") if isinstance(gate, dict) else []
+        if not isinstance(delivery_checks, list):
+            return
+        delivery_evidence = [
+            evidence_from_check(item, gate="delivery", index=index)
+            for index, item in enumerate(delivery_checks)
+            if isinstance(item, dict)
+        ]
+        delivery_failures = [
+            failure_fact_from_check(item, gate="delivery", owner="integration_gate", index=index)
+            for index, item in enumerate(delivery_checks)
+            if isinstance(item, dict) and str(item.get("status")) != "passed"
+        ]
+        snapshot = state.context.snapshot()
+        current_evidence = snapshot.get("evidence")
+        non_delivery_evidence = [
+            item
+            for item in (current_evidence if isinstance(current_evidence, list) else [])
+            if not isinstance(item, dict) or str(item.get("gate") or "") != "delivery"
+        ]
+        all_evidence = [*non_delivery_evidence, *delivery_evidence]
+        state.context.set("delivery_evidence", delivery_evidence)
+        state.context.set("evidence", all_evidence)
+
+        current_failures = snapshot.get("failure_facts")
+        historical_failures = [
+            item for item in (current_failures if isinstance(current_failures, list) else [])
+            if isinstance(item, dict)
+        ]
+        current_failure_ids = {str(item.get("failure_id") or "") for item in delivery_failures}
+        retained_failures: list[dict[str, Any]] = []
+        for item in historical_failures:
+            if str(item.get("gate") or "") != "delivery":
+                retained_failures.append(item)
+            elif str(item.get("failure_id") or "") not in current_failure_ids:
+                retained_failures.append({**item, "resolved": True})
+        all_failures = [*retained_failures, *delivery_failures]
+        state.context.set("failure_facts", all_failures)
+        self.repository.update_run(
+            state.run_id,
+            evidence_json=json.dumps(all_evidence, ensure_ascii=False),
+            failure_facts_json=json.dumps(all_failures, ensure_ascii=False),
+        )
+        await self.event_bus.emit(
+            "integration.evidence",
+            state.run_id,
+            {"evidence": delivery_evidence, "failureFacts": delivery_failures},
+        )
 
     async def _resume_graph(self, state: RunState, decision: Any) -> None:
         try:

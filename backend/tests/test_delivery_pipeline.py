@@ -221,6 +221,53 @@ def test_all_agents_success_cannot_hide_missing_page_or_asset_gate(pipeline, mod
     assert delivery.archive.is_file()
 
 
+def test_late_delivery_gate_reenters_tester_before_failing(pipeline, monkeypatch):
+    delivery = pipeline("static")
+    valid_proof = copy.deepcopy(delivery.context["artifact_validation"])
+    stale_proof = copy.deepcopy(valid_proof)
+    stale_proof["checks"] = [
+        item for item in stale_proof["checks"] if item["id"] != "frontend-page-assets"
+    ]
+    delivery.state.context.set("artifact_validation", stale_proof)
+    tester = StepDefinition(
+        "tester",
+        agent_id="tester_agent",
+        validation={"enabled": True, "repair_attempts": 1},
+    )
+    delivery.state.workflow.steps.append(tester)
+    delivery.state.results[tester.id] = StepStatus.SUCCESS
+    delivery.repository.upsert_step(
+        delivery.state.run_id,
+        tester.id,
+        agent_id=tester.agent_id,
+        status=StepStatus.SUCCESS.value,
+    )
+    calls = []
+
+    async def replay_tester(state, step):
+        calls.append(step.id)
+        state.context.set("artifact_validation", copy.deepcopy(valid_proof))
+        state.results[step.id] = StepStatus.SUCCESS
+        delivery.repository.upsert_step(
+            state.run_id,
+            step.id,
+            agent_id=step.agent_id,
+            status=StepStatus.SUCCESS.value,
+        )
+
+    monkeypatch.setattr(delivery.executor, "_execute_step", replay_tester)
+
+    run = delivery.finalize()
+
+    _assert_final(delivery, run, RunStatus.SUCCESS, "passed")
+    assert calls == ["tester"]
+    events = delivery.repository.list_events(delivery.state.run_id)
+    assert [event["type"] for event in events if event["type"].startswith("delivery.repair_")] == [
+        "delivery.repair_started",
+        "delivery.repair_completed",
+    ]
+
+
 @pytest.mark.parametrize("mutation", ["content", "name", "addition"])
 def test_final_graph_result_cannot_modify_validated_source_and_still_succeed(pipeline, mutation):
     delivery = pipeline("static")

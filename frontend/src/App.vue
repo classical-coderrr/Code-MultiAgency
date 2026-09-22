@@ -1437,6 +1437,12 @@ function handleEvent(event: Record<string, any>) {
   if (type === 'workflow.delivery_checked') {
     addLog(payload.deliverable ? '交付门禁已通过 · 已验证源码与 ZIP 一致' : '交付门禁未通过', 'workflow', payload.deliverable ? 'success' : 'failed', undefined, JSON.stringify(payload.checks, null, 2))
   }
+  if (type === 'delivery.repair_started') {
+    addLog('最终交付门禁正在回修', 'workflow', 'waiting', String(payload.stepId ?? 'tester'), `第 ${Number(payload.repairAttempt ?? 1)} 轮 · 缺失：${(payload.missing ?? []).join('、') || '验证证据'}`)
+  }
+  if (type === 'delivery.repair_completed') {
+    addLog(payload.passed ? '最终交付门禁回修通过' : '最终交付门禁回修未通过', 'workflow', payload.passed ? 'success' : 'failed', String(payload.stepId ?? 'tester'), `第 ${Number(payload.repairAttempt ?? 1)} 轮 · ${payload.madeProgress ? '验证状态已推进' : '验证状态未推进'}`)
+  }
   if (type === 'workflow.failed') {
     if (payload.durationMs != null) syncRunDuration(Number(payload.durationMs))
     else syncRunDuration(liveDurationMs.value)
@@ -1473,6 +1479,7 @@ async function connectToRun(id: string) {
   eventTypes.push('workflow.contract_validated', 'workflow.contract_frozen', 'workflow.contract_reopened', 'workflow.delivery_checked', 'workflow.clarification_required', 'workflow.clarification_answered', 'workflow.blueprint_created', 'workflow.blueprint_frozen', 'validation.evidence', 'integration.evidence')
   eventTypes.push('repair.routed', 'repair.round_started', 'repair.target_gate_completed', 'repair.full_regression_completed', 'repair.completed', 'repair.candidate_created', 'repair.candidate_promoted', 'repair.candidate_discarded', 'repair.circuit_open', 'repair.escalated', 'step.validation_stage_started', 'step.validation_stage_completed', 'step.validation_short_circuited', 'step.validation_missing_declaration')
   eventTypes.push('architecture.contract_failed', 'architecture.repair_started', 'architecture.repair_rejected', 'architecture.target_gate_completed', 'architecture.repair_circuit_open')
+  eventTypes.push('delivery.repair_started', 'delivery.repair_completed')
   eventTypes.push('collaboration.started', 'collaboration.message', 'collaboration.completed', 'collaboration.unavailable')
   eventTypes.push('worker.lease_acquired', 'worker.lease_released', 'worker.lease_lost', 'worker.execution_error', 'worker.control_applied', 'worker.control_rejected')
   eventTypes.forEach((eventType) => source.addEventListener(eventType, (message) => {
