@@ -703,15 +703,17 @@ def _run_metrics(
         "step.retrying", "step.continuing", "step.repairing", "step.artifact_repairing",
         "step.artifact_continuing", "step.validation_repairing", "step.validation_owner_reexecuting",
         "step.repaired", "step.artifact_plan_fallback", "repair.round_started", "workflow.recovered",
-        "architecture.repair_started",
+        "architecture.repair_started", "delivery.repair_started", "delivery.archive_rebuild_started",
     }
     repair_rounds = {
         (str(payload.get("stepId") or "tester"), _non_negative_int(payload.get("repairAttempt")))
         for event_type, payload in decoded_events
-        if event_type in {"repair.round_started", "architecture.repair_started"} and _non_negative_int(payload.get("repairAttempt")) > 0
+        if event_type in {"repair.round_started", "architecture.repair_started", "delivery.repair_started"}
+        and _non_negative_int(payload.get("repairAttempt")) > 0
     }
     repair_completions = [
-        payload for event_type, payload in decoded_events if event_type == "repair.completed"
+        payload for event_type, payload in decoded_events
+        if event_type in {"repair.completed", "delivery.repair_completed", "delivery.archive_rebuild_completed"}
     ]
     architecture_attempted = any(event_type == "architecture.repair_started" for event_type, _ in decoded_events)
     if architecture_attempted:
@@ -758,6 +760,10 @@ def _run_metrics(
         "repair.full_regression_completed": "完整回归已验证",
         "repair.completed": "自动修复已结束",
         "repair.circuit_open": "无进展熔断",
+        "delivery.repair_started": "交付门禁整改中",
+        "delivery.repair_completed": "交付门禁已验证",
+        "delivery.archive_rebuild_started": "交付压缩包重建中",
+        "delivery.archive_rebuild_completed": "交付压缩包已验证",
     }
     repair_trace: dict[str, dict[str, Any]] = {}
     for event_type, payload in decoded_events:
@@ -770,8 +776,11 @@ def _run_metrics(
             continue
         if event_type not in trace_status:
             continue
-        step_id = str(payload.get("stepId") or ("architecture" if event_type.startswith("architecture.") else "tester"))
+        default_step = "architecture" if event_type.startswith("architecture.") else "platform" if event_type.startswith("delivery.archive_") else "tester"
+        step_id = str(payload.get("stepId") or default_step)
         attempt = _non_negative_int(payload.get("repairAttempt") or payload.get("attempt") or payload.get("attempts"))
+        if event_type.startswith("delivery.archive_"):
+            attempt = 1
         key = f"{step_id}:{attempt}"
         if event_type == "architecture.target_gate_completed" and attempt == 0 and key not in repair_trace:
             continue
@@ -791,12 +800,15 @@ def _run_metrics(
         if isinstance(files, list) and files:
             row["files"] = [str(name) for name in files]
         row["status"] = trace_status[event_type]
-        if event_type in {"architecture.target_gate_completed", "repair.target_gate_completed", "repair.full_regression_completed", "repair.completed"}:
+        if event_type in {"architecture.target_gate_completed", "repair.target_gate_completed", "repair.full_regression_completed", "repair.completed", "delivery.repair_completed", "delivery.archive_rebuild_completed"}:
             row["status"] = ("目标 Gate 通过" if event_type.endswith("target_gate_completed") else
                              "完整回归通过" if event_type == "repair.full_regression_completed" else
+                             "交付门禁通过" if event_type == "delivery.repair_completed" else
+                             "压缩包重建通过" if event_type == "delivery.archive_rebuild_completed" else
                              "自动修复完成" if event_type == "repair.completed" else row["status"]) if payload.get("passed") else row["status"]
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-        row["result"] = str(result.get("summary") or payload.get("reason") or fact.get("summary") or row["result"])
+        missing = payload.get("missing") if isinstance(payload.get("missing"), list) else []
+        row["result"] = str(result.get("summary") or payload.get("reason") or fact.get("summary") or (f"仍缺少：{'、'.join(map(str, missing))}" if missing else "") or row["result"])
 
     return {
         "active_duration_ms": max(0, wall_duration_ms - approval_duration_ms),

@@ -238,3 +238,26 @@ def test_architecture_backedge_contributes_to_repair_metrics() -> None:
     repository.append_event("architecture-metrics", "architecture.repair_circuit_open", "2026-09-14T00:00:04+00:00",
                             {"stepId": "architecture", "repairAttempt": 2})
     assert repository.get_run("architecture-metrics")["repair_metrics"]["circuit_breaks"] == 1
+
+
+def test_delivery_repairs_and_archive_rebuilds_are_visible_in_run_metrics() -> None:
+    repository = SQLiteRepository(":memory:")
+    repository.create_run("delivery-metrics", "software-development", {"requirement": "build"},
+                          "RUNNING", "2026-09-14T00:00:00+00:00")
+    repository.append_event("delivery-metrics", "delivery.archive_rebuild_started", "2026-09-14T00:00:01+00:00",
+                            {"owner": "platform", "missing": ["delivery-archive"]})
+    repository.append_event("delivery-metrics", "delivery.archive_rebuild_completed", "2026-09-14T00:00:02+00:00",
+                            {"owner": "platform", "passed": True, "missing": []})
+    repository.append_event("delivery-metrics", "delivery.repair_started", "2026-09-14T00:00:03+00:00",
+                            {"stepId": "tester", "repairAttempt": 1, "missing": ["browser-evidence"]})
+    repository.append_event("delivery-metrics", "delivery.repair_completed", "2026-09-14T00:00:04+00:00",
+                            {"stepId": "tester", "repairAttempt": 1, "passed": True, "missing": []})
+
+    result = repository.get_run("delivery-metrics")
+
+    assert result["repair_metrics"]["repair_rounds"] == 1
+    assert result["repair_metrics"]["successful_repairs"] == 2
+    assert result["repair_metrics"]["automatic_repair_rate"] == 1.0
+    traces = {(row["step_id"], row["status"]) for row in result["repair_trace"]}
+    assert ("platform", "压缩包重建通过") in traces
+    assert ("tester", "交付门禁通过") in traces

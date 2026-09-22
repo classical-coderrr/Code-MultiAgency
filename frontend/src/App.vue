@@ -655,6 +655,20 @@ function upsertRepairTrace(stepId: string, payload: Record<string, any>, status:
   }
   if (existing) Object.assign(existing, value)
   else runStats.repairTrace.push(value)
+  recalculateLiveRepairMetrics()
+}
+
+function recalculateLiveRepairMetrics() {
+  const attempted = runStats.repairTrace.filter((item) => item.attempt > 0)
+  const successful = attempted.filter((item) => /通过|完成|已提交/.test(item.status))
+  const circuits = runStats.repairTrace.filter((item) => item.status.includes('熔断'))
+  runStats.repair.firstPass = runStats.repairTrace.length === 0 && runStatus.value === 'SUCCESS'
+  runStats.repair.repairRounds = new Set(attempted.map((item) => item.key)).size
+  runStats.repair.successfulRepairs = successful.length
+  runStats.repair.circuitBreaks = circuits.length
+  const completed = Math.max(successful.length + circuits.length, attempted.length ? 1 : 0)
+  runStats.repair.automaticRepairRate = completed ? successful.length / completed : 0
+  runStats.repair.averageRepairRounds = completed ? attempted.length / completed : 0
 }
 
 function now() {
@@ -1234,7 +1248,10 @@ function handleEvent(event: Record<string, any>) {
     } else if (type === 'step.validation_check') {
       const check = payload.check ?? {}
       const tone = check.status === 'passed' ? 'success' : check.status === 'blocked' ? 'waiting' : 'failed'
-      addLog(`${stepId} · ${String(check.label ?? '验证检查')} · ${check.status === 'passed' ? '通过' : check.status === 'blocked' ? '阻塞' : '失败'}`, 'step', tone, stepId, `${String(check.message ?? '')}${check.command ? ` · ${String(check.command)}` : ''}${check.output ? `\n${String(check.output)}` : ''}`)
+      const evidence = check.evidence ?? {}
+      const screenshots = Array.isArray(evidence.screenshotPaths) ? evidence.screenshotPaths.map(String) : evidence.screenshotPath ? [String(evidence.screenshotPath)] : []
+      const evidenceDetail = screenshots.length ? `\n浏览器证据：${screenshots.join('、')}` : ''
+      addLog(`${stepId} · ${String(check.label ?? '验证检查')} · ${check.status === 'passed' ? '通过' : check.status === 'blocked' ? '阻塞' : '失败'}`, 'step', tone, stepId, `${String(check.message ?? '')}${check.command ? ` · ${String(check.command)}` : ''}${check.output ? `\n${String(check.output)}` : ''}${evidenceDetail}`)
     } else if (type === 'step.validation_repairing') {
       addLog(`${stepId} 正在定点修复成果物`, 'step', 'waiting', stepId, `目标：${String(payload.target ?? '')} · 文件：${String(payload.fileName ?? '')} · 第 ${Number(payload.repairAttempt ?? 1)} 轮 · 上限：${Number(payload.maxTokens ?? 0)} Token`)
     } else if (type === 'step.validation_repair_dispatched') {
@@ -1447,10 +1464,20 @@ function handleEvent(event: Record<string, any>) {
     addLog(payload.deliverable ? '交付门禁已通过 · 已验证源码与 ZIP 一致' : '交付门禁未通过', 'workflow', payload.deliverable ? 'success' : 'failed', undefined, JSON.stringify(payload.checks, null, 2))
   }
   if (type === 'delivery.repair_started') {
+    upsertRepairTrace(String(payload.stepId ?? 'tester'), payload, '交付门禁整改中', String(payload.reason ?? ''))
     addLog('最终交付门禁正在回修', 'workflow', 'waiting', String(payload.stepId ?? 'tester'), `第 ${Number(payload.repairAttempt ?? 1)} 轮 · 缺失：${(payload.missing ?? []).join('、') || '验证证据'}`)
   }
   if (type === 'delivery.repair_completed') {
+    upsertRepairTrace(String(payload.stepId ?? 'tester'), payload, payload.passed ? '交付门禁通过' : '交付门禁未通过', `${payload.madeProgress ? '验证状态已推进' : '验证状态未推进'}${Array.isArray(payload.missing) && payload.missing.length ? ` · 仍缺少：${payload.missing.join('、')}` : ''}`)
     addLog(payload.passed ? '最终交付门禁回修通过' : '最终交付门禁回修未通过', 'workflow', payload.passed ? 'success' : 'failed', String(payload.stepId ?? 'tester'), `第 ${Number(payload.repairAttempt ?? 1)} 轮 · ${payload.madeProgress ? '验证状态已推进' : '验证状态未推进'}`)
+  }
+  if (type === 'delivery.archive_rebuild_started') {
+    upsertRepairTrace('platform', { ...payload, repairAttempt: 1 }, '交付压缩包重建中', '平台正在重新打包并核对文件清单')
+    addLog('交付压缩包不一致 · 平台正在重新打包', 'workflow', 'waiting', undefined, `缺失：${(payload.missing ?? []).join('、') || '压缩包校验信息'}`)
+  }
+  if (type === 'delivery.archive_rebuild_completed') {
+    upsertRepairTrace('platform', { ...payload, repairAttempt: 1 }, payload.passed ? '压缩包重建通过' : '压缩包重建未通过', Array.isArray(payload.missing) && payload.missing.length ? `仍缺少：${payload.missing.join('、')}` : '源码与 ZIP 清单一致')
+    addLog(payload.passed ? '交付压缩包已重建并通过校验' : '交付压缩包重建后仍未通过', 'workflow', payload.passed ? 'success' : 'failed')
   }
   if (type === 'workflow.failed') {
     if (payload.durationMs != null) syncRunDuration(Number(payload.durationMs))
@@ -1468,6 +1495,9 @@ function handleEvent(event: Record<string, any>) {
     clearActiveRun()
     addLog(`工作流已由操作员停止 · ${liveDuration.value}`, 'workflow', 'failed')
   }
+  if (type === 'workflow.cancelling') {
+    addLog('正在安全停止工作流 · 等待底层请求退出', 'workflow', 'waiting')
+  }
 }
 
 async function connectToRun(id: string) {
@@ -1484,11 +1514,11 @@ async function connectToRun(id: string) {
     }
   }
   source.onmessage = parseEventMessage
-  const eventTypes = ['workflow.started', 'workflow.queued', 'workflow.recovered', 'workflow.recovery_exhausted', 'workflow.requirement_routed', 'workflow.budget_planned', 'workflow.policy_decided', 'step.started', 'step.completed', 'step.failed', 'step.retrying', 'step.continuing', 'step.repairing', 'step.repaired', 'step.coding_loop_completed', 'coding_loop.iteration_started', 'coding_loop.iteration_completed', 'coding_loop.tool_result', 'step.artifact_plan_recovering', 'step.artifact_plan_fallback', 'step.artifact_planned', 'step.artifact_split_planned', 'step.artifact_generating', 'step.artifact_repairing', 'step.artifact_continuing', 'step.artifact_validated', 'step.artifact_dependency_normalized', 'step.validation_started', 'step.validation_check', 'step.validation_repairing', 'step.validation_repaired', 'step.validation_owner_reexecuting', 'step.validation_candidate_rejected', 'step.validation_no_progress', 'step.validation_repair_failed', 'step.validation_repair_skipped', 'step.validation_succeeded', 'step.validation_failed', 'step.budget_planned', 'step.context_packed', 'step.budget_adjusted', 'step.runtime_adjusted', 'step.skills_resolved', 'step.skipped', 'step.waiting_approval', 'step.waiting_clarification', 'workflow.waiting_approval', 'artifact.created', 'artifact.failed', 'workflow.completed', 'workflow.failed', 'workflow.stopped']
+  const eventTypes = ['workflow.started', 'workflow.queued', 'workflow.recovered', 'workflow.recovery_exhausted', 'workflow.requirement_routed', 'workflow.budget_planned', 'workflow.policy_decided', 'step.started', 'step.completed', 'step.failed', 'step.retrying', 'step.continuing', 'step.repairing', 'step.repaired', 'step.coding_loop_completed', 'coding_loop.iteration_started', 'coding_loop.iteration_completed', 'coding_loop.tool_result', 'step.artifact_plan_recovering', 'step.artifact_plan_fallback', 'step.artifact_planned', 'step.artifact_split_planned', 'step.artifact_generating', 'step.artifact_repairing', 'step.artifact_continuing', 'step.artifact_validated', 'step.artifact_dependency_normalized', 'step.validation_started', 'step.validation_check', 'step.validation_repairing', 'step.validation_repair_dispatched', 'step.validation_repaired', 'step.validation_owner_reexecuting', 'step.validation_candidate_rejected', 'step.validation_no_progress', 'step.validation_repair_failed', 'step.validation_repair_skipped', 'step.validation_succeeded', 'step.validation_failed', 'step.budget_planned', 'step.context_packed', 'step.budget_adjusted', 'step.runtime_adjusted', 'step.skills_resolved', 'step.skipped', 'step.waiting_approval', 'step.waiting_clarification', 'workflow.waiting_approval', 'artifact.created', 'artifact.failed', 'workflow.completed', 'workflow.failed', 'workflow.cancelling', 'workflow.stopped']
   eventTypes.push('workflow.contract_validated', 'workflow.contract_frozen', 'workflow.contract_reopened', 'workflow.delivery_checked', 'workflow.clarification_required', 'workflow.clarification_answered', 'workflow.blueprint_created', 'workflow.blueprint_frozen', 'validation.evidence', 'integration.evidence')
   eventTypes.push('repair.routed', 'repair.round_started', 'repair.target_gate_completed', 'repair.full_regression_completed', 'repair.completed', 'repair.candidate_created', 'repair.candidate_promoted', 'repair.candidate_discarded', 'repair.circuit_open', 'repair.escalated', 'step.validation_stage_started', 'step.validation_stage_completed', 'step.validation_short_circuited', 'step.validation_missing_declaration')
   eventTypes.push('architecture.contract_failed', 'architecture.repair_started', 'architecture.repair_rejected', 'architecture.target_gate_completed', 'architecture.repair_circuit_open')
-  eventTypes.push('delivery.repair_started', 'delivery.repair_completed')
+  eventTypes.push('delivery.repair_started', 'delivery.repair_completed', 'delivery.archive_rebuild_started', 'delivery.archive_rebuild_completed')
   eventTypes.push('collaboration.started', 'collaboration.message', 'collaboration.completed', 'collaboration.unavailable')
   eventTypes.push('worker.lease_acquired', 'worker.lease_released', 'worker.lease_lost', 'worker.execution_error', 'worker.control_applied', 'worker.control_rejected')
   eventTypes.forEach((eventType) => source.addEventListener(eventType, (message) => {
