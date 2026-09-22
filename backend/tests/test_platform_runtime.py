@@ -95,6 +95,77 @@ def test_tool_gateway_output_limit_is_enforced(tmp_path: Path) -> None:
     assert len(result.output.encode("utf-8")) <= 10
 
 
+def test_tool_gateway_supports_structured_file_lifecycle(tmp_path: Path) -> None:
+    service = LocalWorkspaceService(tmp_path / "workspaces")
+    workspace = service.create_for_run("run_file_ops")
+    root = Path(workspace.worktree_path)
+    gateway = CodeCompanyRuntime(service).tool_gateway
+
+    created = gateway.execute(
+        workspace,
+        ToolCall("fs.create", {"path": "src/draft.txt", "content": "draft\n"}),
+    )
+    assert created.success is True
+    assert created.metadata["operation"] == "create"
+    assert created.metadata["beforeSha256"] is None
+    assert created.metadata["afterSha256"]
+
+    moved = gateway.execute(
+        workspace,
+        ToolCall(
+            "fs.move",
+            {"path": "src/draft.txt", "destination": "src/generated/final.txt"},
+        ),
+    )
+    assert moved.success is True
+    assert moved.metadata["source"] == "src/draft.txt"
+    assert moved.metadata["destination"] == "src/generated/final.txt"
+    assert not (root / "src" / "draft.txt").exists()
+    assert (root / "src" / "generated" / "final.txt").read_text(encoding="utf-8") == "draft\n"
+
+    renamed = gateway.execute(
+        workspace,
+        ToolCall(
+            "fs.rename",
+            {"path": "src/generated/final.txt", "destination": "src/generated/result.txt"},
+        ),
+    )
+    assert renamed.success is True
+    assert renamed.metadata["operation"] == "rename"
+
+    collision = gateway.execute(
+        workspace,
+        ToolCall("fs.create", {"path": "src/generated/result.txt", "content": "duplicate"}),
+    )
+    assert collision.success is False
+
+    deleted = gateway.execute(
+        workspace,
+        ToolCall("fs.delete", {"path": "src/generated/result.txt"}),
+    )
+    assert deleted.success is True
+    assert deleted.metadata["operation"] == "delete"
+    assert deleted.metadata["beforeSha256"] == renamed.metadata["sha256"]
+    assert not (root / "src" / "generated" / "result.txt").exists()
+
+
+def test_tool_gateway_move_checks_destination_policy(tmp_path: Path) -> None:
+    service = LocalWorkspaceService(tmp_path / "workspaces")
+    workspace = service.create_for_run("run_move_policy")
+    root = Path(workspace.worktree_path)
+    (root / "safe.txt").write_text("safe", encoding="utf-8")
+    gateway = CodeCompanyRuntime(service).tool_gateway
+
+    result = gateway.execute(
+        workspace,
+        ToolCall("fs.move", {"path": "safe.txt", "destination": ".env"}),
+    )
+
+    assert result.success is False
+    assert (root / "safe.txt").is_file()
+    assert not (root / ".env").exists()
+
+
 def test_existing_repo_is_copied_and_indexed_without_sensitive_files(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

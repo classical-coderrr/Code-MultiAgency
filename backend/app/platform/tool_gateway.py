@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -65,6 +66,7 @@ class ToolPolicy:
     def coding_default(cls) -> "ToolPolicy":
         return cls(allowed_tools=frozenset({
             "repo.tree", "repo.search", "repo.read", "fs.create", "fs.write", "fs.patch", "fs.delete",
+            "fs.rename", "fs.move",
             "shell.execute", "build.run", "test.run", "git.status", "git.diff", "git.log",
         }))
 
@@ -114,7 +116,7 @@ class LocalToolGateway:
                 result = self._bounded(call.tool, self._read(workspace, call.arguments))
             elif call.tool.startswith("git."):
                 result = self._bounded(call.tool, self._git(workspace, call.tool))
-            elif call.tool in {"fs.create", "fs.write", "fs.patch", "fs.delete"}:
+            elif call.tool in {"fs.create", "fs.write", "fs.patch", "fs.delete", "fs.rename", "fs.move"}:
                 result = self._fs(workspace, call)
             elif call.tool in {"shell.execute", "build.run", "test.run"}:
                 result = self._command(workspace, call)
@@ -200,8 +202,20 @@ class LocalToolGateway:
                 raise ValueError("file exceeds Tool Gateway size limit")
             if call.tool == "fs.create" and path.exists():
                 raise FileExistsError(relative)
+            previous_hash = self._file_sha256(path) if path.is_file() else None
             self._atomic_write(path, content)
-            return ToolResult(call.tool, True, output=relative, metadata={"bytes": len(content.encode("utf-8"))})
+            return ToolResult(
+                call.tool,
+                True,
+                output=relative,
+                metadata={
+                    "operation": "create" if call.tool == "fs.create" else "update",
+                    "path": relative,
+                    "bytes": len(content.encode("utf-8")),
+                    "beforeSha256": previous_hash,
+                    "afterSha256": self._file_sha256(path),
+                },
+            )
         if call.tool == "fs.patch":
             old_text = call.arguments.get("old_text")
             new_text = call.arguments.get("new_text")
@@ -213,14 +227,65 @@ class LocalToolGateway:
             updated = current.replace(old_text, new_text, 1 if not call.arguments.get("replace_all") else -1)
             if len(updated.encode("utf-8")) > self.policy.max_file_bytes:
                 raise ValueError("patched file exceeds Tool Gateway size limit")
+            previous_hash = self._file_sha256(path)
             self._atomic_write(path, updated)
-            return ToolResult(call.tool, True, output=relative, metadata={"changed": updated != current})
+            return ToolResult(
+                call.tool,
+                True,
+                output=relative,
+                metadata={
+                    "operation": "update",
+                    "path": relative,
+                    "changed": updated != current,
+                    "beforeSha256": previous_hash,
+                    "afterSha256": self._file_sha256(path),
+                },
+            )
+        if call.tool in {"fs.rename", "fs.move"}:
+            destination_relative = str(call.arguments.get("destination") or "")
+            if not destination_relative:
+                raise ValueError(f"{call.tool} requires destination")
+            destination = self._path(workspace, destination_relative)
+            if not path.exists():
+                raise FileNotFoundError(relative)
+            if not path.is_file():
+                raise IsADirectoryError(relative)
+            if destination.exists() and not bool(call.arguments.get("overwrite")):
+                raise FileExistsError(destination_relative)
+            if destination.exists() and not destination.is_file():
+                raise IsADirectoryError(destination_relative)
+            digest = self._file_sha256(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, destination)
+            return ToolResult(
+                call.tool,
+                True,
+                output=destination_relative,
+                metadata={
+                    "operation": "rename" if call.tool == "fs.rename" else "move",
+                    "source": relative,
+                    "destination": destination_relative,
+                    "sha256": digest,
+                },
+            )
         if not path.exists():
             raise FileNotFoundError(relative)
         if path.is_dir():
             raise IsADirectoryError(relative)
+        size_bytes = path.stat().st_size
+        digest = self._file_sha256(path)
         path.unlink()
-        return ToolResult(call.tool, True, output=relative)
+        return ToolResult(
+            call.tool,
+            True,
+            output=relative,
+            metadata={
+                "operation": "delete",
+                "path": relative,
+                "bytes": size_bytes,
+                "beforeSha256": digest,
+            },
+        )
 
     def _command(self, workspace: WorkspaceRef | dict[str, Any], call: ToolCall) -> ToolResult:
         command = self._command_argv(call)
@@ -267,6 +332,16 @@ class LocalToolGateway:
         except Exception:
             Path(temp_name).unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _bounded(self, tool: str, output: str) -> ToolResult:
         encoded = output.encode("utf-8")

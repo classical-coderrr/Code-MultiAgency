@@ -103,7 +103,7 @@ class CodingAgentLoop:
     def _system_prompt() -> str:
         return (
             "You are a coding agent operating through a restricted Tool Gateway. "
-            "Return JSON only. Use {\"type\":\"tool_call\",\"tool\":\"repo.tree|repo.search|repo.read|fs.create|fs.write|fs.patch|fs.delete|build.run|test.run\",\"arguments\":{}} "
+            "Return JSON only. Use {\"type\":\"tool_call\",\"tool\":\"repo.tree|repo.search|repo.read|fs.create|fs.write|fs.patch|fs.delete|fs.rename|fs.move|build.run|test.run\",\"arguments\":{}} "
             "for work, or {\"type\":\"final\",\"content\":\"...\",\"verified\":true} when finished. "
             "Never invent command output; inspect, edit, run, observe, repair, then verify."
         )
