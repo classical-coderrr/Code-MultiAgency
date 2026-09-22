@@ -118,7 +118,12 @@ class ArtifactValidator:
     ) -> ArtifactValidationResult:
         profile = dict(config or {})
         preflight_started = time.perf_counter()
-        contract = context.get("delivery_contract") or {}
+        contract = dict(context.get("delivery_contract") or {})
+        if contract.get("browser_required"):
+            run_label = re.sub(r"[^A-Za-z0-9_-]", "-", str(profile.get("run_id") or "validation"))[:80]
+            evidence_dir = Path(__file__).resolve().parents[2] / "data" / "validation-evidence" / run_label
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            contract["_validation_evidence_dir"] = str(evidence_dir)
         raw_files = context.get("__artifact_files__") if isinstance(context, dict) else None
         checks: list[ValidationCheck] = []
 
@@ -1243,19 +1248,45 @@ class ArtifactValidator:
                 if isinstance(api, dict) else api
                 for api in contract.get("api_contract", [])
             ]
-            spec = json.dumps({"url": base + path, "contract": probe_contract}, ensure_ascii=False).encode("utf-8")
+            spec = json.dumps({
+                "url": base + path,
+                "contract": probe_contract,
+                "evidenceDir": str(contract.get("_validation_evidence_dir") or ""),
+                "evidenceId": f"browser-{uuid.uuid4().hex[:12]}",
+            }, ensure_ascii=False).encode("utf-8")
             outcome = await self._run_command(node, [str(script)], root, 90, input_data=spec)
             try:
                 data = json.loads(outcome.output.strip().splitlines()[-1])
             except (ValueError, IndexError):
                 data = {"status": "failed", "message": outcome.output[-3000:]}
             status = "passed" if outcome.returncode == 0 and data.get("status") == "passed" else "blocked" if "Cannot find module" in outcome.output or "Executable doesn't exist" in outcome.output else "failed"
-            checks.append(ValidationCheck("browser-render", "frontend", "页面浏览器验证", status, data.get("message") or "页面已真实渲染，无同源资源错误或 JavaScript 异常。", duration_ms=outcome.duration_ms, output=outcome.output, evidence={"path": path, "uiCrud": bool(data.get("uiCrud")), "visibleTextChars": data.get("visibleTextChars", 0)}))
+            browser_evidence = self._browser_evidence(data, path)
+            checks.append(ValidationCheck("browser-render", "frontend", "页面浏览器验证", status, data.get("message") or "页面已真实渲染，无同源资源错误或 JavaScript 异常。", duration_ms=outcome.duration_ms, output=outcome.output, evidence=browser_evidence))
             if contract.get("crud_required") and contract.get("backend_stack") != "none":
-                checks.append(ValidationCheck("browser-crud", "frontend", "浏览器 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已通过真实页面完成新增、查询、修改、删除" if data.get("uiCrud") else "真实页面 CRUD 未通过，不能以 API 测试替代。", evidence={"path": path}))
+                checks.append(ValidationCheck("browser-crud", "frontend", "浏览器 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已通过真实页面完成新增、查询、修改、删除" if data.get("uiCrud") else "真实页面 CRUD 未通过，不能以 API 测试替代。", evidence=browser_evidence))
             elif contract.get("crud_required"):
-                checks.append(ValidationCheck("browser-local-crud", "frontend", "浏览器本地 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已验证新增、刷新后持久化、编辑与删除" if data.get("uiCrud") else "本地 CRUD 未通过真实浏览器验证。", evidence={"path": path, "persistentAcrossReload": bool(data.get("uiCrud"))}))
+                checks.append(ValidationCheck("browser-local-crud", "frontend", "浏览器本地 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已验证新增、刷新后持久化、编辑与删除" if data.get("uiCrud") else "本地 CRUD 未通过真实浏览器验证。", evidence={**browser_evidence, "persistentAcrossReload": bool(data.get("uiCrud"))}))
         return checks
+
+    @staticmethod
+    def _browser_evidence(data: dict[str, Any], path: str) -> dict[str, Any]:
+        """Keep browser diagnostics useful but bounded in persisted Run logs."""
+        def bounded_list(key: str, limit: int) -> list[Any]:
+            value = data.get(key)
+            return list(value[:limit]) if isinstance(value, list) else []
+
+        return {
+            "path": path,
+            "uiCrud": bool(data.get("uiCrud")),
+            "visibleTextChars": int(data.get("visibleTextChars", 0) or 0),
+            "screenshotPath": str(data.get("screenshotPath") or ""),
+            "screenshotPaths": bounded_list("screenshotPaths", 8),
+            "domSnapshot": str(data.get("domSnapshot") or "")[:12000],
+            "consoleMessages": bounded_list("consoleMessages", 50),
+            "networkEvents": bounded_list("networkEvents", 100),
+            "formValues": data.get("formValues") if isinstance(data.get("formValues"), dict) else {},
+            "crudStates": bounded_list("crudStates", 8),
+        }
 
     async def _probe_joint_frontend(self, root: Path, backend_port: int, files: dict[str, str], contract: dict[str, Any], client: httpx.AsyncClient) -> list[ValidationCheck]:
         """Keep backend/H2 alive while exercising Vue UI through its own proxy."""

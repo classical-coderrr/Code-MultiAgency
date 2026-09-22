@@ -21,6 +21,31 @@ def _result(status: str) -> ArtifactValidationResult:
     return ArtifactValidationResult(status, status, ("frontend",), (check,))
 
 
+def test_browser_evidence_is_bounded_and_keeps_failure_context():
+    data = {
+        "uiCrud": False,
+        "visibleTextChars": 42,
+        "screenshotPath": "D:/evidence/failure.png",
+        "screenshotPaths": [f"D:/evidence/{index}.png" for index in range(12)],
+        "domSnapshot": "x" * 13000,
+        "consoleMessages": [{"text": str(index)} for index in range(60)],
+        "networkEvents": [{"status": index} for index in range(120)],
+        "formValues": {"crud-field-name": "Room 101"},
+        "crudStates": [{"label": str(index)} for index in range(12)],
+    }
+
+    evidence = ArtifactValidator._browser_evidence(data, "/rooms")
+
+    assert evidence["path"] == "/rooms"
+    assert evidence["screenshotPath"].endswith("failure.png")
+    assert len(evidence["screenshotPaths"]) == 8
+    assert len(evidence["domSnapshot"]) == 12000
+    assert len(evidence["consoleMessages"]) == 50
+    assert len(evidence["networkEvents"]) == 100
+    assert evidence["formValues"]["crud-field-name"] == "Room 101"
+    assert len(evidence["crudStates"]) == 8
+
+
 def test_frontend_validation_requires_standard_source_tree():
     validator = ArtifactValidator()
     files = [

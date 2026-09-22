@@ -1823,7 +1823,8 @@ class WorkflowExecutor:
             if thinking_warning:
                 await self.event_bus.emit("step.runtime_adjusted", state.run_id, {"stepId": step.id, "requestedThinking": runtime["thinking"], "effectiveThinking": effective_thinking, "warning": thinking_warning})
             capabilities = self.provider.capabilities()
-            validation_config = step.validation if isinstance(step.validation, dict) else {}
+            validation_config = dict(step.validation) if isinstance(step.validation, dict) else {}
+            validation_config["run_id"] = state.run_id
             if validation_config.get("enabled"):
                 async def emit_validation_event(event_type: str, payload: dict[str, Any]) -> None:
                     await self.event_bus.emit(
