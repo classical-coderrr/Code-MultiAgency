@@ -1486,8 +1486,6 @@ class WorkflowExecutor:
             0,
             min(2, int(state.workflow.meta.get("delivery_repair_attempts", 1) or 0)),
         )
-        if not max_attempts:
-            return gate
         missing = {str(item) for item in gate.get("missing", [])}
         if {"delivery-contract", "delivery-api-contract"} & missing:
             return gate
@@ -1502,10 +1500,62 @@ class WorkflowExecutor:
             ),
             None,
         )
-        if tester is None:
-            return gate
-
         from .delivery_gate import evaluate_delivery
+
+        async def seal_delivery(candidate_gate: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any]:
+            """Write final metadata, rebuild ZIP, then verify that exact archive."""
+            if not self.artifact_service:
+                return candidate_gate
+            state.context.set("delivery_gate", candidate_gate)
+            await self.artifact_delivery.materialize(state, final_report)
+            archive_path = await asyncio.to_thread(
+                self.artifact_service.create_archive,
+                state.run_id,
+                strict=True,
+            )
+            sealed = evaluate_delivery(state.context.snapshot(), proof, archive_path)
+            state.context.set("delivery_gate", sealed)
+            if sealed.get("deliverable") and candidate_gate != sealed:
+                # The first rebuilt archive necessarily contains the previous
+                # gate in delivery-report.json. Seal once more so metadata and
+                # the verified final decision describe the same snapshot.
+                await self.artifact_delivery.materialize(state, final_report)
+                archive_path = await asyncio.to_thread(
+                    self.artifact_service.create_archive,
+                    state.run_id,
+                    strict=True,
+                )
+                sealed = evaluate_delivery(state.context.snapshot(), proof, archive_path)
+                state.context.set("delivery_gate", sealed)
+            return sealed
+
+        # ZIP corruption, stale packaging and missing archive entries are
+        # platform delivery defects. Re-materialize and verify once before
+        # asking any source Agent to modify already validated code.
+        if "delivery-archive" in missing and self.artifact_service:
+            await self.event_bus.emit(
+                "delivery.archive_rebuild_started",
+                state.run_id,
+                {"owner": "platform", "missing": sorted(missing)},
+            )
+            proof = self._delivery_proof(state)
+            rebuilt = await seal_delivery(gate, proof)
+            await self.event_bus.emit(
+                "delivery.archive_rebuild_completed",
+                state.run_id,
+                {
+                    "owner": "platform",
+                    "passed": bool(rebuilt.get("deliverable")),
+                    "missing": sorted(str(item) for item in rebuilt.get("missing", [])),
+                },
+            )
+            gate = rebuilt
+            missing = {str(item) for item in gate.get("missing", [])}
+            if gate.get("deliverable") or missing == {"delivery-archive"}:
+                return gate
+
+        if not max_attempts or tester is None:
+            return gate
 
         previous_missing = sorted(missing)
         for attempt in range(1, max_attempts + 1):
@@ -1547,6 +1597,8 @@ class WorkflowExecutor:
                 )
             repaired_gate = evaluate_delivery(state.context.snapshot(), proof, archive)
             state.context.set("delivery_gate", repaired_gate)
+            if repaired_gate.get("deliverable"):
+                repaired_gate = await seal_delivery(repaired_gate, proof)
             repaired_missing = sorted(str(item) for item in repaired_gate.get("missing", []))
             made_progress = repaired_gate.get("deliverable") or repaired_missing != previous_missing
             await self.event_bus.emit(
@@ -1580,7 +1632,12 @@ class WorkflowExecutor:
             if isinstance(item, dict)
         ]
         delivery_failures = [
-            failure_fact_from_check(item, gate="delivery", owner="integration_gate", index=index)
+            failure_fact_from_check(
+                item,
+                gate="delivery",
+                owner="platform" if str(item.get("id") or "") == "delivery-archive" else "integration_gate",
+                index=index,
+            )
             for index, item in enumerate(delivery_checks)
             if isinstance(item, dict) and str(item.get("status")) != "passed"
         ]

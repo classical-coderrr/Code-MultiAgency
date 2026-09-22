@@ -349,6 +349,41 @@ def test_actual_zip_content_is_decisive_even_when_all_checks_and_agents_pass(pip
     assert "delivery-archive" in gate["missing"]
 
 
+def test_delivery_archive_is_rebuilt_by_platform_before_source_agents(pipeline, monkeypatch):
+    delivery = pipeline("static_rest")
+    create_archive = delivery.service.create_archive
+    calls = 0
+
+    def damage_second_archive_only(run_id, *, strict=False):
+        nonlocal calls
+        calls += 1
+        path = create_archive(run_id, strict=strict)
+        if calls == 2:
+            with zipfile.ZipFile(path) as archive:
+                members = {name: archive.read(name) for name in archive.namelist()}
+            source = next(name for name in members if name.endswith("pom.xml"))
+            del members[source]
+            with zipfile.ZipFile(path, "w") as archive:
+                for name, data in members.items():
+                    archive.writestr(name, data)
+        return path
+
+    monkeypatch.setattr(delivery.service, "create_archive", damage_second_archive_only)
+
+    run = delivery.finalize()
+
+    gate = _assert_final(delivery, run, RunStatus.SUCCESS, "passed")
+    assert calls >= 4
+    events = delivery.repository.list_events(delivery.state.run_id)
+    assert [event["type"] for event in events if event["type"].startswith("delivery.archive_rebuild_")] == [
+        "delivery.archive_rebuild_started",
+        "delivery.archive_rebuild_completed",
+    ]
+    with zipfile.ZipFile(delivery.archive) as archive:
+        metadata = json.loads(archive.read("delivery-report.json"))
+    assert metadata["delivery_gate"] == gate
+
+
 def test_strict_executor_archive_does_not_package_unregistered_workspace_history(pipeline):
     delivery = pipeline()
     run_dir = delivery.archive.parent
