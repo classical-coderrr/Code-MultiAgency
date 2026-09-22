@@ -2809,10 +2809,14 @@ class WorkflowExecutor:
         responses: list[LLMResponse] = []
         failed_targets = self.repair_engine.targets(validation)
         for target in sorted(failed_targets):
-            diagnostics = "\n\n".join(
-                f"[{check.label}] {check.message}\n{check.output}".strip()
+            target_checks = [
+                check
                 for check in validation.checks
                 if check.status == "failed" and check.target == target
+            ]
+            diagnostics = "\n\n".join(
+                f"[{check.label}] {check.message}\n{check.output}".strip()
+                for check in target_checks
             )
             owned_files = [
                 item
@@ -2822,7 +2826,11 @@ class WorkflowExecutor:
                 and isinstance(item.get("name"), str)
                 and isinstance(item.get("content"), str)
             ]
-            candidates = self._validation_repair_candidates(owned_files, diagnostics)
+            candidates = self._validation_repair_candidates(
+                owned_files,
+                diagnostics,
+                checks=target_checks,
+            )
             existing_names = {str(item.get("name") or "") for item in raw_files if isinstance(item, dict)}
             ownership = (state.blueprint or {}).get("artifact_ownership") or {}
             missing_declarations: list[dict[str, Any]] = []
@@ -3286,24 +3294,110 @@ class WorkflowExecutor:
         return list(proposed.values())[:8]
 
     @staticmethod
-    def _validation_repair_candidates(owned_files: list[dict[str, Any]], diagnostics: str) -> list[dict[str, Any]]:
-        """Prefer the source file that a compiler identifies as the error owner."""
+    def _evidence_file_paths(checks: list[Any] | tuple[Any, ...] | None) -> list[str]:
+        """Return normalized file paths explicitly named by validator evidence.
+
+        Only file-oriented evidence keys are considered.  Generic evidence such
+        as an HTTP ``path`` (``/api/rooms``) must not accidentally become a
+        workspace repair target.
+        """
+        if not checks:
+            return []
+        file_keys = {
+            "file", "files", "filename", "filenames", "filepath", "filepaths",
+            "sourcefile", "sourcefiles", "relatedfile", "relatedfiles",
+            "artifact", "artifacts", "artifactpath", "artifactpaths",
+        }
+        found: list[str] = []
+
+        def collect(value: Any, *, file_context: bool = False) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    normalized_key = re.sub(r"[^a-z]", "", str(key).lower())
+                    collect(child, file_context=normalized_key in file_keys)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for child in value:
+                    collect(child, file_context=file_context)
+                return
+            if not file_context or not isinstance(value, str):
+                return
+            path = value.strip().replace("\\", "/").lstrip("./")
+            if not path or path.startswith("/") or "/api/" in path.lower():
+                return
+            if path not in found:
+                found.append(path)
+
+        for check in checks:
+            collect(getattr(check, "evidence", None))
+        return found
+
+    @staticmethod
+    def _match_owned_evidence_files(
+        owned_files: list[dict[str, Any]],
+        evidence_paths: list[str],
+    ) -> list[dict[str, Any]]:
+        """Resolve evidence paths without guessing between duplicate basenames."""
+        if not evidence_paths:
+            return []
+        normalized_files = {
+            str(item.get("name") or "").replace("\\", "/").lstrip("./"): item
+            for item in owned_files
+            if str(item.get("name") or "").strip()
+        }
+        selected: dict[str, dict[str, Any]] = {}
+        for raw_path in evidence_paths:
+            path = raw_path.replace("\\", "/").lstrip("./")
+            exact = normalized_files.get(path)
+            if exact is not None:
+                selected[path] = exact
+                continue
+            suffix_matches = [
+                (name, item)
+                for name, item in normalized_files.items()
+                if path.endswith("/" + name) or name.endswith("/" + path)
+            ]
+            if len(suffix_matches) == 1:
+                name, item = suffix_matches[0]
+                selected[name] = item
+                continue
+            basename = Path(path).name.lower()
+            basename_matches = [
+                (name, item)
+                for name, item in normalized_files.items()
+                if Path(name).name.lower() == basename
+            ]
+            if len(basename_matches) == 1:
+                name, item = basename_matches[0]
+                selected[name] = item
+        return list(selected.values())
+
+    @staticmethod
+    def _validation_repair_candidates(
+        owned_files: list[dict[str, Any]],
+        diagnostics: str,
+        checks: list[Any] | tuple[Any, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Locate repair files from structured evidence before using heuristics."""
         normalized = diagnostics.replace("\\", "/")
+        evidence_candidates = WorkflowExecutor._match_owned_evidence_files(
+            owned_files,
+            WorkflowExecutor._evidence_file_paths(checks),
+        )
+        if evidence_candidates:
+            return evidence_candidates
         # Maven output may mention dependency names while downloading them.
         # Explicit compiler locations are stronger evidence than those incidental
         # mentions and must be checked before dependency-based routing.
-        compiler_sources = {
-            match.lower()
+        compiler_paths = [
+            match.replace("\\", "/")
             for match in re.findall(
-                r"(?m)^\[ERROR\]\s+[^\r\n]*?/([^/\r\n]+\.java):\[\d+",
+                r"(?m)^\[ERROR\]\s+([^\r\n]+?\.java):\[\d+",
                 normalized,
             )
-        }
-        if compiler_sources:
-            source_files = [
-                item for item in owned_files
-                if Path(str(item.get("name") or "")).name.lower() in compiler_sources
-            ]
+        ]
+        if compiler_paths:
+            source_files = WorkflowExecutor._match_owned_evidence_files(owned_files, compiler_paths)
             if source_files:
                 return source_files
         missing_table = re.search(r"Schema-validation:\s*missing table\s*\[([^\]]+)\]", normalized, re.IGNORECASE)
@@ -3498,10 +3592,15 @@ class WorkflowExecutor:
             Path(match.group("path")).name.lower()
             for match in re.finditer(r"(?P<path>(?:[A-Za-z]:)?[^\s'\"()]+\.[A-Za-z0-9]+)", normalized)
         }
+        owned_by_basename: dict[str, list[dict[str, Any]]] = {}
+        for item in owned_files:
+            basename = Path(str(item.get("name") or "")).name.lower()
+            if basename:
+                owned_by_basename.setdefault(basename, []).append(item)
         basename_matches = [
-            item
-            for item in owned_files
-            if Path(str(item.get("name") or "")).name.lower() in diagnostic_basenames
+            items[0]
+            for basename, items in owned_by_basename.items()
+            if basename in diagnostic_basenames and len(items) == 1
         ]
         if basename_matches:
             return basename_matches

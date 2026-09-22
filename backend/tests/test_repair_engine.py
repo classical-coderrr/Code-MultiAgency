@@ -105,6 +105,56 @@ def test_frontend_route_repair_selects_app_and_vite_config_only():
     assert [item["name"] for item in selected] == ["src/App.vue", "vite.config.js"]
 
 
+def test_repair_candidates_prefer_structured_related_file_evidence():
+    files = [
+        {"name": "src/views/admin/StudentList.vue", "content": "admin", "step_id": "frontend"},
+        {"name": "src/views/mobile/StudentList.vue", "content": "mobile", "step_id": "frontend"},
+        {"name": "src/App.vue", "content": "app", "step_id": "frontend"},
+    ]
+    check = ValidationCheck(
+        "browser-crud",
+        "frontend",
+        "浏览器 CRUD 操作",
+        "failed",
+        "StudentList.vue 中的保存按钮没有更新列表。",
+        evidence={"relatedFiles": ["src/views/mobile/StudentList.vue"], "path": "/rooms"},
+    )
+
+    selected = WorkflowExecutor._validation_repair_candidates(
+        files,
+        check.message,
+        checks=[check],
+    )
+
+    assert [item["name"] for item in selected] == ["src/views/mobile/StudentList.vue"]
+
+
+def test_repair_candidates_do_not_guess_between_duplicate_basenames():
+    files = [
+        {"name": "src/views/admin/StudentList.vue", "content": "admin", "step_id": "frontend"},
+        {"name": "src/views/mobile/StudentList.vue", "content": "mobile", "step_id": "frontend"},
+    ]
+
+    selected = WorkflowExecutor._validation_repair_candidates(
+        files,
+        "StudentList.vue:12 保存失败",
+    )
+
+    assert selected == []
+
+
+def test_compiler_location_selects_exact_path_when_basenames_repeat():
+    files = [
+        {"name": "src/main/java/com/example/a/Product.java", "content": "a", "step_id": "backend"},
+        {"name": "src/main/java/com/example/b/Product.java", "content": "b", "step_id": "backend"},
+    ]
+    log = "[ERROR] C:/tmp/build/src/main/java/com/example/b/Product.java:[17,9] cannot find symbol"
+
+    selected = WorkflowExecutor._validation_repair_candidates(files, log)
+
+    assert [item["name"] for item in selected] == ["src/main/java/com/example/b/Product.java"]
+
+
 def test_no_progress_opens_repair_circuit_after_two_rounds():
     engine = RepairEngine()
     validation = failed("backend-build", "backend", "compile failed")
