@@ -416,3 +416,109 @@ def test_latest_resolved_failure_fact_supersedes_stale_unresolved_copy():
     )
     assert reset_ids == set()
     assert blockers == []
+
+
+def test_restore_prefers_change_requested_blueprint_over_stale_frozen_snapshot():
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="blueprint-lineage",
+        name="blueprint-lineage",
+        steps=[StepDefinition("architecture", agent_id="architect_agent")],
+    )
+    run_id = "run-blueprint-lineage"
+    repository.create_run(run_id, workflow.id, {}, RunStatus.FAILED.value, "now")
+    repository.upsert_step(run_id, "architecture", status=StepStatus.SUCCESS.value)
+    frozen = {"blueprint_id": "bp-1", "version": 1, "status": "FROZEN"}
+    changed = {
+        "blueprint_id": "bp-1",
+        "version": 1,
+        "status": "CHANGE_REQUESTED",
+        "change_requests": [{"request_id": "change-1"}],
+    }
+    repository.save_run_snapshot(
+        run_id,
+        {
+            "version": 1,
+            "run_id": run_id,
+            "context": {
+                "project_blueprint": frozen,
+                "delivery_contract": {"schema_version": "1.0"},
+                "delivery_contract_hash": "stale",
+                "compiled_contract": {"old": True},
+                "artifact_validation": {"status": "passed"},
+                "delivery_gate": {"deliverable": True},
+            },
+            "results": {"architecture": StepStatus.SUCCESS.value},
+            "blueprint": frozen,
+        },
+    )
+    repository.update_run(run_id, blueprint_json=json.dumps(changed))
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        FailBackendOnceProvider(fail_backend=False),
+        WorkflowEventBus(repository),
+        repository,
+    )
+
+    state = executor._state_from_run(repository.get_run(run_id), workflow)
+    restored = state.context.snapshot()
+
+    assert state.blueprint == changed
+    assert restored["project_blueprint"] == changed
+    assert "delivery_contract" not in restored
+    assert "compiled_contract" not in restored
+    assert "artifact_validation" not in restored
+    assert "delivery_gate" not in restored
+
+
+def test_retry_invalidation_removes_only_reset_owner_artifacts_and_stale_proof():
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="retry-invalidation",
+        name="retry-invalidation",
+        steps=[
+            StepDefinition("backend", agent_id="backend_agent", generation_mode="artifacts"),
+            StepDefinition("frontend", agent_id="frontend_agent", generation_mode="artifacts"),
+            StepDefinition("tester", agent_id="tester_agent", depends_on=["backend", "frontend"]),
+        ],
+    )
+    run_id = "run-retry-invalidation"
+    repository.create_run(run_id, workflow.id, {}, RunStatus.FAILED.value, "now")
+    for step in workflow.steps:
+        repository.upsert_step(run_id, step.id, status=StepStatus.SUCCESS.value)
+    context = {
+        "__artifact_files__": [
+            {"name": "pom.xml", "content": "backend", "step_id": "backend"},
+            {"name": "src/App.vue", "content": "frontend", "step_id": "frontend"},
+        ],
+        "artifact_validation": {"status": "passed"},
+        "delivery_gate": {"deliverable": False},
+        "repair_last_candidate_validation": {"status": "failed"},
+    }
+    repository.save_run_snapshot(
+        run_id,
+        {
+            "version": 1,
+            "run_id": run_id,
+            "context": context,
+            "results": {step.id: StepStatus.SUCCESS.value for step in workflow.steps},
+        },
+    )
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        FailBackendOnceProvider(fail_backend=False),
+        WorkflowEventBus(repository),
+        repository,
+    )
+    state = executor._state_from_run(repository.get_run(run_id), workflow)
+
+    executor._invalidate_retry_outputs(state, {"frontend", "tester"})
+    updated = state.context.snapshot()
+
+    assert updated["__artifact_files__"] == [
+        {"name": "pom.xml", "content": "backend", "step_id": "backend"}
+    ]
+    assert "artifact_validation" not in updated
+    assert "delivery_gate" not in updated
+    assert "repair_last_candidate_validation" not in updated
+    assert state.delivery_status == "NOT_EVALUATED"

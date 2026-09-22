@@ -353,6 +353,27 @@ class WorkflowExecutor:
                 snapshot.get("runtime") if isinstance(snapshot.get("runtime"), dict) else persisted_inputs.get("runtime", {}),
             ).as_dict()
             context_data["workspace"] = workspace
+        snapshot_blueprint = snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else None
+        context_blueprint = context_data.get("project_blueprint") if isinstance(context_data.get("project_blueprint"), dict) else None
+        persisted_blueprint = run.get("blueprint") if isinstance(run.get("blueprint"), dict) else None
+        blueprint = self._authoritative_blueprint(
+            snapshot_blueprint,
+            context_blueprint,
+            persisted_blueprint,
+        )
+        if blueprint:
+            context_data["project_blueprint"] = blueprint
+        if blueprint and str(blueprint.get("status") or "") == "CHANGE_REQUESTED":
+            for stale_key in (
+                "compiled_contract",
+                "delivery_contract",
+                "delivery_contract_hash",
+                "execution_plan",
+                "artifact_validation",
+                "delivery_gate",
+            ):
+                context_data.pop(stale_key, None)
+
         state = RunState(
             run_id=run_id,
             workflow=workflow,
@@ -372,13 +393,39 @@ class WorkflowExecutor:
             started_perf=time.perf_counter() - max(0, int(run.get("active_duration_ms") or 0)) / 1000,
             approval_started_perf=time.perf_counter() if waiting_step_id else None,
             clarification_request=snapshot.get("clarification_request") if isinstance(snapshot.get("clarification_request"), dict) else None,
-            blueprint=snapshot.get("blueprint") if isinstance(snapshot.get("blueprint"), dict) else (context_data.get("project_blueprint") if isinstance(context_data.get("project_blueprint"), dict) else None),
+            blueprint=blueprint,
             workspace=workspace,
             execution_status=str(snapshot.get("execution_status") or run.get("execution_status") or run.get("status") or RunStatus.PENDING.value),
             delivery_status=str(snapshot.get("delivery_status") or run.get("delivery_status") or "NOT_EVALUATED"),
         )
         state.graph = self._build_graph(workflow)
         return state
+
+    @staticmethod
+    def _authoritative_blueprint(
+        snapshot_blueprint: dict[str, Any] | None,
+        context_blueprint: dict[str, Any] | None,
+        persisted_blueprint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Choose the newest durable Blueprint and reject stale frozen copies."""
+        candidates = [
+            (0, context_blueprint),
+            (1, snapshot_blueprint),
+            (2, persisted_blueprint),
+        ]
+        valid = [(source, item) for source, item in candidates if isinstance(item, dict)]
+        if not valid:
+            return None
+        status_rank = {"DRAFT": 0, "FROZEN": 1, "CHANGE_REQUESTED": 2}
+        _, selected = max(
+            valid,
+            key=lambda row: (
+                int(row[1].get("version") or 0),
+                status_rank.get(str(row[1].get("status") or ""), -1),
+                row[0],
+            ),
+        )
+        return dict(selected)
 
     def restore_waiting_run(self, run: dict[str, Any], workflow: WorkflowDefinition) -> bool:
         """Rebuild an approval-paused run after the process has restarted."""
@@ -994,6 +1041,8 @@ class WorkflowExecutor:
             reopen_payload = self._prepare_contract_reopen(
                 state, run, reset_ids, contract_failures
             )
+        else:
+            self._invalidate_retry_outputs(state, reset_ids)
 
         state.waiting_step_id = None
         state.current_level = 0
@@ -1017,6 +1066,37 @@ class WorkflowExecutor:
             )
         state.task = asyncio.create_task(self._run_recovered_state(state, status))
         return state.recovery_count
+
+    def _invalidate_retry_outputs(self, state: RunState, reset_ids: set[str]) -> None:
+        """Remove only outputs made stale by the selected retry boundary."""
+        state.context.delete("delivery_gate")
+        state.context.delete("repair_last_candidate_validation")
+        state.delivery_status = "NOT_EVALUATED"
+        steps_by_id = {step.id: step for step in state.workflow.steps}
+        generation_owners = {
+            step_id
+            for step_id in reset_ids
+            if step_id in steps_by_id
+            and steps_by_id[step_id].type == StepType.AGENT
+            and (
+                steps_by_id[step_id].generation_mode in {"artifacts", "coding_loop"}
+                or steps_by_id[step_id].output_format in {"html", "code"}
+            )
+        }
+        if reset_ids:
+            state.context.delete("artifact_validation")
+        raw_files = state.context.snapshot().get("__artifact_files__")
+        if generation_owners and isinstance(raw_files, list):
+            state.context.set(
+                "__artifact_files__",
+                [
+                    item
+                    for item in raw_files
+                    if not isinstance(item, dict)
+                    or str(item.get("step_id") or item.get("owner_step") or "")
+                    not in generation_owners
+                ],
+            )
 
     def _build_graph(self, workflow: WorkflowDefinition) -> LangGraphWorkflow:
         return LangGraphWorkflow(workflow, self._graph_step_handler, self.checkpointer)
