@@ -685,6 +685,8 @@ class WorkflowExecutor:
 
         state = self._state_from_run(run, workflow)
         reset_ids = {step_id for step_id, step_status in state.results.items() if step_status == StepStatus.FAILED}
+        fact_reset_ids, retry_blockers = self._failure_fact_retry_plan(run, workflow)
+        reset_ids.update(fact_reset_ids)
         contract_failures = self._contract_reopen_failures(run)
         if contract_failures:
             reopen_count = int(state.context.snapshot().get("contract_reopen_count") or 0)
@@ -705,6 +707,8 @@ class WorkflowExecutor:
             if architecture_step is None:
                 raise ValueError("冻结合同存在缺陷，但工作流没有可重新执行的 Architecture Agent")
             reset_ids.add(architecture_step)
+        if retry_blockers:
+            raise ValueError("当前失败不能自动重试：" + "；".join(retry_blockers[:3]))
         if status == RunStatus.STOPPED.value:
             reset_ids.update(step_id for step_id, step_status in state.results.items() if step_status == StepStatus.RUNNING)
         if not reset_ids and "成果物" in str(run.get("error_message") or ""):
@@ -732,16 +736,30 @@ class WorkflowExecutor:
         return run, state, reset_ids
 
     @staticmethod
-    def _contract_reopen_failures(run: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return unresolved post-freeze defects that require Architecture replay."""
+    def _latest_failure_facts(run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the latest version of each FailureFact, including legacy rows."""
         facts = run.get("failure_facts")
         if not isinstance(facts, list):
             return []
+        latest: dict[str, tuple[int, dict[str, Any]]] = {}
+        for index, fact in enumerate(facts):
+            if not isinstance(fact, dict):
+                continue
+            identity = str(
+                fact.get("failure_id")
+                or fact.get("fingerprint")
+                or f"{fact.get('code', 'UNCLASSIFIED')}:{fact.get('stage', '')}:{fact.get('owner', '')}"
+            )
+            latest[identity] = (index, fact)
+        return [item for _, item in sorted(latest.values(), key=lambda row: row[0])]
+
+    @classmethod
+    def _contract_reopen_failures(cls, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return unresolved post-freeze defects that require Architecture replay."""
         return [
             fact
-            for fact in facts
-            if isinstance(fact, dict)
-            and not bool(fact.get("resolved"))
+            for fact in cls._latest_failure_facts(run)
+            if not bool(fact.get("resolved"))
             and (
                 str(fact.get("repair_action") or "") == "request_blueprint_change"
                 or (
@@ -750,6 +768,80 @@ class WorkflowExecutor:
                 )
             )
         ]
+
+    @classmethod
+    def _failure_fact_retry_plan(
+        cls,
+        run: dict[str, Any],
+        workflow: WorkflowDefinition,
+    ) -> tuple[set[str], list[str]]:
+        """Map unresolved FailureFacts to bounded workflow reset points.
+
+        Unknown, platform, validator and environment failures are returned as
+        blockers so Retry cannot blindly rewrite application source.
+        """
+        steps_by_id = {step.id: step for step in workflow.steps}
+        agent_steps = {
+            str(step.agent_id or "").lower(): step.id
+            for step in workflow.steps
+            if step.type == StepType.AGENT and step.agent_id
+        }
+        role_steps: dict[str, str] = {}
+        for step in workflow.steps:
+            role_steps.setdefault(str(step.id or "").lower(), step.id)
+            if step.agent_id:
+                role_steps.setdefault(str(step.agent_id).lower().removesuffix("_agent"), step.id)
+
+        reset_ids: set[str] = set()
+        blockers: list[str] = []
+        for fact in cls._latest_failure_facts(run):
+            if bool(fact.get("resolved")):
+                continue
+            category = str(fact.get("category") or "").strip().lower()
+            owner = str(fact.get("owner") or "").strip().lower()
+            stage = str(fact.get("stage") or "").strip()
+            action = str(fact.get("repair_action") or "").strip().lower()
+            summary = str(fact.get("summary") or fact.get("message") or fact.get("code") or "未分类失败")
+
+            if action == "request_blueprint_change" or category == "contract_defect":
+                architecture = role_steps.get("architecture") or agent_steps.get("architect_agent")
+                if architecture:
+                    reset_ids.add(architecture)
+                else:
+                    blockers.append("合同缺陷缺少可执行的 Architecture Agent")
+                continue
+            if category in {"validator_defect", "environment", "provider", "platform"} or owner in {"platform", "environment"}:
+                blockers.append(summary)
+                continue
+
+            candidate = None
+            if stage in steps_by_id:
+                candidate = stage
+            elif owner in steps_by_id:
+                candidate = owner
+            elif owner in agent_steps:
+                candidate = agent_steps[owner]
+            elif owner in role_steps:
+                candidate = role_steps[owner]
+            elif owner in {"integration_gate", "tester", "validation"}:
+                candidate = role_steps.get("tester") or agent_steps.get("tester_agent")
+            elif category in {"requirement", "requirement_routing", "capability_routing", "routing"}:
+                candidate = role_steps.get("requirement") or agent_steps.get("requirement_agent")
+
+            explicitly_retryable = bool(fact.get("repairable")) or bool(fact.get("retryable")) or action in {
+                "dispatch_owner_repair",
+                "create_missing_source_or_repair_reference",
+                "repair_agent_output",
+                "retry_agent",
+            }
+            legacy_fact = "repairable" not in fact and "retryable" not in fact and "repair_action" not in fact
+            if candidate and (explicitly_retryable or legacy_fact):
+                reset_ids.add(candidate)
+            elif candidate:
+                blockers.append(summary)
+            else:
+                blockers.append(f"责任不明确：{summary}")
+        return reset_ids, list(dict.fromkeys(blockers))
 
     def _prepare_contract_reopen(
         self,
@@ -3361,6 +3453,18 @@ class WorkflowExecutor:
         else:
             duration_ms = self._active_duration_ms(state)
         state.execution_status = status.value
+        if status == RunStatus.SUCCESS:
+            facts = state.context.snapshot().get("failure_facts")
+            if isinstance(facts, list):
+                resolved_facts = [
+                    {**fact, "resolved": True} if isinstance(fact, dict) else fact
+                    for fact in facts
+                ]
+                state.context.set("failure_facts", resolved_facts)
+                self.repository.update_run(
+                    state.run_id,
+                    failure_facts_json=json.dumps(resolved_facts, ensure_ascii=False),
+                )
         gate = state.context.snapshot().get("delivery_gate")
         if isinstance(gate, dict):
             state.delivery_status = "PASSED" if gate.get("deliverable") else "FAILED"

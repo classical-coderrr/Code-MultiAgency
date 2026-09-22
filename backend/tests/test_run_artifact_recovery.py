@@ -300,3 +300,119 @@ def test_contract_defect_retry_reopens_architecture_and_invalidates_downstream()
     assert state.blueprint is None
     assert repository.get_run(run_id)["blueprint"]["status"] == "CHANGE_REQUESTED"
     repository._connection.close()
+
+
+def test_retry_plan_uses_failure_fact_owner_when_all_steps_were_successful():
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="fact-retry",
+        name="fact-retry",
+        steps=[
+            StepDefinition("architecture", agent_id="architect_agent"),
+            StepDefinition("frontend", agent_id="frontend_agent", depends_on=["architecture"]),
+            StepDefinition("tester", agent_id="tester_agent", depends_on=["frontend"]),
+        ],
+    )
+    run_id = "run-fact-retry"
+    repository.create_run(run_id, workflow.id, {}, RunStatus.FAILED.value, "now")
+    results = {step.id: StepStatus.SUCCESS for step in workflow.steps}
+    for step in workflow.steps:
+        repository.upsert_step(run_id, step.id, status=StepStatus.SUCCESS.value)
+    failure = {
+        "failure_id": "failure-browser-crud",
+        "code": "browser-crud",
+        "category": "integration",
+        "owner": "frontend",
+        "stage": "integration",
+        "repairable": True,
+        "retryable": True,
+        "repair_action": "dispatch_owner_repair",
+        "summary": "浏览器 CRUD 未通过",
+        "resolved": False,
+    }
+    repository.save_run_snapshot(
+        run_id,
+        {
+            "version": 1,
+            "run_id": run_id,
+            "context": {"failure_facts": [failure]},
+            "results": {key: value.value for key, value in results.items()},
+        },
+    )
+    repository.update_run(run_id, failure_facts_json=json.dumps([failure]))
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        FailBackendOnceProvider(fail_backend=False),
+        WorkflowEventBus(repository),
+        repository,
+    )
+
+    _, _, reset_ids = executor._retry_plan(run_id, workflow)
+
+    assert reset_ids == {"frontend", "tester"}
+
+
+def test_retry_plan_blocks_platform_or_validator_failures():
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="platform-failure",
+        name="platform-failure",
+        steps=[StepDefinition("tester", agent_id="tester_agent")],
+    )
+    run_id = "run-platform-failure"
+    repository.create_run(run_id, workflow.id, {}, RunStatus.FAILED.value, "now")
+    repository.upsert_step(run_id, "tester", status=StepStatus.SUCCESS.value)
+    failure = {
+        "failure_id": "failure-validator",
+        "code": "validator-error",
+        "category": "validator_defect",
+        "owner": "platform",
+        "summary": "验证器测试数据类型错误",
+        "resolved": False,
+    }
+    repository.save_run_snapshot(
+        run_id,
+        {
+            "version": 1,
+            "run_id": run_id,
+            "context": {"failure_facts": [failure]},
+            "results": {"tester": StepStatus.SUCCESS.value},
+        },
+    )
+    repository.update_run(run_id, failure_facts_json=json.dumps([failure]))
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        FailBackendOnceProvider(fail_backend=False),
+        WorkflowEventBus(repository),
+        repository,
+    )
+
+    with pytest.raises(ValueError, match="验证器测试数据类型错误"):
+        executor.validate_retry(run_id, workflow)
+
+
+def test_latest_resolved_failure_fact_supersedes_stale_unresolved_copy():
+    unresolved = {
+        "failure_id": "failure-api",
+        "code": "api-contract",
+        "owner": "backend",
+        "repairable": True,
+        "resolved": False,
+    }
+    resolved = {**unresolved, "resolved": True}
+
+    latest = WorkflowExecutor._latest_failure_facts(
+        {"failure_facts": [unresolved, resolved]}
+    )
+
+    assert latest == [resolved]
+    reset_ids, blockers = WorkflowExecutor._failure_fact_retry_plan(
+        {"failure_facts": [unresolved, resolved]},
+        WorkflowDefinition(
+            id="resolved-fact",
+            name="resolved-fact",
+            steps=[StepDefinition("backend", agent_id="backend_agent")],
+        ),
+    )
+    assert reset_ids == set()
+    assert blockers == []
