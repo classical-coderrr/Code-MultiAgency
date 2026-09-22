@@ -43,6 +43,30 @@ def test_validation_failure_routes_to_source_owner_instead_of_tester():
     assert plan["repairable"] is True
 
 
+def test_cross_layer_api_and_database_failures_route_to_all_source_owners():
+    classifier = FailureClassifier()
+    route_check = ValidationCheck(
+        "frontend-backend-route-contract", "backend", "前后端 API 路由契约", "failed",
+        "前端与后端路径不一致",
+    )
+    database_check = ValidationCheck(
+        "backend-database-contract", "backend", "真实数据库合同", "failed",
+        "Schema-validation: missing table [rooms]",
+    )
+
+    assert classifier.owners_for_check(route_check) == ["backend", "frontend"]
+    assert classifier.owners_for_check(database_check) == ["database", "backend"]
+
+
+def test_related_files_can_establish_cross_layer_ownership():
+    check = ValidationCheck(
+        "integration-field-contract", "artifact", "字段联调", "failed", "字段不一致",
+        evidence={"relatedFiles": ["src/App.vue", "src/main/java/app/RoomController.java"]},
+    )
+
+    assert FailureClassifier().owners_for_check(check) == ["frontend", "backend"]
+
+
 def test_integration_contract_failure_can_route_to_both_owners():
     engine = RepairEngine()
     validation = failed(

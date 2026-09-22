@@ -145,9 +145,36 @@ class FailureClassifier:
         explicit = str(evidence.get("owner") or "").strip().lower()
         if explicit in self.AGENT_OWNERS:
             return [explicit]
+        explicit_many = [
+            str(owner).strip().lower()
+            for owner in (evidence.get("owners") or [])
+            if str(owner).strip().lower() in self.AGENT_OWNERS
+        ]
+        if explicit_many:
+            return list(dict.fromkeys(explicit_many))
         diagnostic = " ".join(
             (str(check.id), str(check.label), str(check.message), str(check.output))
         ).lower()
+        check_id = str(check.id or "").lower()
+        related_values = evidence.get("relatedFiles") or evidence.get("files") or []
+        related = " ".join(str(item) for item in related_values)
+
+        # Cross-layer Gates are deliberately resolved before the legacy target
+        # field.  The target says where the validator observed the symptom; it
+        # does not always identify every source owner needed for a coherent fix.
+        if check_id in {
+            "frontend-backend-route-contract", "integration-api-contract",
+            "frontend-api-contract", "backend-api-contract",
+        }:
+            return ["backend", "frontend"]
+        if (
+            check_id in {"backend-database-contract", "database-probe-contract", "h2-crud", "backend-h2-crud"}
+            or any(marker in diagnostic for marker in (
+                "schema-validation: missing table", "table contract", "database contract",
+                "h2 crud", "真实数据库合同", "实体表名合同",
+            ))
+        ):
+            return ["database", "backend"]
         # A browser timeout is only the visible symptom when the page called a
         # missing REST endpoint. Keep Frontend involved for path/proxy checks,
         # but also route the failure to Backend instead of repeatedly rewriting
@@ -158,11 +185,26 @@ class FailureClassifier:
             re.IGNORECASE,
         ):
             return ["backend", "frontend"]
+        if check_id in {"browser-render", "browser-crud", "browser-local-crud"}:
+            return ["frontend"]
+
+        inferred_from_files: list[str] = []
+        for raw_path in related_values if isinstance(related_values, (list, tuple, set)) else [related_values]:
+            path = str(raw_path or "").replace("\\", "/").lower()
+            if not path:
+                continue
+            if path.endswith(".sql") or "/db/migration/" in path:
+                inferred_from_files.append("database")
+            elif path.endswith((".java", ".kt")) or path.endswith(("pom.xml", "build.gradle", "build.gradle.kts")):
+                inferred_from_files.append("backend")
+            elif path.endswith((".vue", ".tsx", ".jsx", ".css", ".html")) or path.endswith(("package.json", "vite.config.js", "vite.config.ts")):
+                inferred_from_files.append("frontend")
+        if len(set(inferred_from_files)) > 1:
+            return list(dict.fromkeys(inferred_from_files))
         target = str(check.target or "").strip().lower()
         if target in self.AGENT_OWNERS:
             return [target]
 
-        related = " ".join(str(item) for item in (evidence.get("relatedFiles") or evidence.get("files") or []))
         diagnostic = f"{diagnostic} {related.lower()}"
         if any(marker in diagnostic for marker in ("api contract", "integration", "接口", "契约", "crud")):
             return ["backend", "frontend"]

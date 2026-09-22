@@ -97,7 +97,7 @@ class RepairEngine:
             # reporting, but a passing backend contract plus a failing frontend
             # contract proves that only the frontend must change.
             if (
-                check.id == "frontend-backend-route-contract"
+                check.id in {"frontend-backend-route-contract", "frontend-api-contract", "frontend-proxy-contract"}
                 and statuses.get("backend-api-contract") == "passed"
                 and statuses.get("frontend-api-contract") == "failed"
             ):
