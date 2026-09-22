@@ -27,6 +27,38 @@ def test_provider_configuration_failure_is_not_sent_to_a_business_agent():
     assert route["retryable"] is False
 
 
+def test_environment_failure_is_not_sent_to_source_agents():
+    engine = RepairEngine()
+    node_route = engine.route_node_failure(
+        "backend",
+        "[WinError 10013] permission denied while binding port",
+    )
+    validation = ArtifactValidationResult("blocked", "toolchain missing", ("frontend",), (
+        ValidationCheck(
+            "frontend-toolchain", "frontend", "Node.js 工具链", "blocked",
+            "找不到 npm，无法执行前端构建。",
+        ),
+    ))
+    plan = engine.plan_validation_repair(validation, attempt=1)
+
+    assert node_route["category"] == "environment"
+    assert node_route["owner_step"] == "platform"
+    assert node_route["action"] == "pause_for_environment"
+    assert plan["repairable"] is False
+    assert plan["owners"] == []
+
+
+def test_provider_transport_remains_distinct_from_local_environment():
+    route = RepairEngine().route_node_failure(
+        "architecture",
+        "Provider network error: ReadTimeout while calling cloud model",
+    )
+
+    assert route["category"] == "provider_transport"
+    assert route["owner_step"] == "architecture"
+    assert route["action"] == "retry_same_node"
+
+
 def test_validation_failure_routes_to_source_owner_instead_of_tester():
     engine = RepairEngine()
     validation = failed(

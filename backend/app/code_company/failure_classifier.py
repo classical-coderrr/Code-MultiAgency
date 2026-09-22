@@ -44,6 +44,13 @@ class FailureClassifier:
         "json", "pydantic", "validation error", "attributeerror",
         "has no attribute", "schema", "expected a valid", "字段", "类型未明确",
     )
+    ENVIRONMENT_MARKERS = (
+        "executable not found", "command not found", "no such file or directory",
+        "找不到 npm", "找不到 node", "找不到 maven", "找不到 gradle", "找不到启动工具",
+        "docker desktop", "docker daemon", "redis unavailable", "redis 连接",
+        "address already in use", "port is already occupied", "端口被占用",
+        "permission denied", "winerror 10013", "database is locked", "disk full",
+    )
 
     def classify_node(self, step_id: str, error: str, *, error_type: str = "") -> FailureClassification:
         step = str(step_id or "unknown")
@@ -57,6 +64,11 @@ class FailureClassifier:
             return FailureClassification(
                 "platform_defect", ("platform",), "validation",
                 "inspect_platform", False, False, "critical", "platform",
+            )
+        if any(marker in lowered for marker in self.ENVIRONMENT_MARKERS):
+            return FailureClassification(
+                "environment", ("platform",), "environment",
+                "pause_for_environment", False, True, "high", "platform",
             )
         if step == "architecture" and any(marker in lowered for marker in (
             "entity_id", "实体合同", "api 合同", "字段", "query_parameters", "contract",
@@ -107,6 +119,19 @@ class FailureClassifier:
             return FailureClassification(
                 "contract_defect", ("architecture",), "contract",
                 "request_blueprint_change", False, False, "critical", "contract",
+            )
+        environment_diagnostic = f"{identity}\n{check.output}".lower()
+        if (
+            check.status == "blocked"
+            and (
+                any(marker in str(check.id).lower() for marker in ("toolchain", "environment"))
+                or any(marker in environment_diagnostic for marker in self.ENVIRONMENT_MARKERS)
+                or any(marker in environment_diagnostic for marker in ("playwright", "浏览器可执行文件"))
+            )
+        ):
+            return FailureClassification(
+                "environment", ("platform",), "environment",
+                "pause_for_environment", False, True, "high", "platform",
             )
         frontend_diagnostic = f"{check.message}\n{check.output}"
         if check.target == "frontend" and re.search(
