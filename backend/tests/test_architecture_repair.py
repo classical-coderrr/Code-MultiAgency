@@ -74,6 +74,89 @@ def test_entity_link_patch_requires_explicit_existing_entity_without_url_guessin
     assert candidate["delivery_contract"]["api_contract"][0]["entity_id"] is None
 
 
+def test_file_plan_failure_is_owned_by_architecture_with_bounded_shape_scope():
+    fact = contract_failure_fact(
+        ValueError("必需 Agent 缺少成果物文件计划：backend、frontend"),
+        attempt=0,
+    )
+
+    assert fact["code"] == "ARCH_FILE_PLAN_REQUIRED"
+    assert fact["owner"] == "architecture"
+    assert fact["repairable"] is True
+    assert fact["repair_scope"] == [
+        "backend_stack", "frontend_stack", "page_mode", "entrypoints",
+    ]
+
+
+def test_file_plan_patch_changes_only_allowed_delivery_shape_fields():
+    original = _decision([_api("/api/students", "Student"), _api("/api/courses", "Course")])
+    original["delivery_contract"].update({
+        "backend_stack": "none",
+        "frontend_stack": "none",
+        "page_mode": "none",
+        "entrypoints": [],
+    })
+    proposed = {
+        "project_type": "static_html",
+        "backend_required": False,
+        "delivery_contract": {
+            "backend_stack": "springboot",
+            "frontend_stack": "vue",
+            "page_mode": "spa",
+            "entrypoints": ["/"],
+            "entities": [_entity("Wrong")],
+        },
+    }
+
+    fixed = merge_scoped_architecture_patch(
+        original,
+        proposed,
+        ["backend_stack", "frontend_stack", "page_mode", "entrypoints"],
+        error="必需 Agent 缺少成果物文件计划：backend、frontend",
+    )
+
+    assert fixed["project_type"] == "web_app"
+    assert fixed["backend_required"] is True
+    assert fixed["delivery_contract"]["backend_stack"] == "springboot"
+    assert fixed["delivery_contract"]["frontend_stack"] == "vue"
+    assert fixed["delivery_contract"]["page_mode"] == "spa"
+    assert fixed["delivery_contract"]["entrypoints"] == ["/"]
+    assert fixed["delivery_contract"]["entities"] == original["delivery_contract"]["entities"]
+
+
+@pytest.mark.asyncio
+async def test_file_plan_failure_repairs_delivery_shape_before_freeze():
+    initial = _decision([_api("/api/students", "Student"), _api("/api/courses", "Course")])
+    initial["delivery_contract"].update({
+        "backend_stack": "none",
+        "frontend_stack": "vue",
+        "page_mode": "spa",
+        "entrypoints": ["/"],
+    })
+    calls = []
+
+    def validate(candidate):
+        if candidate["delivery_contract"].get("backend_stack") != "springboot":
+            raise ValueError("必需 Agent 缺少成果物文件计划：backend")
+        return {"candidate": candidate}
+
+    async def repair(candidate, fact, attempt):
+        calls.append((fact["code"], tuple(fact["repair_scope"]), attempt))
+        return {"delivery_contract": {"backend_stack": "springboot"}}
+
+    result = await ArchitectureRepairCoordinator().coordinate(
+        run_id="arch-file-plan",
+        candidate=initial,
+        max_attempts=2,
+        validate=validate,
+        repair=repair,
+    )
+
+    assert result["passed"] is True
+    assert result["candidate"]["delivery_contract"]["backend_stack"] == "springboot"
+    assert calls == [("ARCH_FILE_PLAN_REQUIRED", ("backend_stack",), 1)]
+
+
 @pytest.mark.asyncio
 async def test_single_entity_contract_repair_rejects_missing_link_then_reaches_approval():
     requirement = "设计一个学生管理系统,前端用vue,后端用springboot.要有增删改查的功能"

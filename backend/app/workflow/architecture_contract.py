@@ -304,13 +304,45 @@ class ArchitectureContractService:
                 if previous_feedback
                 else ""
             )
+            repair_scope = list(fact.get("repair_scope") or [])
+            contract_shape_scope = [
+                item
+                for item in repair_scope
+                if item
+                in {
+                    "backend_stack",
+                    "frontend_stack",
+                    "page_mode",
+                    "database_mode",
+                    "production_database",
+                    "validation_database",
+                    "entrypoints",
+                }
+            ]
+            if contract_shape_scope:
+                allowed_instruction = (
+                    "本次只允许修正交付形态合同。返回 JSON 对象并在 delivery_contract 中显式提供："
+                    f"{json.dumps(contract_shape_scope, ensure_ascii=False)}。"
+                    "技术栈必须使用平台规范标识，例如 springboot、python、vue、react、html、none；"
+                    "entrypoints 必须是字符串数组。不得修改 entities、api_contract、原始需求或能力范围。"
+                )
+            elif "artifact_ownership" in repair_scope:
+                allowed_instruction = (
+                    "本次只允许修正顶层 artifact_ownership 映射；不得修改实体、API、技术栈、"
+                    "项目类型或原始需求。"
+                )
+            else:
+                allowed_instruction = (
+                    "只修正以下允许范围内的实体、字段或 API 合同；"
+                    "不得改动技术栈、项目类型、能力路由或原始需求。"
+                    "只返回 JSON 对象，包含允许修改的 entities 和/或 api_contract 数组，"
+                    "不得省略其他已有实体与路由。"
+                )
             repair_prompt = (
-                "架构合同预检失败。只修正以下允许范围内的实体、字段或 API 合同；"
-                "不得改动技术栈、项目类型、能力路由或原始需求。"
-                "只返回 JSON 对象，包含允许修改的 entities 和/或 api_contract 数组，"
-                "不得省略其他已有实体与路由。\n"
+                "架构合同预检失败。"
+                f"{allowed_instruction}\n"
                 f"{entity_link_rule}{feedback_line}"
-                f"允许范围：{json.dumps(fact['repair_scope'], ensure_ascii=False)}\n"
+                f"允许范围：{json.dumps(repair_scope, ensure_ascii=False)}\n"
                 f"原始用户需求：{requirement_spec.raw_requirement}\n"
                 f"失败规则：{fact['code']}\n失败证据：{fact['message']}\n"
                 f"当前架构草案：{json.dumps(candidate, ensure_ascii=False)}"

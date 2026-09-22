@@ -47,6 +47,25 @@ def contract_failure_fact(error: ValueError, *, attempt: int) -> dict[str, Any]:
     lowered = message.lower()
     if "entity_id" in lowered:
         code, scope, summary = "ARCH_API_ENTITY_ID_REQUIRED", ["api_contract"], "API 合同缺少明确的实体关联 entity_id。"
+    elif any(marker in lowered for marker in ("成果物文件计划", "file plan", "file_plan")):
+        scope = []
+        if "backend" in lowered:
+            scope.append("backend_stack")
+        if "frontend" in lowered:
+            scope.extend(["frontend_stack", "page_mode", "entrypoints"])
+        if "database" in lowered:
+            scope.append("database_mode")
+        if not scope:
+            scope = ["backend_stack", "frontend_stack", "page_mode", "database_mode", "entrypoints"]
+        code, summary = "ARCH_FILE_PLAN_REQUIRED", "必需 Agent 缺少可执行的成果物文件计划。"
+    elif any(marker in lowered for marker in ("artifact_ownership", "ownership", "归属边界", "文件归属")):
+        code, scope, summary = "ARCH_ARTIFACT_OWNERSHIP_INVALID", ["artifact_ownership"], "成果物文件归属合同不合法。"
+    elif any(marker in lowered for marker in ("backend_stack", "frontend_stack", "技术栈")):
+        code, scope, summary = "ARCH_STACK_INVALID", ["backend_stack", "frontend_stack"], "实现技术栈合同不合法。"
+    elif any(marker in lowered for marker in ("page_mode", "entrypoint", "entrypoints", "页面模式", "入口")):
+        code, scope, summary = "ARCH_DELIVERY_SHAPE_INVALID", ["page_mode", "entrypoints"], "页面模式或交付入口合同不合法。"
+    elif any(marker in lowered for marker in ("database_mode", "数据库模式")):
+        code, scope, summary = "ARCH_DATABASE_MODE_INVALID", ["database_mode"], "数据库模式合同不合法。"
     elif "fields" in lowered or "字段" in message or "实体合同" in message:
         code, scope, summary = "ARCH_ENTITY_FIELDS_INVALID", ["entities"], "实体字段合同格式或类型不合法。"
     elif any(marker in lowered for marker in ("api", "path", "query_parameters", "http")):
@@ -121,6 +140,23 @@ def merge_scoped_architecture_patch(
                 merged.append(row)
                 known.add(identifier)
         proposal[section] = merged
+    contract_fields = {
+        "backend_stack", "frontend_stack", "page_mode", "database_mode",
+        "production_database", "validation_database", "entrypoints",
+    }
+    for section in scope:
+        if section in contract_fields and section in incoming:
+            proposal[section] = deepcopy(incoming[section])
+    if "artifact_ownership" in scope:
+        ownership = patch.get("artifact_ownership")
+        if not isinstance(ownership, dict):
+            ownership = incoming.get("artifact_ownership")
+        if isinstance(ownership, dict):
+            current = dict(updated.get("artifact_ownership") or {})
+            current.update(deepcopy(ownership))
+            updated["artifact_ownership"] = current
+    if "backend_required" in scope and "backend_required" in patch:
+        updated["backend_required"] = bool(patch["backend_required"])
     updated["delivery_contract"] = proposal
     return updated
 
@@ -131,9 +167,23 @@ def architecture_patch_issue(candidate: dict[str, Any], patch: dict[str, Any], f
     This checks the model's proposed patch; it never infers an entity from a URL.
     The complete contract gate remains authoritative after the scoped merge.
     """
+    incoming = patch.get("delivery_contract") if isinstance(patch.get("delivery_contract"), dict) else patch
+    if fact.get("code") == "ARCH_FILE_PLAN_REQUIRED":
+        required = [
+            item for item in fact.get("repair_scope", [])
+            if item in {"backend_stack", "frontend_stack", "database_mode"}
+        ]
+        for field in required:
+            value = str(incoming.get(field) or "").strip().lower()
+            if not value or value == "none":
+                return f"修复结果仍缺少可执行的 {field}；不能生成对应 Agent 的文件计划。"
+        if "page_mode" in fact.get("repair_scope", []) and "page_mode" not in incoming:
+            return "修复结果缺少 page_mode，无法确定前端成果物目录。"
+        if "entrypoints" in fact.get("repair_scope", []) and not isinstance(incoming.get("entrypoints"), list):
+            return "修复结果缺少 entrypoints 数组，无法冻结页面入口。"
+        return None
     if fact.get("code") != "ARCH_API_ENTITY_ID_REQUIRED":
         return None
-    incoming = patch.get("delivery_contract") if isinstance(patch.get("delivery_contract"), dict) else patch
     rows = incoming.get("api_contract")
     if not isinstance(rows, list) or not rows:
         return "修复结果缺少 api_contract 数组，无法确认 API 与实体的关联。"

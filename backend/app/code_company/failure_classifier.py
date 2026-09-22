@@ -60,6 +60,9 @@ class FailureClassifier:
             )
         if step == "architecture" and any(marker in lowered for marker in (
             "entity_id", "实体合同", "api 合同", "字段", "query_parameters", "contract",
+            "成果物文件计划", "file plan", "file_plan", "artifact_ownership",
+            "归属边界", "backend_stack", "frontend_stack", "page_mode",
+            "entrypoints", "database_mode", "技术栈", "页面模式", "数据库模式",
         )):
             return FailureClassification(
                 "architecture_contract", ("architecture",), "architecture_contract",
