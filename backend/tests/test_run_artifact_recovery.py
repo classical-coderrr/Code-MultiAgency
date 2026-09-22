@@ -420,6 +420,38 @@ def test_latest_resolved_failure_fact_supersedes_stale_unresolved_copy():
     assert blockers == []
 
 
+def test_retry_plan_accepts_pre_failure_fact_validator_rows():
+    workflow = WorkflowDefinition(
+        id="legacy-fact",
+        name="legacy-fact",
+        steps=[
+            StepDefinition("backend", agent_id="backend_agent"),
+            StepDefinition("tester", agent_id="tester_agent", depends_on=["backend"]),
+        ],
+    )
+    legacy = {
+        "id": "backend-build",
+        "type": "build",
+        "target": "backend",
+        "phase": "build",
+        "error": "cannot find symbol RoomService",
+        "files": ["src/main/java/app/RoomController.java"],
+        "action": "dispatch_owner_repair",
+        "retry": True,
+    }
+
+    reset_ids, blockers = WorkflowExecutor._failure_fact_retry_plan(
+        {"failure_facts": [legacy]},
+        workflow,
+    )
+
+    assert reset_ids == {"backend"}
+    assert blockers == []
+    normalized = WorkflowExecutor._latest_failure_facts({"failure_facts": [legacy]})[0]
+    assert normalized["failure_id"].startswith("failure_legacy_")
+    assert normalized["related_files"] == ["src/main/java/app/RoomController.java"]
+
+
 def test_restore_prefers_change_requested_blueprint_over_stale_frozen_snapshot():
     repository = SQLiteRepository(":memory:")
     workflow = WorkflowDefinition(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.workflow.capability_router import CapabilityRouter
 from app.workflow.clarification import RequirementClarificationService
-from app.workflow.platform_contracts import build_project_blueprint, evidence_from_check, failure_fact_from_check
+from app.workflow.platform_contracts import build_project_blueprint, evidence_from_check, failure_fact_from_check, normalize_failure_fact
 from app.workflow.delivery_contract import build_delivery_contract
 from app.workflow.integration_gate import IntegrationGate
 from app.code_company.contract_compiler import ContractCompiler
@@ -101,6 +101,29 @@ def test_evidence_and_failure_fact_are_normalized_from_deterministic_check():
     assert evidence["status"] == "failed"
     assert failure["owner"] == "backend"
     assert failure["file"] == "StudentController.java"
+
+
+def test_legacy_failure_fact_is_upgraded_without_losing_evidence():
+    normalized = normalize_failure_fact({
+        "id": "backend-build",
+        "type": "build",
+        "target": "backend",
+        "phase": "build",
+        "error": "cannot find symbol RoomService",
+        "files": ["src/main/java/app/RoomController.java"],
+        "action": "dispatch_owner_repair",
+        "retry": True,
+        "retry_fingerprint": "legacy-fingerprint",
+    })
+
+    assert normalized is not None
+    assert normalized["code"] == "backend-build"
+    assert normalized["category"] == "build"
+    assert normalized["owner"] == "backend"
+    assert normalized["file"] == "src/main/java/app/RoomController.java"
+    assert normalized["retryable"] is True
+    assert normalized["repair_action"] == "dispatch_owner_repair"
+    assert normalized["evidence"]["legacy"] is True
 
 
 def test_artifact_failure_routes_to_check_target_owner():

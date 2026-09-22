@@ -339,6 +339,78 @@ def failure_fact_from_check(
     ).model_dump(mode="json")
 
 
+def normalize_failure_fact(value: Any, *, index: int = 0) -> dict[str, Any] | None:
+    """Upgrade legacy failure rows to the current FailureFact contract.
+
+    Older Runs used validator-shaped dictionaries (``id``, ``target``,
+    ``files`` and ``action``).  Recovery must retain their evidence while
+    applying today's bounded retry policy rather than failing model validation.
+    """
+    if not isinstance(value, dict):
+        return None
+    raw = dict(value)
+    # Preserve already persisted FailureFact rows byte-for-byte. Some early
+    # versions omitted optional fields, but their identity and resolution
+    # ordering are still authoritative during recovery.
+    if str(raw.get("failure_id") or "").strip():
+        return raw
+    evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+    related = raw.get("related_files") or raw.get("relatedFiles") or raw.get("files") or []
+    if isinstance(related, str):
+        related = [related]
+    if not isinstance(related, list):
+        related = []
+    code = str(raw.get("code") or raw.get("check_id") or raw.get("id") or "UNCLASSIFIED")
+    owner = str(raw.get("owner") or raw.get("responsibility") or raw.get("target") or "platform")
+    category = str(raw.get("category") or raw.get("failure_type") or raw.get("type") or "validation")
+    gate = str(raw.get("gate") or raw.get("phase") or raw.get("stage") or "legacy")
+    message = str(raw.get("message") or raw.get("error") or raw.get("reason") or "")
+    summary = str(raw.get("summary") or message or code)[:240]
+    severity = str(raw.get("severity") or "medium").lower()
+    if severity not in {"low", "medium", "high", "critical"}:
+        severity = "medium"
+    action = str(raw.get("repair_action") or raw.get("repairAction") or raw.get("action") or "")
+    repair_scope = raw.get("repair_scope") or raw.get("repairScope") or []
+    if isinstance(repair_scope, str):
+        repair_scope = [repair_scope]
+    if not isinstance(repair_scope, list):
+        repair_scope = []
+    failure_id = str(raw.get("failureId") or "").strip()
+    if not failure_id:
+        digest = hashlib.sha256(stable_json([code, owner, gate, summary]).encode("utf-8")).hexdigest()[:16]
+        failure_id = f"failure_legacy_{digest}"
+    legacy = not all(key in raw for key in ("failure_id", "category", "owner", "gate"))
+    normalized_evidence = dict(evidence)
+    if legacy:
+        normalized_evidence["legacy"] = True
+        normalized_evidence["legacyFields"] = sorted(str(key) for key in raw.keys())[:64]
+    return FailureFact(
+        failure_id=failure_id,
+        code=code,
+        category=category,
+        owner=owner,
+        gate=gate,
+        file=str(raw.get("file") or related[0]) if raw.get("file") or related else None,
+        related_files=[str(item) for item in related if str(item).strip()],
+        evidence=normalized_evidence,
+        expected=str(raw.get("expected") or ""),
+        actual=str(raw.get("actual") or message),
+        evidence_id=str(raw.get("evidence_id") or raw.get("evidenceId") or raw.get("check_id") or "") or None,
+        related_contract=raw.get("related_contract") or raw.get("relatedContract"),
+        severity=severity,  # type: ignore[arg-type]
+        message=message,
+        summary=summary,
+        stage=str(raw.get("stage") or raw.get("phase") or "execution"),
+        repairable=bool(raw.get("repairable", raw.get("can_auto_repair", False))),
+        retryable=bool(raw.get("retryable", raw.get("retry", False))),
+        repair_action=action,
+        repair_scope=[str(item) for item in repair_scope if str(item).strip()],
+        fingerprint=str(raw.get("fingerprint") or raw.get("retry_fingerprint") or ""),
+        attempt=max(0, int(raw.get("attempt") or raw.get("repair_round") or 0)),
+        resolved=bool(raw.get("resolved") or str(raw.get("status") or "").lower() == "resolved"),
+    ).model_dump(mode="json")
+
+
 def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 

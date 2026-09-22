@@ -61,6 +61,7 @@ from .platform_contracts import (
     build_project_blueprint,
     evidence_from_check,
     failure_fact_from_check,
+    normalize_failure_fact,
     request_blueprint_change,
 )
 from .integration_gate import IntegrationGate
@@ -812,14 +813,15 @@ class WorkflowExecutor:
             return []
         latest: dict[str, tuple[int, dict[str, Any]]] = {}
         for index, fact in enumerate(facts):
-            if not isinstance(fact, dict):
+            normalized = normalize_failure_fact(fact, index=index)
+            if normalized is None:
                 continue
             identity = str(
-                fact.get("failure_id")
-                or fact.get("fingerprint")
-                or f"{fact.get('code', 'UNCLASSIFIED')}:{fact.get('stage', '')}:{fact.get('owner', '')}"
+                normalized.get("failure_id")
+                or normalized.get("fingerprint")
+                or f"{normalized.get('code', 'UNCLASSIFIED')}:{normalized.get('stage', '')}:{normalized.get('owner', '')}"
             )
-            latest[identity] = (index, fact)
+            latest[identity] = (index, normalized)
         return [item for _, item in sorted(latest.values(), key=lambda row: row[0])]
 
     @classmethod
