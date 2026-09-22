@@ -98,6 +98,8 @@ async def test_stopped_in_flight_node_resumes_from_stable_checkpoint():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert repository.get_run("run_stopped")["status"] == RunStatus.STOPPED.value
+    assert repository.get_run("run_stopped")["state"]["context"]["cancel_requested_at"]
+    await executor.stop("run_stopped")  # duplicate stop is idempotent
     recovery_count = await executor.retry("run_stopped", workflow)
     for _ in range(30):
         if repository.get_run("run_stopped")["status"] == RunStatus.SUCCESS.value:

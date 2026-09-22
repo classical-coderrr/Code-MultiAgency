@@ -643,11 +643,29 @@ class WorkflowExecutor:
     async def stop(self, run_id: str) -> None:
         state = self._active.get(run_id)
         if not state:
+            persisted = self.repository.get_run(run_id)
+            if persisted and str(persisted.get("status") or "") == RunStatus.STOPPED.value:
+                return
             raise ValueError("Run is not active")
-        if state.task and not state.task.done() and state.task is not asyncio.current_task():
-            state.task.cancel()
-        if state.resume_task and not state.resume_task.done() and state.resume_task is not asyncio.current_task():
-            state.resume_task.cancel()
+        state.context.set("cancel_requested_at", utc_now())
+        self._persist_state(state)
+        await self.event_bus.emit(
+            "workflow.cancelling",
+            run_id,
+            {"status": RunStatus.RUNNING.value, "reason": "user_requested"},
+        )
+        cancelled_tasks: list[asyncio.Task[Any]] = []
+        for task in (state.task, state.resume_task):
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+                cancelled_tasks.append(task)
+        for task in cancelled_tasks:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
         await self._finish(state, RunStatus.STOPPED, "Stopped by user")
 
     async def abandon_for_lease_loss(self, run_id: str) -> None:
