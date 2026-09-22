@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import app.platform.workspace as workspace_module
+
 from app.code_company.runtime import CodeCompanyRuntime
 from app.code_company.planner import DynamicPlanner
 from app.code_company.repair import RepairEngine
@@ -164,6 +166,84 @@ def test_tool_gateway_move_checks_destination_policy(tmp_path: Path) -> None:
     assert result.success is False
     assert (root / "safe.txt").is_file()
     assert not (root / ".env").exists()
+
+
+def test_candidate_promotion_commits_cross_owner_rename_and_delete_as_one_set(tmp_path: Path) -> None:
+    runtime = CodeCompanyRuntime.from_root(tmp_path / "workspaces")
+    workspace = runtime.prepare_run("run_atomic_candidate")
+    stable = Path(workspace.worktree_path)
+    (stable / "backend").mkdir(parents=True)
+    (stable / "frontend").mkdir(parents=True)
+    (stable / "backend" / "Api.java").write_text("old backend", encoding="utf-8")
+    (stable / "frontend" / "Old.vue").write_text("old frontend", encoding="utf-8")
+    candidate = runtime.prepare_candidate(
+        workspace,
+        "repair-cross-layer",
+        ["backend", "frontend"],
+        [
+            {"name": "backend/Api.java", "content": "old backend", "step_id": "backend"},
+            {"name": "frontend/Old.vue", "content": "old frontend", "step_id": "frontend"},
+        ],
+    )
+    runtime.update_candidate(
+        candidate,
+        [
+            {"name": "backend/Api.java", "content": "new backend", "step_id": "backend"},
+            {"name": "frontend/App.vue", "content": "new frontend", "step_id": "frontend"},
+        ],
+    )
+
+    promoted = runtime.promote_candidate(candidate)
+
+    assert promoted.status == "STABLE"
+    assert (stable / "backend" / "Api.java").read_text(encoding="utf-8") == "new backend"
+    assert not (stable / "frontend" / "Old.vue").exists()
+    assert (stable / "frontend" / "App.vue").read_text(encoding="utf-8") == "new frontend"
+
+
+def test_candidate_promotion_rolls_back_every_file_on_partial_failure(tmp_path: Path, monkeypatch) -> None:
+    runtime = CodeCompanyRuntime.from_root(tmp_path / "workspaces")
+    workspace = runtime.prepare_run("run_atomic_rollback")
+    stable = Path(workspace.worktree_path)
+    (stable / "a.txt").write_text("old-a", encoding="utf-8")
+    (stable / "b.txt").write_text("old-b", encoding="utf-8")
+    candidate = runtime.prepare_candidate(
+        workspace,
+        "repair-rollback",
+        ["backend", "frontend"],
+        [
+            {"name": "a.txt", "content": "old-a", "step_id": "backend"},
+            {"name": "b.txt", "content": "old-b", "step_id": "frontend"},
+        ],
+    )
+    runtime.update_candidate(
+        candidate,
+        [
+            {"name": "a.txt", "content": "new-a", "step_id": "backend"},
+            {"name": "b.txt", "content": "new-b", "step_id": "frontend"},
+        ],
+    )
+    real_replace = workspace_module.os.replace
+    failed_once = False
+
+    def fail_second_file(source, destination):
+        nonlocal failed_once
+        if Path(destination).name == "b.txt" and not failed_once:
+            failed_once = True
+            raise OSError("simulated promotion failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(workspace_module.os, "replace", fail_second_file)
+
+    try:
+        runtime.promote_candidate(candidate)
+    except OSError as exc:
+        assert "simulated promotion failure" in str(exc)
+    else:
+        raise AssertionError("promotion must surface the simulated failure")
+
+    assert (stable / "a.txt").read_text(encoding="utf-8") == "old-a"
+    assert (stable / "b.txt").read_text(encoding="utf-8") == "old-b"
 
 
 def test_existing_repo_is_copied_and_indexed_without_sensitive_files(tmp_path: Path) -> None:

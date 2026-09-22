@@ -7,6 +7,8 @@ existing ArtifactService continues to own materialization and versioning.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 from dataclasses import asdict, dataclass, replace
@@ -181,37 +183,114 @@ class LocalWorkspaceService:
         boundary = (self.root / ".candidates" / candidate.run_id).resolve()
         if not self._within_root(root, boundary) or root == boundary:
             raise WorkspacePathError("Invalid candidate workspace boundary")
-        if root.exists():
-            shutil.rmtree(root)
-        root.mkdir(parents=True, exist_ok=True)
+        manifest_path = self._candidate_manifest_path(candidate)
+        previous_manifest = self._read_candidate_manifest(manifest_path)
+        current_paths: list[str] = []
+        normalized_files: list[tuple[str, str]] = []
         for item in files:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 continue
             raw_name = str(item.get("name") or item.get("path") or "").replace("\\", "/")
-            pure = PurePosixPath(raw_name)
-            if not raw_name or pure.is_absolute() or ".." in pure.parts:
-                raise WorkspacePathError("Candidate Artifact path is invalid")
-            destination = (root / Path(*pure.parts)).resolve()
+            normalized = self._candidate_relative_path(raw_name)
+            if normalized in current_paths:
+                raise WorkspacePathError(f"Candidate Artifact path is duplicated: {normalized}")
+            current_paths.append(normalized)
+            normalized_files.append((normalized, str(item["content"])))
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for relative, content in normalized_files:
+            destination = (root / Path(*PurePosixPath(relative).parts)).resolve()
             if not self._within_root(destination, root):
                 raise WorkspacePathError("Candidate Artifact escapes workspace")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(str(item["content"]), encoding="utf-8", newline="")
+            destination.write_text(content, encoding="utf-8", newline="")
+        manifest = {
+            "candidate_id": candidate.candidate_id,
+            "run_id": candidate.run_id,
+            "owners": list(candidate.owners),
+            "base_paths": previous_manifest.get("base_paths", current_paths),
+            "current_paths": current_paths,
+        }
+        self._atomic_json_write(manifest_path, manifest)
         return candidate
 
     def promote_candidate(self, candidate: CandidateWorkspaceRef) -> CandidateWorkspaceRef:
-        """Copy a verified Candidate into the stable Run workspace."""
+        """Atomically promote the complete managed Candidate file set.
+
+        Files removed or renamed inside the Candidate are removed from Stable;
+        an interrupted promotion restores every touched path from the rollback
+        snapshot so cross-Agent changes cannot be partially committed.
+        """
         source = Path(candidate.worktree_path).resolve()
         destination = Path(candidate.base_workspace_path).resolve()
         if not self._within_root(source) or not self._within_root(destination):
             raise WorkspacePathError("Candidate promotion leaves configured root")
-        for path in sorted(source.rglob("*")):
-            if not path.is_file():
-                continue
-            target = (destination / path.relative_to(source)).resolve()
-            if not self._within_root(target, destination):
-                raise WorkspacePathError("Candidate promotion path escapes Stable workspace")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
+        manifest_path = self._candidate_manifest_path(candidate)
+        manifest = self._read_candidate_manifest(manifest_path)
+        if not manifest:
+            raise WorkspacePathError("Candidate manifest is missing")
+        base_paths = {
+            self._candidate_relative_path(str(item))
+            for item in manifest.get("base_paths", [])
+        }
+        current_paths = {
+            self._candidate_relative_path(str(item))
+            for item in manifest.get("current_paths", [])
+        }
+        affected_paths = sorted(base_paths | current_paths)
+        rollback_root = (source.parent / f".{candidate.candidate_id}.rollback").resolve()
+        boundary = (self.root / ".candidates" / candidate.run_id).resolve()
+        if not self._within_root(rollback_root, boundary) or rollback_root == boundary:
+            raise WorkspacePathError("Candidate rollback path escapes boundary")
+        if rollback_root.exists():
+            shutil.rmtree(rollback_root)
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        existed: set[str] = set()
+        try:
+            for relative in affected_paths:
+                target = (destination / Path(*PurePosixPath(relative).parts)).resolve()
+                if not self._within_root(target, destination):
+                    raise WorkspacePathError("Candidate promotion path escapes Stable workspace")
+                if target.exists() and not target.is_file():
+                    raise WorkspacePathError(f"Stable managed path is not a file: {relative}")
+                if target.is_file():
+                    if relative in current_paths - base_paths:
+                        raise WorkspacePathError(f"Candidate would overwrite an unmanaged file: {relative}")
+                    backup = rollback_root / Path(*PurePosixPath(relative).parts)
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, backup)
+                    existed.add(relative)
+
+            for relative in sorted(current_paths):
+                candidate_file = (source / Path(*PurePosixPath(relative).parts)).resolve()
+                target = (destination / Path(*PurePosixPath(relative).parts)).resolve()
+                if not self._within_root(candidate_file, source) or not candidate_file.is_file():
+                    raise WorkspacePathError(f"Candidate file is missing: {relative}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(f".{target.name}.{candidate.candidate_id}.tmp")
+                shutil.copy2(candidate_file, temporary)
+                os.replace(temporary, target)
+
+            for relative in sorted(base_paths - current_paths):
+                target = (destination / Path(*PurePosixPath(relative).parts)).resolve()
+                if target.is_file():
+                    target.unlink()
+        except Exception:
+            for relative in affected_paths:
+                target = (destination / Path(*PurePosixPath(relative).parts)).resolve()
+                backup = rollback_root / Path(*PurePosixPath(relative).parts)
+                if relative in existed and backup.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_name(f".{target.name}.{candidate.candidate_id}.restore")
+                    shutil.copy2(backup, temporary)
+                    os.replace(temporary, target)
+                elif target.is_file():
+                    target.unlink()
+            raise
+        finally:
+            if rollback_root.exists():
+                shutil.rmtree(rollback_root)
         return replace(candidate, status="STABLE")
 
     def discard_candidate(self, candidate: CandidateWorkspaceRef) -> CandidateWorkspaceRef:
@@ -221,7 +300,46 @@ class LocalWorkspaceService:
             raise WorkspacePathError("Invalid candidate workspace boundary")
         if root.exists():
             shutil.rmtree(root)
+        manifest_path = self._candidate_manifest_path(candidate)
+        manifest_path.unlink(missing_ok=True)
         return replace(candidate, status="REJECTED")
+
+    def _candidate_manifest_path(self, candidate: CandidateWorkspaceRef) -> Path:
+        root = Path(candidate.worktree_path).resolve()
+        boundary = (self.root / ".candidates" / candidate.run_id).resolve()
+        manifest = (root.parent / f".{candidate.candidate_id}.manifest.json").resolve()
+        if not self._within_root(manifest, boundary) or manifest == boundary:
+            raise WorkspacePathError("Candidate manifest path escapes boundary")
+        return manifest
+
+    @staticmethod
+    def _candidate_relative_path(value: str) -> str:
+        raw = str(value or "").replace("\\", "/")
+        pure = PurePosixPath(raw)
+        if not raw or pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
+            raise WorkspacePathError("Candidate Artifact path is invalid")
+        return pure.as_posix()
+
+    @staticmethod
+    def _read_candidate_manifest(path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise WorkspacePathError("Candidate manifest is invalid") from exc
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+            newline="",
+        )
+        os.replace(temporary, path)
 
     def resolve_relative(self, workspace: WorkspaceRef | dict[str, Any], relative_path: str = "") -> Path:
         root = Path(str(workspace.worktree_path if isinstance(workspace, WorkspaceRef) else workspace.get("worktree_path", ""))).resolve()
