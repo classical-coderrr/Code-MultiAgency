@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -7,7 +8,7 @@ from app.llm.base import LLMError, LLMProvider, LLMResponse
 from app.repositories.sqlite import SQLiteRepository
 from app.workflow.events import WorkflowEventBus
 from app.workflow.executor import WorkflowExecutor
-from app.workflow.models import RunStatus, StepDefinition, StepType, WorkflowDefinition
+from app.workflow.models import RunStatus, StepDefinition, StepStatus, StepType, WorkflowDefinition
 
 
 class FailBackendOnceProvider(LLMProvider):
@@ -199,3 +200,103 @@ async def test_retry_stream_does_not_close_on_old_terminal_event():
     await second_bus.emit("workflow.completed", "run_retry_stream", {"status": "SUCCESS"})
     assert (await waiting_for_recovery)["type"] == "workflow.recovered"
     await stream.aclose()
+
+
+def test_contract_defect_retry_reopens_architecture_and_invalidates_downstream():
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="contract-reopen",
+        name="contract-reopen",
+        meta={"delivery_contract": True, "contract_reopen_attempts": 2},
+        steps=[
+            StepDefinition("requirement", agent_id="requirement_agent", output="requirement_doc"),
+            StepDefinition("architecture", agent_id="architect_agent", depends_on=["requirement"], output="architecture_doc"),
+            StepDefinition("architecture_approval", type=StepType.APPROVAL, depends_on=["architecture"]),
+            StepDefinition("backend", agent_id="backend_agent", depends_on=["architecture_approval"], output="backend_result"),
+            StepDefinition("tester", agent_id="tester_agent", depends_on=["backend"], output="test_report"),
+        ],
+    )
+    run_id = "run-contract-reopen"
+    repository.create_run(run_id, workflow.id, {"requirement": "学生管理系统"}, RunStatus.FAILED.value, "now")
+    results = {
+        "requirement": StepStatus.SUCCESS,
+        "architecture": StepStatus.SUCCESS,
+        "architecture_approval": StepStatus.SUCCESS,
+        "backend": StepStatus.SUCCESS,
+        "tester": StepStatus.FAILED,
+    }
+    for step_id, status in results.items():
+        repository.upsert_step(run_id, step_id, status=status.value)
+    frozen_blueprint = {
+        "blueprint_id": "bp_test",
+        "version": 1,
+        "status": "FROZEN",
+        "change_requests": [],
+    }
+    failure = {
+        "failure_id": "failure_delivery-api-contract",
+        "code": "delivery-api-contract",
+        "category": "contract_defect",
+        "owner": "architecture",
+        "repair_action": "request_blueprint_change",
+        "related_contract": "api_contract",
+        "summary": "冻结合同缺少 CRUD API",
+        "resolved": False,
+    }
+    context = {
+        "requirement": "学生管理系统",
+        "requirement_doc": "已确认",
+        "architecture_doc": "old",
+        "delivery_contract": {"api_contract": []},
+        "delivery_contract_hash": "old-hash",
+        "compiled_contract": {"openapi": {}},
+        "project_blueprint": frozen_blueprint,
+        "artifact_validation": {"status": "failed"},
+        "delivery_gate": {"deliverable": False},
+        "__artifact_files__": [
+            {"name": "pom.xml", "content": "old", "step_id": "backend"},
+        ],
+        "failure_facts": [failure],
+    }
+    repository.save_run_snapshot(
+        run_id,
+        {
+            "version": 1,
+            "run_id": run_id,
+            "context": context,
+            "results": {key: value.value for key, value in results.items()},
+            "blueprint": frozen_blueprint,
+        },
+    )
+    repository.update_run(
+        run_id,
+        status=RunStatus.FAILED.value,
+        blueprint_json=json.dumps(frozen_blueprint),
+        failure_facts_json=json.dumps([failure]),
+    )
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        FailBackendOnceProvider(fail_backend=False),
+        WorkflowEventBus(repository),
+        repository,
+    )
+
+    run, state, reset_ids = executor._retry_plan(run_id, workflow)
+    assert reset_ids == {"architecture", "architecture_approval", "backend", "tester"}
+
+    payload = executor._prepare_contract_reopen(
+        state,
+        run,
+        reset_ids,
+        executor._contract_reopen_failures(run),
+    )
+    reopened = state.context.snapshot()
+    assert payload["attempt"] == 1
+    assert "delivery_contract" not in reopened
+    assert "compiled_contract" not in reopened
+    assert reopened["__artifact_files__"] == []
+    assert reopened["contract_reopen_count"] == 1
+    assert reopened["failure_facts"][0]["resolved"] is True
+    assert state.blueprint is None
+    assert repository.get_run(run_id)["blueprint"]["status"] == "CHANGE_REQUESTED"
+    repository._connection.close()

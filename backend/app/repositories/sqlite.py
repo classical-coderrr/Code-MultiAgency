@@ -425,7 +425,15 @@ class SQLiteRepository:
     @_sqlite_retry
     def create_approval(self, run_id: str, step_id: str, created_at: str) -> None:
         self._connection.execute(
-            "INSERT OR IGNORE INTO approval_requests (run_id, step_id, status, created_at) VALUES (?, ?, 'WAITING', ?)",
+            """
+            INSERT INTO approval_requests (run_id, step_id, status, created_at)
+            VALUES (?, ?, 'WAITING', ?)
+            ON CONFLICT(run_id, step_id) DO UPDATE SET
+                status = 'WAITING',
+                decision = NULL,
+                created_at = excluded.created_at,
+                resolved_at = NULL
+            """,
             (run_id, step_id, created_at),
         )
         self._connection.commit()

@@ -61,6 +61,7 @@ from .platform_contracts import (
     build_project_blueprint,
     evidence_from_check,
     failure_fact_from_check,
+    request_blueprint_change,
 )
 from .integration_gate import IntegrationGate
 from .platform_runtime import PlatformRuntime
@@ -684,6 +685,26 @@ class WorkflowExecutor:
 
         state = self._state_from_run(run, workflow)
         reset_ids = {step_id for step_id, step_status in state.results.items() if step_status == StepStatus.FAILED}
+        contract_failures = self._contract_reopen_failures(run)
+        if contract_failures:
+            reopen_count = int(state.context.snapshot().get("contract_reopen_count") or 0)
+            max_reopens = max(
+                1,
+                min(3, int(workflow.meta.get("contract_reopen_attempts", 2) or 2)),
+            )
+            if reopen_count >= max_reopens:
+                raise ValueError("冻结合同已达到最大重新打开次数，请人工检查需求与架构证据")
+            architecture_step = next(
+                (
+                    step.id
+                    for step in workflow.steps
+                    if step.id == "architecture" or step.agent_id == "architect_agent"
+                ),
+                None,
+            )
+            if architecture_step is None:
+                raise ValueError("冻结合同存在缺陷，但工作流没有可重新执行的 Architecture Agent")
+            reset_ids.add(architecture_step)
         if status == RunStatus.STOPPED.value:
             reset_ids.update(step_id for step_id, step_status in state.results.items() if step_status == StepStatus.RUNNING)
         if not reset_ids and "成果物" in str(run.get("error_message") or ""):
@@ -710,6 +731,132 @@ class WorkflowExecutor:
                     changed = True
         return run, state, reset_ids
 
+    @staticmethod
+    def _contract_reopen_failures(run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return unresolved post-freeze defects that require Architecture replay."""
+        facts = run.get("failure_facts")
+        if not isinstance(facts, list):
+            return []
+        return [
+            fact
+            for fact in facts
+            if isinstance(fact, dict)
+            and not bool(fact.get("resolved"))
+            and (
+                str(fact.get("repair_action") or "") == "request_blueprint_change"
+                or (
+                    str(fact.get("category") or "") == "contract_defect"
+                    and str(fact.get("owner") or "") == "architecture"
+                )
+            )
+        ]
+
+    def _prepare_contract_reopen(
+        self,
+        state: RunState,
+        run: dict[str, Any],
+        reset_ids: set[str],
+        failures: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Invalidate a frozen contract and its dependent outputs before replay.
+
+        The old Blueprint is retained as an auditable change request, while the
+        execution context is cleared so no downstream Agent can consume stale
+        contracts or artifacts during the new Architecture/approval cycle.
+        """
+        snapshot = state.context.snapshot()
+        reopen_count = int(snapshot.get("contract_reopen_count") or 0) + 1
+        related_sections = list(
+            dict.fromkeys(
+                str(fact.get("related_contract") or "delivery_contract")
+                for fact in failures
+            )
+        )
+        reason = "；".join(
+            str(fact.get("summary") or fact.get("message") or fact.get("code") or "合同缺陷")
+            for fact in failures
+        )[:2000]
+        old_blueprint = state.blueprint or run.get("blueprint")
+        change_request: dict[str, Any] = {}
+        if isinstance(old_blueprint, dict) and str(old_blueprint.get("status") or "") == "FROZEN":
+            change_request = request_blueprint_change(
+                old_blueprint,
+                source_agent="integration_gate",
+                reason=reason,
+                affected_sections=related_sections,
+                proposed_changes={},
+            )
+
+        history = snapshot.get("contract_reopen_history")
+        if not isinstance(history, list):
+            history = []
+        state.context.set("contract_reopen_count", reopen_count)
+        state.context.set(
+            "contract_reopen_history",
+            [
+                *history,
+                {
+                    "attempt": reopen_count,
+                    "reason": reason,
+                    "affected_sections": related_sections,
+                    "failure_ids": [str(item.get("failure_id") or "") for item in failures],
+                    "previous_contract_hash": snapshot.get("delivery_contract_hash"),
+                    "change_request": change_request,
+                },
+            ],
+        )
+        stale_contract_keys = (
+            "architecture_raw",
+            "architecture_decision",
+            "architecture_doc",
+            "project_blueprint",
+            "compiled_contract",
+            "delivery_contract",
+            "delivery_contract_hash",
+            "execution_plan",
+            "artifact_validation",
+            "delivery_gate",
+            "repair_last_candidate_validation",
+        )
+        for key in stale_contract_keys:
+            state.context.delete(key)
+        raw_files = snapshot.get("__artifact_files__")
+        if isinstance(raw_files, list):
+            state.context.set(
+                "__artifact_files__",
+                [
+                    item
+                    for item in raw_files
+                    if not isinstance(item, dict)
+                    or str(item.get("step_id") or item.get("owner_step") or "") not in reset_ids
+                ],
+            )
+        state.blueprint = None
+        state.adaptive_policy = {}
+        state.policy_skipped_steps = set()
+        state.delivery_status = "NOT_EVALUATED"
+        resolved_facts = [
+            {**fact, "resolved": True}
+            if isinstance(fact, dict)
+            and any(fact.get("failure_id") == item.get("failure_id") for item in failures)
+            else fact
+            for fact in (run.get("failure_facts") or [])
+        ]
+        state.context.set("failure_facts", resolved_facts)
+        self.repository.update_run(
+            state.run_id,
+            blueprint_json=json.dumps(change_request or {}, ensure_ascii=False),
+            failure_facts_json=json.dumps(resolved_facts, ensure_ascii=False),
+            delivery_status="NOT_EVALUATED",
+        )
+        return {
+            "attempt": reopen_count,
+            "reason": reason,
+            "affectedSections": related_sections,
+            "resetSteps": sorted(reset_ids),
+            "changeRequest": change_request,
+        }
+
     def validate_retry(self, run_id: str, workflow: WorkflowDefinition) -> list[str]:
         """Fail fast before a retry job is sent to a background Worker."""
         _, _, reset_ids = self._retry_plan(run_id, workflow)
@@ -726,6 +873,7 @@ class WorkflowExecutor:
         run, state, reset_ids = self._retry_plan(run_id, workflow)
         status = str(run.get("status") or "")
         steps_by_id = {step.id: step for step in workflow.steps}
+        contract_failures = self._contract_reopen_failures(run)
 
         for step_id in reset_ids:
             step = steps_by_id[step_id]
@@ -749,6 +897,12 @@ class WorkflowExecutor:
                 provider_attempts_json=json.dumps([], ensure_ascii=False),
             )
 
+        reopen_payload = None
+        if contract_failures:
+            reopen_payload = self._prepare_contract_reopen(
+                state, run, reset_ids, contract_failures
+            )
+
         state.waiting_step_id = None
         state.current_level = 0
         state.recovery_mode = True
@@ -763,6 +917,12 @@ class WorkflowExecutor:
         )
         self._persist_state(state)
         self._active[run_id] = state
+        if reopen_payload is not None:
+            await self.event_bus.emit(
+                "workflow.contract_reopened",
+                run_id,
+                reopen_payload,
+            )
         state.task = asyncio.create_task(self._run_recovered_state(state, status))
         return state.recovery_count
 

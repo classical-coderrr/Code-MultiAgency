@@ -3,6 +3,46 @@ from __future__ import annotations
 from app.repositories.sqlite import SQLiteRepository
 
 
+def test_repeated_approval_reopens_the_existing_request() -> None:
+    repository = SQLiteRepository(":memory:")
+    repository.create_run(
+        "run-reapproval",
+        "software-development",
+        {"requirement": "build"},
+        "RUNNING",
+        "2026-09-14T00:00:00+00:00",
+    )
+    repository.create_approval(
+        "run-reapproval",
+        "architecture_approval",
+        "2026-09-14T00:00:01+00:00",
+    )
+    repository.resolve_approval(
+        "run-reapproval",
+        "architecture_approval",
+        "approve",
+        "2026-09-14T00:00:02+00:00",
+    )
+
+    repository.create_approval(
+        "run-reapproval",
+        "architecture_approval",
+        "2026-09-14T00:00:03+00:00",
+    )
+
+    approval = repository._connection.execute(
+        "SELECT status, decision, created_at, resolved_at FROM approval_requests "
+        "WHERE run_id = ? AND step_id = ?",
+        ("run-reapproval", "architecture_approval"),
+    ).fetchone()
+    assert dict(approval) == {
+        "status": "WAITING",
+        "decision": None,
+        "created_at": "2026-09-14T00:00:03+00:00",
+        "resolved_at": None,
+    }
+
+
 def test_run_metrics_exclude_approval_wait_and_group_tokens_by_agent() -> None:
     repository = SQLiteRepository(":memory:")
     repository.create_run(

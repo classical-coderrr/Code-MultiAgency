@@ -1420,6 +1420,17 @@ function handleEvent(event: Record<string, any>) {
   if (type === 'workflow.contract_frozen') {
     addLog('交付合同已冻结 · 页面、接口和数据库约束已同步到各 Agent', 'workflow', 'success', undefined, JSON.stringify(payload.contract, null, 2))
   }
+  if (type === 'workflow.contract_reopened') {
+    runStatus.value = 'RUNNING'
+    persistActiveRun()
+    addLog(
+      '冻结合同已重新打开 · 正在回退架构设计',
+      'workflow',
+      'waiting',
+      undefined,
+      `第 ${Number(payload.attempt ?? 1)} 轮 · ${String(payload.reason ?? '下游验证发现合同缺陷')} · 将重新校验并等待你确认`,
+    )
+  }
   if (type === 'workflow.contract_validated') {
     addLog('架构合同预检通过 · 等待人工确认后冻结', 'workflow', 'success')
   }
@@ -1459,7 +1470,7 @@ async function connectToRun(id: string) {
   }
   source.onmessage = parseEventMessage
   const eventTypes = ['workflow.started', 'workflow.queued', 'workflow.recovered', 'workflow.recovery_exhausted', 'workflow.requirement_routed', 'workflow.budget_planned', 'workflow.policy_decided', 'step.started', 'step.completed', 'step.failed', 'step.retrying', 'step.continuing', 'step.repairing', 'step.repaired', 'step.coding_loop_completed', 'coding_loop.iteration_started', 'coding_loop.iteration_completed', 'coding_loop.tool_result', 'step.artifact_plan_recovering', 'step.artifact_plan_fallback', 'step.artifact_planned', 'step.artifact_split_planned', 'step.artifact_generating', 'step.artifact_repairing', 'step.artifact_continuing', 'step.artifact_validated', 'step.artifact_dependency_normalized', 'step.validation_started', 'step.validation_check', 'step.validation_repairing', 'step.validation_repaired', 'step.validation_owner_reexecuting', 'step.validation_candidate_rejected', 'step.validation_no_progress', 'step.validation_repair_failed', 'step.validation_repair_skipped', 'step.validation_succeeded', 'step.validation_failed', 'step.budget_planned', 'step.context_packed', 'step.budget_adjusted', 'step.runtime_adjusted', 'step.skills_resolved', 'step.skipped', 'step.waiting_approval', 'step.waiting_clarification', 'workflow.waiting_approval', 'artifact.created', 'artifact.failed', 'workflow.completed', 'workflow.failed', 'workflow.stopped']
-  eventTypes.push('workflow.contract_validated', 'workflow.contract_frozen', 'workflow.delivery_checked', 'workflow.clarification_required', 'workflow.clarification_answered', 'workflow.blueprint_created', 'workflow.blueprint_frozen', 'validation.evidence', 'integration.evidence')
+  eventTypes.push('workflow.contract_validated', 'workflow.contract_frozen', 'workflow.contract_reopened', 'workflow.delivery_checked', 'workflow.clarification_required', 'workflow.clarification_answered', 'workflow.blueprint_created', 'workflow.blueprint_frozen', 'validation.evidence', 'integration.evidence')
   eventTypes.push('repair.routed', 'repair.round_started', 'repair.target_gate_completed', 'repair.full_regression_completed', 'repair.completed', 'repair.candidate_created', 'repair.candidate_promoted', 'repair.candidate_discarded', 'repair.circuit_open', 'repair.escalated', 'step.validation_stage_started', 'step.validation_stage_completed', 'step.validation_short_circuited', 'step.validation_missing_declaration')
   eventTypes.push('architecture.contract_failed', 'architecture.repair_started', 'architecture.repair_rejected', 'architecture.target_gate_completed', 'architecture.repair_circuit_open')
   eventTypes.push('collaboration.started', 'collaboration.message', 'collaboration.completed', 'collaboration.unavailable')
