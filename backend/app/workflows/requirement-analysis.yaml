@@ -1,0 +1,20 @@
+name: requirement-analysis
+
+concurrency: 1
+
+inputs:
+  requirement: ""
+
+steps:
+  - id: requirement_analysis
+    agent: requirement_agent
+    timeout: 120s
+    retry: 1
+    skills: [requirements-scope]
+    task: |
+      请分析以下软件需求，并输出一份可执行的结构化需求文档：
+
+      {{requirement}}
+
+      文档必须包含：项目目标、用户角色、核心功能、非功能需求、页面与交互、数据结构建议、验收标准，以及明确列出不在本次范围内的内容。
+    output: requirement_doc

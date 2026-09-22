@@ -1,0 +1,175 @@
+name: software-development
+concurrency: 3
+inputs:
+  requirement: ""
+defaults:
+  skill_mode: auto
+meta:
+  delivery_contract: true
+  collaboration:
+    mode: on_failure
+    max_rounds: 2
+    timeout_seconds: 40
+    max_tokens_per_message: 400
+  layout:
+    requirement: {x: 36, y: 64}
+    token_estimator: {x: 250, y: 64}
+    architecture: {x: 464, y: 64}
+    architecture_approval: {x: 678, y: 64}
+    database: {x: 892, y: 64}
+    backend: {x: 1110, y: 16}
+    frontend: {x: 1110, y: 166}
+    tester: {x: 1328, y: 92}
+    reviewer: {x: 1546, y: 92}
+steps:
+  - id: requirement
+    agent: requirement_agent
+    timeout: 120s
+    # 需求分析发生在 Runtime Plan 之前：Auto 使用原始需求的启动预算，
+    # Manual 仍尊重用户为本节点设置的预算；后置预算不得反向覆盖本节点。
+    max_tokens: 6000
+    skills: [requirements-scope]
+    task: |
+      请严格保留用户原始范围，输出结构化需求摘要。未明确要求的能力只能列为可选建议，不得进入本次必做范围。
+      用户原始需求：{{requirement}}
+    output: requirement_doc
+
+  - id: token_estimator
+    agent: token_budget_agent
+    depends_on: [requirement]
+    timeout: 45s
+    retry: 0
+    max_tokens: 800
+    thinking: "off"
+    output_format: json
+    runtime_plan: true
+    failure_policy: continue
+    task: |
+      需求分析与必要的人工确认已经完成。请根据已确认需求、需求摘要、Provider 模型能力和后续 Agent 清单，输出本次 Run 的 Runtime Plan JSON。
+      用户原始需求（仅用于核对，不得覆盖已确认边界）：{{requirement}}
+      已确认的规范化需求：{{requirement_spec}}
+      需求分析摘要：{{requirement_doc}}
+      人工确认答案（没有待确认项时为空对象）：{{clarification_answers}}
+      Provider 能力：{{provider_capabilities}}
+      工作流 Agent：{{workflow_steps}}
+      requirement 已使用启动预算完成，不得再为 requirement 或 token_estimator 分配预算；只为后续 Agent 分配预算。
+      后续代码生成还会根据冻结架构和成果物文件清单进行文件级预算细化，此处只规划节点级安全上限。
+    output: token_budget_plan
+
+  - id: architecture
+    agent: architect_agent
+    timeout: 120s
+    failure_policy: fallback
+    # Architecture 的 Auto 启动预算会根据需求难度在 2200/3600/5200 之间规划。
+    max_tokens: 6000
+    skills: [architecture-routing]
+    depends_on: [token_estimator]
+    task: |
+      Routing guard: a business/data management system or CRUD requirement must keep both Backend and Frontend unless the original user request explicitly allows pure frontend, browser-only, no backend, or localStorage. Do not classify a student/user/order/product management system as static_html just because it is simple, a demo, an MVP, or does not mention an API/database. If the scope is ambiguous, preserve the implementation branches and list the ambiguity in risks.
+      Architecture should also report required_capabilities, optional_capabilities, evidence, needs_clarification, and clarification_questions. Prefer capability names such as frontend, backend, persistence, authentication, external_api, tool, rag, artifact, human_approval, and async. Do not invent or select a company-specific route from these fields.
+      请先根据用户原始需求判断项目类型和范围，再参考需求摘要；不得把摘要中的可选建议升级为必做功能。只有纯展示内容、广告页、落地页或单文件静态 HTML 且用户没有提出业务数据管理/CRUD 时，才返回 static_html 并将 backend_required 设置为 false。学生、用户、订单、商品等管理系统只要涉及增删改查，默认返回 web_app 并保留 Backend。不要输出 JSON 以外的内容。
+      用户原始需求：{{requirement}}
+      需求摘要：{{requirement_doc}}
+      规范化需求合同（其中已确认实体与 Safe Default 不得重新解释）：{{requirement_spec}}
+    output: architecture_doc
+    output_format: json
+
+  - id: architecture_approval
+    type: approval
+    depends_on: [architecture]
+
+  - id: database
+    agent: database_agent
+    timeout: 120s
+    generation_mode: artifacts
+    enforce_artifact_contract: true
+    max_tokens: 6000
+    skills: [artifact-file-generation]
+    depends_on: [architecture_approval]
+    task: |
+      当前 Agent 的冻结角色合同：{{role_contract}}
+      SQL 列类型必须严格匹配冻结 Entity Contract；数据库表/字段定义要明确写进文件和数据库说明，不得改变实体、字段或主键类型。
+      只输出 Ownership 允许的 Schema、Migration、Seed、Index 与 Constraint 文件，不生成 application.yml 或应用代码。
+      Spring Boot 项目的测试和前后端联调默认使用 H2（MySQL compatibility mode）；生成的 schema、data 和 migration SQL 必须能在该环境执行，不能包含 H2 不支持的 MySQL 表选项。
+    output: database_result
+
+  - id: backend
+    agent: backend_agent
+    timeout: 120s
+    generation_mode: auto
+    enforce_artifact_contract: true
+    # Auto 由 Runtime Plan Agent 与 Architecture 策略共同规划；6000 是安全上限。
+    max_tokens: 6000
+    skills: [backend-api-contract, artifact-file-generation]
+    depends_on: [architecture_approval]
+    task: |
+      当前 Agent 的冻结角色合同：{{role_contract}}
+      原始需求（仅用于审计和文案追踪，发生冲突时不得覆盖冻结合同）：{{requirement}}
+      Java 实体属性类型必须匹配冻结 entities.fields.java_type 和 Database Agent 的真实 SQL 列类型；H2 驱动与初始化必须可用。普通本地启动默认端口 2198，允许 --server.port 覆盖。保留 SQL schema，不要另行生成冲突的表定义。
+      API 合同默认集合 GET 返回 JSON 数组，POST 返回含真实 id 的 JSON 对象；PUT/PATCH 与 DELETE 必须使用集合路径后的 /{id}，PUT/PATCH 必须持久化 payload 中每个可编辑合同字段，更新返回含真实 id 的 JSON 对象，删除返回 204。禁止改成在请求体中传 id 的集合 PUT/DELETE；不要用空响应或未约定包装格式让前端解析失败。
+      若 API 合同标记 detail_required=true，还必须实现 GET 集合路径/{id}；不能只实现列表查询。
+      基于角色合同生成最小可落地后端。不得重新解释原始需求，不得修改字段、表结构、API path、HTTP method 或核心依赖。
+      如果项目包含持久化，测试与联调环境默认使用 H2 内存数据库。Spring Boot 的 pom.xml 必须包含 com.h2database:h2 runtime 依赖；不得要求 Tester 预装或连接外部数据库。前端与后端必须使用同一组 REST 路径、HTTP 方法和 JSON 字段。
+    output: backend_result
+
+  - id: frontend
+    agent: frontend_agent
+    timeout: 120s
+    generation_mode: auto
+    enforce_artifact_contract: true
+    max_tokens: 6000
+    skills: [frontend-vue-implementation, artifact-file-generation]
+    depends_on: [architecture_approval]
+    thinking: auto
+    task: |
+      当前 Agent 的冻结角色合同：{{role_contract}}
+      原始需求（仅用于审计和文案追踪，发生冲突时不得覆盖冻结合同）：{{requirement}}
+      CRUD 页面必须提供稳定 data-testid：crud-add 为新增入口，crud-save 为表单提交，crud-row 为每条数据行，行内 crud-edit/crud-delete 为编辑删除按钮；表单字段为 crud-field-{JSON字段名}。
+      浏览器门禁由平台统一执行，HTML/static_rest 不要额外生成 Playwright、package.json、Vue 或 Vite 项目来实现平台测试；只生成页面真实需要的静态文件及用户启动说明。
+      新增/编辑可在同一可见表单；新增按钮清空表单，保存后刷新真实接口列表，编辑后回填字段，删除后刷新列表。不允许仅模拟操作成功。
+      Vue/Vite 必须为冻结角色合同中的 proxy_paths 每个前缀配置代理，target 读取 process.env.VITE_API_PROXY 并默认 http://127.0.0.1:2198；不得擅自给 API path 增删 /api 前缀或硬编码测试端口。后端默认端口同为 2198。
+      按当前 Agent 的成果物分块模式逐个生成完整文件。只能调用 Contract 中存在的 API，不得创建新的路径、方法、字段或核心依赖。
+    output: frontend_result
+
+  - id: tester
+    agent: tester_agent
+    timeout: 120s
+    max_tokens: 6000
+    skills: [test-acceptance]
+    validation:
+      enabled: true
+      targets: auto
+      build: true
+      startup: true
+      install_dependencies: true
+      timeout_seconds: 120
+      startup_timeout_seconds: 30
+      repair_attempts: 4
+      test_database: h2
+      integration: true
+      fail_fast: true
+    depends_on: [database, backend, frontend]
+    task: |
+      冻结交付合同（真实验收依据，不允许放宽）：{{delivery_contract}}
+      先阅读确定性验证器的真实结果，再输出测试与交付结论。若验证失败，必须优先报告失败检查和修复建议，不得标记为通过。
+      成果物验证结果：{{artifact_validation}}
+      编译后的实现契约：{{compiled_contract}}
+      根据后端和前端方案设计测试计划并指出风险：
+      后端：{{backend_result}}
+      前端：{{frontend_result}}
+    output: test_report
+
+  - id: reviewer
+    agent: reviewer_agent
+    timeout: 120s
+    max_tokens: 6000
+    skills: [delivery-review]
+    depends_on: [tester]
+    task: |
+      冻结交付合同（真实验收依据，不允许放宽）：{{delivery_contract}}
+      对整个软件开发方案进行最终审查，生成 final_report：
+      架构：{{architecture_doc}}
+      后端：{{backend_result}}
+      前端：{{frontend_result}}
+      测试：{{test_report}}
+    output: final_report

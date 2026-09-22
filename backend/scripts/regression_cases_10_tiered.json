@@ -1,0 +1,60 @@
+[
+  {
+    "id": "01-static-promo",
+    "requirement": "开发一个可直接打开的响应式咖啡店宣传网页，纯 HTML/CSS/JavaScript，包含品牌介绍、菜单卡片、营业时间和联系信息。纯前端、无需后端、无需数据库，不调用外部 API；交付完整 index.html、样式和脚本。",
+    "expected_stack": "static_html"
+  },
+  {
+    "id": "02-static-gallery",
+    "requirement": "开发一个响应式摄影作品展示页，纯 HTML/CSS/JavaScript；展示至少六张用本地占位图或 CSS 图形实现的作品卡片，按风景/人像分类筛选，支持明暗主题切换并用 localStorage 保存主题。纯前端、无需后端或数据库，不调用外部 API。",
+    "expected_stack": "static_html"
+  },
+  {
+    "id": "03-static-tasks",
+    "requirement": "开发一个可直接打开的待办事项网页，纯 HTML/CSS/JavaScript；待办实体字段为 id、title、completed，支持新增、列表查询、编辑标题、完成切换和删除，所有数据只保存在浏览器 localStorage。明确纯前端、无需后端、无需独立数据库。",
+    "expected_stack": "static_html",
+    "clarification_answers": {"primary_entity": "Task", "backend_required": false, "frontend_stack": "html", "database_mode": "none"}
+  },
+  {
+    "id": "04-spring-notes",
+    "requirement": "开发一个可运行的便签管理系统，Spring Boot 3 + 原生 HTML/CSS/JavaScript，页面由 Spring Boot static 目录提供。主要实体 Note 字段为 id(Long)、title(String)、content(String)；REST API 使用 /api/notes 与 /api/notes/{id}，实现新增、查询列表和详情、修改、删除；使用 JPA 与 H2，前端真实调用后端接口。无需登录或外部服务，交付 Maven 测试及启动说明。",
+    "expected_stack": "springboot_html",
+    "clarification_answers": {"primary_entity": "Note", "backend_required": true, "frontend_stack": "html", "database_mode": "h2"}
+  },
+  {
+    "id": "05-spring-books",
+    "requirement": "开发一个图书信息管理系统，Spring Boot 3 + 原生 HTML/CSS/JavaScript，同源页面放在 src/main/resources/static。主要实体 Book 字段为 id(Long)、title(String)、author(String)、price(BigDecimal)；使用 JPA/H2，REST 路径 /api/books 与 /api/books/{id}，前端完成新增、列表、按标题筛选、编辑、删除和错误提示。无需登录，不接外部数据库；交付完整源码、Maven 测试和启动说明。",
+    "expected_stack": "springboot_html",
+    "clarification_answers": {"primary_entity": "Book", "backend_required": true, "frontend_stack": "html", "database_mode": "h2"}
+  },
+  {
+    "id": "06-vue-contacts",
+    "requirement": "开发联系人管理系统，Spring Boot 3 REST 后端 + Vue 3/Vite 前端 + JPA/H2。主要实体 Contact 字段为 id(Long)、name(String)、phone(String)、email(String)。API 为 /api/contacts 与 /api/contacts/{id}；Vue 页面真实调用接口，完成新增、列表查询、编辑、删除与表单校验；Vite 配置 /api 代理。无需登录或外部服务，交付 Maven 测试、npm 构建和启动说明。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Contact", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "07-vue-inventory",
+    "requirement": "开发库存商品管理系统，Spring Boot 3 + Vue 3/Vite + JPA/H2。主要实体 Product 字段为 id(Long)、name(String)、sku(String)、stock(Integer)、price(BigDecimal)；REST 路径 /api/products 与 /api/products/{id}。页面须完成真实增删改查、按名称筛选、库存非负校验、请求失败提示；Vite 代理 /api。无需登录和外部服务，交付可构建运行的前后端源码。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Product", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "08-vue-courses",
+    "requirement": "开发课程与学生管理系统，Spring Boot 3 + Vue 3/Vite + JPA/H2。包含 Student(id Long,name String,email String) 和 Course(id Long,title String,teacher String) 两个独立实体，各自提供 /api/students、/api/courses 及各自 /{id} 的新增、列表、详情、修改、删除；Vue 页面有两个管理视图并分别真实联调 API。暂不做选课关系、登录或外部服务；Vite 代理 /api，交付完整构建与启动说明。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Student", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "09-vue-orders",
+    "requirement": "开发商品与订单管理系统，Spring Boot 3 + Vue 3/Vite + JPA/H2。Product 实体字段 id(Long)、name(String)、price(BigDecimal)、stock(Integer)，Order 实体字段 id(Long)、productId(Long)、quantity(Integer)、status(String)。分别提供 /api/products、/api/orders 及各自 /{id} 的 CRUD；新增订单时验证商品存在、quantity 为正且不超过 stock，前端页面分别管理商品和订单并展示校验错误。不要支付、登录或外部服务；Vite 代理 /api，交付可编译、启动、联调的源码。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Product", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "10-vue-room-bookings",
+    "requirement": "开发酒店客房与预订管理系统，Spring Boot 3 + Vue 3/Vite + JPA/H2。Room 实体字段 id(Long)、number(String)、type(String)、nightlyPrice(BigDecimal)、status(String)；Booking 实体字段 id(Long)、roomId(Long)、guestName(String)、checkIn(LocalDate)、checkOut(LocalDate)、status(String)。两实体分别提供 /api/rooms、/api/bookings 及各自 /{id} 的 CRUD；预订时校验客房存在、退房日晚于入住日，同一客房有效预订日期不可重叠。Vue 页面真实调用 API 并提供两类数据的新增、查看、编辑、删除及错误提示。无登录、支付或外部服务；Vite 代理 /api，交付 Maven 测试、npm 构建和启动联调说明。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Room", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  }
+]

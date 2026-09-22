@@ -1,0 +1,20 @@
+name: backend-implementation
+
+concurrency: 1
+
+inputs:
+  requirement: ""
+
+steps:
+  - id: backend_implementation
+    agent: backend_agent
+    timeout: 120s
+    retry: 1
+    skills: [backend-api-contract, artifact-file-generation]
+    task: |
+      请根据以下软件需求，输出独立的后端实现方案：
+
+      {{requirement}}
+
+      请覆盖 API 合同、数据模型、业务边界、安全、错误处理、可靠性、测试策略和落地步骤。如果需求是纯静态前端，请明确说明后端可以不实现哪些内容。
+    output: backend_result

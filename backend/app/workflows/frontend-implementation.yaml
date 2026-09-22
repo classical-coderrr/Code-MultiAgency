@@ -1,0 +1,22 @@
+name: frontend-implementation
+
+concurrency: 1
+
+inputs:
+  requirement: ""
+
+steps:
+  - id: frontend_implementation
+    agent: frontend_agent
+    timeout: 120s
+    retry: 1
+    max_tokens: 3200
+    thinking: low
+    skills: [frontend-vue-implementation, artifact-file-generation]
+    task: |
+      请根据以下软件需求，输出独立的前端实现方案：
+
+      {{requirement}}
+
+      请覆盖页面结构、组件拆分、交互状态、数据模型、响应式布局、错误与空状态、可访问性、性能和验收步骤。若需求只需要一个可直接打开的 HTML 页面，请优先给出原生 HTML、CSS、JavaScript 方案，不要强行引入后端或复杂框架。
+    output: frontend_result

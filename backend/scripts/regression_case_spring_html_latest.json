@@ -1,0 +1,7 @@
+[
+  {
+    "id": "springboot-html-latest",
+    "requirement": "开发一个学生管理系统，用 Spring Boot 和 HTML 作为技术栈，要体现增删改查功能。",
+    "expected_stack": "springboot_html"
+  }
+]

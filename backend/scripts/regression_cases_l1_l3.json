@@ -1,0 +1,17 @@
+[
+  {
+    "id": "l1-static-landing",
+    "requirement": "开发一个完整可运行的响应式咖啡品牌宣传网页，使用纯 HTML、CSS 和原生 JavaScript；包含首页横幅、产品卡片、门店信息和联系表单的前端交互。明确无需后端、无需数据库、无需登录，成果物可直接打开 index.html 运行。",
+    "expected_stack": "static_html"
+  },
+  {
+    "id": "l2-spring-html-api",
+    "requirement": "开发一个可运行的汇率换算系统：使用 Spring Boot 提供 REST API，使用原生 HTML、CSS、JavaScript 作为前端并放入 Spring Boot static 目录。用户输入金额、源币种和目标币种，前端调用 /api/convert，后端使用代码中的固定汇率返回换算结果。明确不使用数据库、不需要持久化、不做 CRUD。要求前后端接口字段一致，提供 Maven 测试和启动说明。",
+    "expected_stack": "springboot_html"
+  },
+  {
+    "id": "l3-vue-spring-h2-crud",
+    "requirement": "开发一个完整可运行的学生管理系统：Spring Boot REST 后端、Vue 3 + Vite 前端、JPA + H2 数据库。学生字段统一为 id、name、email，完整实现新增、列表查询、详情查询、修改和删除；前后端共享 /api/students 契约，修改、删除和详情使用 /api/students/{id}。配置 Vite 代理，提供数据库 Schema、DTO、Maven 测试、npm 构建和启动说明，不要登录或其他扩展功能。",
+    "expected_stack": "springboot_vue"
+  }
+]

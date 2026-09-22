@@ -1,0 +1,1346 @@
+Agent Team 错误分析记录（历史重总结版）
+========================================
+
+说明：以下内容是对之前记录的重新提炼。每条都先写错误要点，再写关键证据、根因、解决步骤和验证结果。标题前的 `*` 表示需要多轮对话、反复复现或多次排查。
+
+【2026-09-15】动态 Skill YAML 配置把未加引号的 on/off 解析为布尔值
+错误要点总结：新增 `skill_mode: on | off | auto` 后，YAML 解析回归测试发现未加引号的 `on` 被 PyYAML 按 YAML 1.1 规则读取为 `True`，导致工作流报“skill_mode must be one of auto, on, off”。这会让用户按自然 YAML 写法启用或关闭 Skill 时无法启动 Run。
+关键证据：`skill_mode: on` 进入解析器时的值为 Python `True`；同样规则下 `off` 会变为 `False`。
+根因分析：解析器只接受字符串，没有兼容 YAML 1.1 对 on/off 的历史布尔语义。
+解决步骤：1. 在 Workflow DSL 的 `skill_mode` 解析函数中显式把布尔值 `True/False` 映射为 `on/off`；2. 字符串仍严格限制为 `auto/on/off`；3. 增加 YAML alias、默认值、自动选择、手动开启和关闭的回归测试。
+验证结果：后端完整测试 92 项通过；前端 TypeScript 检查与生产构建通过；本地 Skill Registry 已加载 7 个内置 Skill。
+
+【2026-09-15】审查成果包 `run_c1535a368d-artifacts` 发现前后端均不可直接运行
+错误要点总结：用户下载的学生管理系统成果包只有根目录平铺文件，前端入口、Vue 单文件结构、依赖和后端 Java 包目录没有形成可构建工程；页面存在白屏或 404，CRUD 链路无法验证。
+关键证据：`index.html` 引用 `/src/main.js`，但成果包没有 `src/main.js`；`App.vue` 只有 `<template>` 和 `<style>`，没有 `<script setup>`，且模板之后混入两套未包裹脚本；`api.js` 引入 `axios`，但 `package.json` 没有 axios；Maven 工程没有 `src/main/java` 与 `src/main/resources`，因此 `mvn compile` 返回成功只是因为没有找到源码，并未编译 Java 文件。
+后端代码问题：`StudentService` 引用了不存在的 `com.example.studentdemo.model.Student`，实体实际位于 `entity`；Service 使用不存在的 `setStudentNumber`，实体实际只有 `setStudentNo`；Controller 将 `Optional<Student>` 直接赋给 `Student`；前后端没有明确 CORS 配置。
+根因分析：成果物生成器只收集了文件名和正文，没有校验标准工程目录、入口存在性、依赖闭包、Java 包路径、Vue SFC 结构和真实构建结果；最终审查报告也明确写的是“结构校验通过”，不是“运行验证通过”。
+解决步骤：1. 将前端文件归档到 `src/` 并补齐 Vite 配置与 axios 依赖；2. 将 Java 文件按 package 归档到 `src/main/java/com/example/studentdemo/...`，配置文件放入 `src/main/resources`；3. 统一实体字段为 `studentNo`，修复 Optional、导入和 CRUD 调用；4. 增加 CORS、接口契约和真实 `npm run build` / `mvn test` 门禁；5. Artifact 校验必须区分“结构完整”和“构建运行通过”，构建失败时不能标记 Run 成功。
+验证结果：在原成果包中执行 `npm run build` 失败，Vite 报无法解析 `/src/main.js`；未把该成果包判定为可运行交付物。
+补充检查：使用 UTF-8 直接读取源码后，`<title>` 实际内容为 `ѧ������ϵͳ`，不是正常的“学生管理系统”，说明生成内容还存在一次字符编码损坏，修复工程结构后必须重新生成或统一恢复 UTF-8 文本。
+
+【2026-09-10】* 8000 端口启动 Uvicorn 报 WinError 10013
+错误要点：Windows 启动后端绑定 8000 时被拒绝，即使释放脚本没有发现 LISTENING 进程，服务仍无法启动。
+关键证据：异常为 `WinError 10013`；端口检查结果不能解释系统保留、IPv4/IPv6 冲突或权限策略。
+根因分析：仅凭 LISTENING 进程无法确认 Windows 的全部绑定限制，原始问题没有确认唯一根因。
+解决步骤：
+1. 检查监听端口、进程 PID 和进程命令行，避免误结束无关服务。
+2. 将 Agent Team 后端切换到 3455，并同步前端代理地址。
+3. 后续同类问题增加 IPv4/IPv6、端口排除范围和权限检查。
+验证结果：3455 后端正常监听，`/api/health` 返回 HTTP 200。
+
+【2026-09-10】5173 被其他项目占用，前端使用 5174
+错误要点：Agent Team 前端无法使用默认 5173，Vite 自动选择 5174。
+关键证据：5173 已由其他本地项目监听；Agent Team Vite 进程命令行指向 `D:\Agent-Team\frontend`。
+根因分析：Vite 检测到默认端口占用后自动切换可用端口。
+解决步骤：
+1. 确认 5173 的占用进程属于其他项目。
+2. 保留其他项目不动，将 Agent Team 固定到 5174。
+3. 将前端 API 代理指向后端 3455。
+验证结果：`http://127.0.0.1:5174/` 返回 HTTP 200。
+
+【2026-09-10】* 前端直接解析响应导致 `Unexpected end of JSON input`
+错误要点：后端返回空响应、非 JSON 或异常响应时，前端二次解析失败，遮蔽了真正的接口错误。
+关键证据：浏览器报 `Failed to execute 'json' on 'Response': Unexpected end of JSON input`。
+根因分析：前端直接调用 `response.json()`，没有先判断响应体是否为空或是否为合法 JSON。
+解决步骤：
+1. 统一先读取响应文本，再分别处理 JSON、空响应和普通文本。
+2. 后端统一返回可读的 Provider、HTTP 和无效 JSON 错误。
+3. 错误信息中的 API Key 等敏感字段统一脱敏。
+验证结果：前端不再产生二次 JSON 解析异常，配置区和运行日志可以显示原始错误摘要。
+
+【2026-09-10】* 云端 LLM 配置和测试连接失败
+错误要点：切换云端模型时，Provider、Base URL、模型名或请求参数不匹配，测试连接失败且错误提示不完整。
+关键证据：接口使用 OpenAI-compatible 格式；DeepSeek Base URL 为 `https://api.deepseek.com`，请求路径为 `/chat/completions`。
+根因分析：厂商协议虽然兼容，但模型参数和错误响应格式仍可能不同，不能把所有 Provider 当成完全相同的接口。
+解决步骤：
+1. 通过 ProviderFactory 按配置创建具体 LLM Provider。
+2. 为 DeepSeek 配置 Base URL、模型和 thinking 参数适配。
+3. 增加测试连接和 Provider 能力查询接口，Key 只保存在后端 `.env`。
+验证结果：3455 的 Provider 能力接口正常；真实云端连接仍取决于有效 Key、模型可用性和网络环境。
+
+【2026-09-10】* 架构 Agent 超时、失败或看起来像死循环
+错误要点：架构 Agent 失败时，用户无法判断是超时、重试、上游错误还是任务仍在运行。
+关键证据：失败路径包括连接超时、读取超时、总任务超时、429/5xx、网络错误和无效响应体。
+根因分析：云端请求的多个失败阶段没有统一处理，前端也缺少逐 Agent 的过程日志。
+解决步骤：
+1. 使用可取消的 `httpx.AsyncClient`，分别限制连接、读取、写入/连接池和总任务时间。
+2. 取消请求后等待底层任务清理完成，再开始重试。
+3. 总任务最多等待 120 秒；首次失败后的重试降低到 `low`，最大输出限制 6000 Token。
+4. 通过 SSE 推送启动、重试、失败、跳过、取消和每个 Agent 的日志。
+验证结果：后端超时、重试、取消和下游跳过测试通过；最终测试为 18 passed。
+
+【2026-09-10】前端出现 `DataCloneError`
+错误要点：工作流画布加载时，Vue 响应式对象不能直接被 `structuredClone` 克隆。
+关键证据：Vue reactive/ref 对象包含 Proxy，浏览器结构化克隆失败。
+根因分析：克隆前没有解除 Vue 响应式代理。
+解决步骤：
+1. 统一使用 `toRaw` 获取原始对象。
+2. 对原始对象执行 `structuredClone`。
+3. 在图数据加载和重置路径中复用同一个复制函数。
+验证结果：前端类型检查和生产构建通过，画布可以正常加载。
+
+【2026-09-10】Provider 能力适配测试失败
+错误要点：未知 Provider 默认关闭思考能力后，旧测试仍假设所有 Provider 支持 `high`，导致重试配置断言失败。
+关键证据：安全默认值为 `supportsThinking=false`、`supportedLevels=[off]`；测试 Provider 未声明能力。
+根因分析：未知实现不能假设支持所有厂商参数，测试夹具也必须声明自身能力。
+解决步骤：
+1. 将未知 Provider 的默认能力设为只支持 `off`。
+2. 仅由明确的 Provider 适配器声明 `low/high/max`。
+3. 为测试 Provider 增加明确的能力声明。
+验证结果：后端测试 18 passed，未知厂商不会收到不认识的思考参数。
+
+【2026-09-10】* 架构确认后 Run 停在 `WAITING_APPROVAL`
+错误要点：前端显示架构已确认，但 Backend/Frontend 没有继续；刷新时反复提示无法刷新 Run。
+关键证据：Run 数据库状态仍为 `WAITING_APPROVAL`，`architecture_approval` 没有完成时间；当时 3455 没有监听进程。
+根因分析：前端先乐观显示确认成功，却没有检查确认接口结果；后端 `RunState` 和 `waiting_step_id` 只在内存，进程重启后 SQLite 记录存在但 Executor 没有上下文。
+解决步骤：
+1. 前端审批请求检查 HTTP 状态和响应体，失败时恢复等待状态并显示真实错误。
+2. 后端启动时从 SQLite 恢复等待审批的 Run、DAG、上下文、已完成输出和当前步骤。
+3. 增加恢复测试、刷新并发保护、实际离线提示和日志节流。
+4. 保留用户审批决定，不自动替用户批准旧 Run。
+验证结果：新增后端重启后恢复审批的端到端测试；后端 18 passed、前端构建成功、3455 健康检查 HTTP 200。旧 Run 可在刷新后重新点击确认。
+
+【2026-09-10】前端 5174 开发服务进程退出
+错误要点：后端已恢复，但前端 5174 进程退出，浏览器无法访问页面。
+关键证据：前端返回 HTTP 000；重新启动后 Vite 命令行确认来自 `D:\Agent-Team\frontend`。
+根因分析：Vite 后台进程已退出，原退出原因没有保存到可读取日志，具体是生命周期、热更新还是外部结束待确认。
+解决步骤：
+1. 重新以后台方式启动 Vite 并固定绑定 `127.0.0.1:5174`。
+2. 同时检查监听 PID、进程命令行和 HTTP 响应。
+3. 后续增加启动日志和服务存活检查，以便定位再次退出。
+验证结果：前端 5174 和后端 3455 均返回 HTTP 200。
+
+【2026-09-10】重复启动同一工作流返回 409 Conflict
+错误要点：再次提交 `POST /api/workflows/software-development/runs` 时返回 409，无法创建新的 Run。
+关键证据：当前 Run `run_0c42074c86` 状态为 `WAITING_APPROVAL`；`requirement` 和 `architecture` 已成功，`architecture_approval` 正在等待确认。
+根因分析：后端通过 `executor.is_active(workflow_id)` 防止同一个工作流同时运行多个 Run。`WAITING_APPROVAL` 仍属于未结束状态，所以重复启动会被主动拒绝；这不是 Agent 或接口崩溃。
+解决步骤：
+1. 先查看当前未结束 Run 的状态和步骤。
+2. 如果要继续当前任务，打开该 Run 并点击“确认架构”。
+3. 如果要放弃当前任务，先点击“停止运行”，再重新启动。
+4. 只有明确需要并行 Run 时，才调整工作流并发策略，并同时考虑 Provider 额度和结果隔离。
+验证结果：当前 3455 后端健康检查正常，409 响应符合重复运行保护逻辑。
+
+【2026-09-10】* 409 后前端看不到仍在运行的工作流，且日志固定在右侧
+错误要点：已有工作流处于 `WAITING_APPROVAL` 时，重复启动返回 409；前端原来只显示失败，没有接入旧 Run，用户容易误以为没有运行。运行日志还固定在右侧检查器，Agent 节点内的信息不够详细。
+关键证据：`POST /api/workflows/software-development/runs` 返回 HTTP 409；响应现在包含 `runId=run_0c42074c86` 和 `status=WAITING_APPROVAL`；前端此前通过右侧 `run-log-section` 展示日志。
+根因分析：409 是后端防止同一工作流并发运行的保护机制，等待人工审批也属于未结束状态。前端没有解析结构化 409 信息，也没有恢复旧 Run；日志展示位置和单条日志字段没有覆盖运行时、Token、重试和失败类型。
+解决步骤：
+1. 增加 Executor 查询工作流当前活跃 Run 的能力，并让 409 返回 `message`、`runId` 和 `status`。
+2. 前端识别带有 `runId` 的 409，自动接入已有 Run、加载图和运行快照；用户可以继续审批或先停止后重新运行。
+3. 移除右侧固定日志区，把 Agent 日志保留在各自节点的“运行日志”按钮下展开，并增加可滚动的详细内容。
+4. 为日志补充 Agent、耗时、重试次数、Token 输入/输出、最大输出和请求/实际思考强度；失败日志补充错误类型和原因。
+5. 移除外部英文字体依赖，统一使用中文系统字体栈，并同步记录本次多轮排查结果。
+验证结果：后端测试 18 passed；前端 `vue-tsc` 与生产构建通过；实际重复提交已返回结构化 409：旧 Run 为 `WAITING_APPROVAL`，前端可自动接入。遗留风险：如果服务刚进入启动竞态、尚未登记 Run ID，仍需等待下一次提交或刷新后再识别。
+
+【2026-09-10】* 3455 后端进程退出导致前端运行时报 HTTP 500
+错误要点：前端点击运行时出现 `Request failed · HTTP 500`，实际不是工作流业务失败，而是后端 3455 端口没有监听，前端开发服务器代理无法获得正常 API 响应。
+关键证据：检查 TCP 3455 没有监听进程；重新启动 FastAPI 后启动完成，重复运行接口恢复为 HTTP 409，并返回旧 Run 信息。
+根因分析：本次 500 的直接原因是 3455 后端进程已退出；退出发生在热更新/进程生命周期中，原进程退出原因待确认，不能把它误判成 Agent 或 Provider 错误。
+解决步骤：
+1. 读取前端实际响应并检查 3455 端口，确认问题发生在后端不可用而不是 409 业务保护。
+2. 重新启动 3455 后端并确认应用启动完成。
+3. 重复调用创建 Run 接口，确认活跃 Run 保护和结构化响应均恢复。
+4. 在前端重新加载页面，再验证旧 Run 自动恢复、审批节点选中和节点日志展开。
+验证结果：3455 后端可用；前端页面 HTTP 200；重复启动返回 409、`run_0c42074c86`、`WAITING_APPROVAL`；前端已显示审批操作和节点内详细日志。遗留风险：若后端再次被外部终止，仍需要保活/启动脚本进一步完善。
+
+【2026-09-10】* 3455 端口被旧 FastAPI 进程占用，重新启动 `--reload` 失败
+错误要点：在 `D:\Agent-Team\backend` 再次执行 `uvicorn app.main:app --reload --port 3455` 时出现 `WinError 10013`，原因是同一端口已有旧后端进程监听。
+关键证据：TCP 3455 的监听 PID 为 `26304`，进程命令行为 `D:\python\Scripts\uvicorn.exe app.main:app --port 3455`，工作目录对应 Agent-Team 后端。
+根因分析：旧的非 `--reload` FastAPI 进程仍在运行；Windows 不允许第二个 Uvicorn 实例绑定同一个本地端口，因此报访问权限错误。该错误不是代码权限配置或 Provider 配置错误。
+解决步骤：
+1. 查询 3455 的 TCP LISTENING 进程和命令行，确认占用者属于本项目。
+2. 只停止已确认的 PID `26304`，不影响其他端口和进程。
+3. 再次检查 3455，确认监听已清除，交由用户重新执行带 `--reload` 的启动命令。
+验证结果：PID `26304` 已停止，3455 已释放；用户重新执行原命令即可启动热重载后端。若再次出现同类问题，应先检查端口占用者再启动，避免重复运行多个后端实例。
+
+【2026-09-10】* 双击启动器首次执行时被 Windows 批处理编码和续行规则拆分
+错误要点：新建的双击启动脚本第一次运行时，多行 PowerShell 检查命令被 Windows 批处理解释成多条无效命令，导致启动流程没有可靠执行。
+关键证据：启动窗口出现多条“不是内部或外部命令”的提示；改用纯英文命令提示、单行 PowerShell 检查后，脚本成功释放项目旧进程并启动两个服务。
+根因分析：批处理文件中的中文字符在当前命令行代码页下显示异常，多行 `^` 续行与内嵌 PowerShell 命令的引号组合也增加了解析风险。问题属于启动脚本格式，不是 FastAPI 或 Vite 代码错误。
+解决步骤：
+1. 复现双击启动器，确认异常来自脚本解析，而不是端口释放逻辑。
+2. 移除脚本中的中文输出和多行续行，改为 ASCII 提示与单行 PowerShell 端口检查。
+3. 保留项目归属判断：只释放命令行包含 `Agent-Team` 或本项目 `app.main:app` 的进程，外部进程只提示不结束。
+4. 再次运行启动器，自动释放 5173 旧 Vite 进程，并分别启动后端热重载和前端开发服务。
+验证结果：启动器已验证成功；3455 后端和 5173 前端均监听，健康接口和首页均返回 HTTP 200。双击根目录的 `启动开发环境.bat` 即可使用。
+【2026-09-11】* Architecture Agent 返回空输出导致工作流失败
+错误要点：Requirement 成功后，Architecture 在约 38.7 秒后返回空的可见内容，Run 被标记为 FAILED；由于依赖失败，审批、Backend、Frontend、Tester、Reviewer 全部被 SKIPPED。
+关键证据：Run `run_4ff66572`；Architecture 报错 `LLMError: Agent returned an empty output`；duration 38726ms；retry_count 0；input/output tokens 0；当前配置 Provider=deepseek、Base URL=https://api.deepseek.com、model=deepseek-flash。
+根因分析：已确认的直接原因是 Provider 返回的 `message.content` 为空，后端将其判定为 LLMError；当前 OpenAI-compatible Provider 只读取 `message.content`，且空输出异常默认不可重试。另有配置风险：`deepseek-flash` 不在 DeepSeek 官方当前模型清单中，正确模型应为 `deepseek-v4-flash` 或 `deepseek-v4-pro`。未取得该次完整上游响应体，因此“空内容是模型名不兼容、思考预算耗尽还是 Provider 返回形态变化”仍待用脱敏响应体确认。
+解决步骤：
+1. 检查 Run/Step SQLite 记录，确认 Requirement 成功、Architecture 空输出、后续依赖跳过。
+2. 检查 `/api/provider/config` 与 `/api/provider/capabilities`，确认当前模型为 deepseek-flash。
+3. 对照 DeepSeek 官方 Chat Completions/Thinking 文档，确认有效模型和 thinking 参数。
+4. 前端将空输出、Provider 错误、超时和重试信息全部本地化为中文，并保留 Agent、LLM、Token、API、SSE 等专业名词。
+解决方案/后续建议：将模型改为 `deepseek-v4-pro` 或 `deepseek-v4-flash`；Provider 需同时记录 finish_reason、message.content 是否为空、reasoning_content 是否存在，并将空输出标记为可重试，第一次重试自动降为 Low；在未验证配置前不要继续消耗多轮 Token。
+验证结果：前端生产构建通过；数据库证据链完整；需要确认模型切换/是否实施 Provider 重试修复后再做云端复跑。
+【2026-09-11】* 人工确认后 Frontend Agent 单独返回空输出
+错误要点：Architecture 和人工确认均成功后，Backend 与 Frontend 并行启动；Backend 成功，Frontend 运行约 39.2 秒后失败，错误为 `Agent returned an empty output`，Tester 和 Reviewer 随后被跳过。
+关键证据：Run `run_4debd16900`；Architecture `SUCCESS`，人工确认 `SUCCESS`，Backend `SUCCESS`（duration 44181ms，output_tokens 6000），Frontend `FAILED`（duration 39170ms，retry_count 0，数据库未保存输出，错误 `Agent returned an empty output`）；Frontend YAML 可正常解析，system_prompt 长度 109；当前 Provider=deepseek、model=deepseek-v4-flash、thinking=auto、max_tokens=6000。
+根因分析：已确认的直接原因仍是 Frontend Provider 响应中的可见 `message.content` 为空。Frontend 的任务模板和 Architecture 输出都能正常传入，因为同一轮 Backend 使用相同的上下文并成功完成。当前 OpenAI-compatible Provider 只读取 `message.content`，不记录 `finish_reason`、`reasoning_content` 和原始响应形态；Executor 遇到空文本直接抛出不可重试的 `LLMError`。高概率诱因是 Frontend 任务与架构文档较长，在 `thinking=auto` 被解析为高强度且 `max_tokens=6000` 的情况下，模型把输出预算消耗在思考或返回了没有最终 content 的响应；也不能排除并行请求下的 Provider 异常响应。当前没有保存脱敏后的上游响应体，因此不能把其中一种诱因当成已确认事实。
+解决步骤：
+1. 查询同一 Run 的 step_runs，确认 Architecture、人工确认、Backend 均成功，Frontend 单独失败。
+2. 检查 Frontend YAML 和工作流模板，确认 Agent ID、system_prompt、requirement_doc、architecture_doc 均存在。
+3. 检查 Provider 配置，确认 Base URL 正确，当前模型为 deepseek-v4-flash，运行参数为 Auto/6000 Token/重试 2 次。
+4. 对照 Provider 调用实现，确认空输出发生在 `message.content` 读取之后，且空输出异常没有标记为可重试。
+解决方案/后续建议：Provider 记录并脱敏保存 `finish_reason`、`message.content`、`reasoning_content`、usage 和请求关联 ID；当 content 为空但 reasoning_content 有值时继续等待或发起一次低强度重试；将空输出标记为可重试，第一次重试自动降为 Low，并在重试前确认底层请求已结束；Frontend 可先使用 Low 或适当提高 max_tokens 验证是否为思考预算耗尽；若仍失败，再按响应体区分限流、模型异常或返回格式变化。
+验证结果：同一工作流历史上 Frontend 曾成功，说明 YAML 和连线不是必现故障；本次前端构建通过，最新数据库证据链完整，但还需要记录脱敏 Provider 响应后才能最终锁定云端返回为空的具体原因。
+【2026-09-11】* 空输出重试与 Provider 响应诊断修复
+错误要点：Frontend Agent 空输出时原先直接失败、没有有效重试，也没有保存 Provider 返回结构，导致无法判断是思考预算耗尽、返回格式变化还是网络异常。
+解决步骤：
+1. 扩展 LLMResponse，记录 `finish_reason`、`message.content`、`reasoning_content`、完整 `usage` 和模型信息。
+2. 为 SQLite `step_runs` 增加响应字段和 `provider_attempts_json`，兼容已有数据库并保存每次尝试。
+3. 将空输出标记为可重试；第一次重试自动使用 `Low`，并在 SSE 和历史 Run 中记录响应诊断摘要。
+4. Provider HTTP 请求使用独立 asyncio task；超时或取消时先取消并等待底层 httpx 请求清理完成，确认 task 已结束后才允许下一次重试。
+5. 将软件开发工作流和独立前端工作流的 Frontend Agent 默认思考强度设置为 `Low`。
+验证结果：后端测试 21 passed；前端 `vue-tsc` 与生产构建通过；3455 `/api/health` 返回 200；工作流 API 确认 Frontend runtime thinking 为 `low`。
+
+【2026-09-11】* 固定工作流导致简单 HTML 任务 Token 膨胀，已增加 Architecture 自适应调度
+错误要点：用户目标只是生成简单广告 HTML，但原工作流无论项目类型都固定执行 Backend、Frontend、Tester、Reviewer；Architecture 即使在文本中识别出静态 HTML，Executor 也没有结构化字段可以据此改路线，导致后端架构输出过长、整体耗时和 Token 消耗过高。
+关键证据：Run `run_8432323882` 中 Architecture 输出约 5930 Token，Backend 输出约 4979 Token，Frontend 单次上限 9000 Token 且发生重试；整条 Run 的输入约 40428 Token、输出约 49029 Token。另一次 Architecture 文本已经说明“不是分布式系统而是静态 HTML”，但旧调度器仍然启动 Backend 分支。
+根因分析：旧设计把 `max_tokens` 当成每个 Agent 的固定目标，而不是安全上限；Architecture 只返回自由文本，Executor 只能按 YAML 固定 DAG 执行；后续 Agent 还会重复接收前置长文档。思考强度会影响生成行为，但不能代替输出上限和工作流路由。
+解决步骤：
+1. 为 Architecture 增加严格 JSON 合同，要求返回项目类型、是否需要 Backend、复杂度、前端计划、后端判断依据和风险。
+2. 新增自适应策略模块：Requirement/Architecture 使用启动预算；静态 HTML 路线跳过 Backend，并为 Frontend、Tester、Reviewer 设置较小的角色预算；复杂 Web 项目按 low/medium/high 使用不同预算。
+3. 修改 Executor：合法决策后动态设置策略；Auto 模式按角色预算执行，同时把用户配置的最大 Token 作为安全上限；Manual 模式保留用户对每个 Agent 的控制。
+4. 处理策略跳过后的依赖：Backend 的输出写入“无需后端”的短标记，Tester/Reviewer 仍可正常运行；SSE 增加 `workflow.policy_decided` 和带原因的 `step.skipped` 日志。
+5. 前端 Inspector 增加 Token 模式选择和说明，运行日志显示 Architecture 的分类结果以及 Backend 是否跳过。
+验证结果：新增自适应解析、预算策略和静态 HTML 端到端测试；后端测试 25 passed；前端 `vue-tsc` 与生产构建通过。云端真实调用未在本次验证中触发，避免额外消耗 Token；需要新建 Run 才会使用新策略，历史 Run 不会被 retroactive 改路由。
+
+【2026-09-11】* 双击启动开发环境脚本失效
+错误要点：双击 `启动开发环境.bat` 无法稳定启动前后端；直接嵌入批处理的 PowerShell 端口检查包含复杂变量、引号和项目路径判断，Windows 命令行解析容易受编码和转义影响。
+关键证据：原批处理把端口释放逻辑、两个服务启动命令和 PowerShell 代码全部写在同一个 `.bat` 中；测试时 3455 曾返回一个已经退出的残留 PID `31536`，导致脚本误报“外部进程占用”。
+根因分析：批处理不适合承载复杂 PowerShell 逻辑；端口枚举结果和进程查询存在短暂竞态，监听记录对应的进程可能已经退出。旧脚本没有过滤空的进程对象，因此会把残留记录当成真实外部占用。
+解决步骤：
+1. 将 `.bat` 改为纯 ASCII 启动入口，只负责调用同目录的 `start-dev.ps1`。
+2. 将端口检查、项目进程识别、前后端启动和浏览器打开逻辑迁移到 PowerShell 脚本，使用明确的工作目录启动 FastAPI 和 Vite。
+3. 增加空进程检查：查询到已退出的 PID 时记录为残留并继续，不停止外部进程。
+4. 仅释放命令行属于本项目的进程；外部进程占用端口时安全停止并提示用户。
+验证结果：启动脚本执行成功；3455 `/api/health` 返回 HTTP 200，5173 首页返回 HTTP 200。以后直接双击 `D:\Agent-Team\启动开发环境.bat` 即可启动；如果窗口中途关闭，可查看新打开的后端或前端 PowerShell 窗口中的具体错误。
+
+【2026-09-11】* 切换千问后测试连接提示缺少真实 API Key
+错误要点：在 Provider 切换为千问后点击“测试连接”返回 `A real MODEL_API_KEY is required to test the cloud provider`，用户误以为千问 Base URL 配置错误。
+关键证据：GET `/api/provider/config` 显示当前已保存配置仍为 DeepSeek、Base URL=`https://api.deepseek.com`、model=`deepseek-v4-flash`、`apiKeyConfigured=true`；使用无 Key 的千问测试请求返回 HTTP 400，说明请求在本地校验阶段被拒绝，未发起上游请求。
+根因分析：项目当前只保存一个 active `MODEL_API_KEY`；切换 Base URL 时后端不会把 DeepSeek Key 复用给千问，前端也会主动清空旧 Key，避免不同厂商的 Key 串用。因此测试请求没有千问 API Key，ProviderFactory 安全退回 Mock 并被测试接口拒绝。千问的 Base URL 本身是 OpenAI-compatible 的 `https://dashscope.aliyuncs.com/compatible-mode/v1`，但真实连通性必须使用千问 API Key 和对应模型。
+解决步骤：
+1. Provider 增加千问/DeepSeek 下拉选择，并在切换时自动填充对应 Base URL 和常用模型。
+2. 后端 ProviderFactory 支持 qwen，通过 OpenAI-compatible Chat Completions 传输；DeepSeek 保留专用参数。
+3. 切换厂商时清空旧 Key，要求用户在本机配置对应厂商的 Key；后端测试接口改为提示“请先输入当前 Provider 的 API Key，再测试连接”。
+4. 选择千问，确认 Base URL 为 `https://dashscope.aliyuncs.com/compatible-mode/v1`，填写千问 API Key 和实际可用模型后，先测试连接，再保存配置。
+验证结果：无 Key 的千问测试稳定返回 HTTP 400（预期的安全校验）；后端测试 26 passed，前端生产构建通过；未执行真实云端调用，因为当前请求没有提供千问 Key，避免伪 Key 或错误厂商 Key 产生无效请求。
+
+【2026-09-11】* 千问 Key 已显示掩码但测试仍被判定为空
+错误要点：用户切换到千问并在 API Key 输入框看到大量圆点，点击测试仍提示“请先输入当前 Provider 的 API Key，再测试连接”。
+关键证据：截图中输入框显示密码掩码，但后端测试接口返回缺少真实 `MODEL_API_KEY`；项目代码对非空 `sk-ws-...` 不做前缀限制，且已新增 `sk-ws-` 回归测试通过。
+根因分析：Key 前缀不是问题。高概率是浏览器密码自动填充只更新了输入框的视觉内容，没有触发 Vue `v-model`，因此实际 POST 请求中的 `api_key` 仍为空；同时 3455 端口曾残留多个旧后端监听实例，可能继续返回旧的英文错误文案。
+解决步骤：
+1. ProviderFactory 保持通用 Key 校验：仅拒绝空值和示例占位符，不拒绝 `sk-ws-`。
+2. 测试连接和保存配置前，直接从密码输入框 DOM 读取实际值并同步到请求参数。
+3. 关闭该输入框的浏览器自动密码填充，避免旧厂商凭据被误显示或串用。
+4. 保持切换 Provider 时清空旧 Key，要求在本地重新输入与当前 Base URL 匹配的千问 Key。
+验证结果：后端测试 27 passed；前端 `vue-tsc` 与生产构建通过。真实云端连通性仍需用户在本地输入完整千问 Key 后点击“测试连接”，完整 Key 不进入聊天记录。
+
+【2026-09-11】* 千问真实 Key 仍被提示缺失，确认 3455 为旧后端实例
+错误要点：用户在前端输入千问 `sk-ws-...` Key 后，仍看到“请先输入当前 Provider 的 API Key，再测试连接”。
+关键证据：向 3455 发送虚假的非空 `sk-ws-test-key` 仍返回“缺少真实 MODEL_API_KEY”；而用同样请求发送到全新 3456 实例时返回上游 HTTP 401 `Incorrect API key provided`。HTTP 401 证明新实例已接收到 Key 并完成了千问上游请求，失败仅是测试字符串无效。
+根因分析：3455 存在多个无法被当前进程表识别的旧监听实例，前端代理请求会命中旧代码；旧代码不包含最新 qwen ProviderFactory 和 Key 处理逻辑。用户的 `sk-ws-` 前缀不是根因。
+解决步骤：
+1. 启动一个干净的后端实例并用非敏感测试 Key 验证 Provider 链路。
+2. 将开发后端端口从 3455 统一切换为 3456，避免继续命中旧监听；Vite `/api` 代理同步指向 3456。
+3. 更新 `启动开发环境.bat` 调用的 `start-dev.ps1`，让启动器释放和启动 3456，并更新界面中的端口提示及 README。
+4. 用户在本地页面按 `Ctrl+F5`，选择千问，重新粘贴完整 Key 后再测试；如果返回 HTTP 401，说明 Key 本身无效、地域/套餐 Base URL 不匹配或模型权限不足，而不是项目未接收 Key。
+验证结果：3456 `/api/health` 返回 HTTP 200；3456 后端和 5173 前端代理对虚假 Key 均返回上游 HTTP 401；前端生产构建和后端 27 项测试通过。真实 Key 未被读取、输出或发送到聊天。
+
+【2026-09-11】* 千问已收到 Key 但返回 HTTP 401
+错误要点：千问测试接口返回 `Provider 返回 HTTP 401: Incorrect API key provided`。
+关键证据：使用虚假的非空 Key 通过 3456 后端和 5173 前端代理测试时，服务均返回上游 HTTP 401，而不是“缺少 API Key”；说明请求已带上 Authorization 并到达千问接口。
+根因分析：项目的 Key 读取、`sk-ws-` 格式接受和 OpenAI-compatible 请求适配正常。401 表示千问拒绝凭据，常见原因是 Key 未复制完整、Key 已删除/失效、Key 所属地域与 Base URL 不一致、套餐专用 Base URL 不匹配，或该业务空间没有当前模型权限。不能仅凭 `sk-ws-` 前缀判断具体套餐。
+解决步骤：
+1. 在百炼控制台重新复制或新建一个完整 API Key，不要复制脱敏圆点或只复制前缀。
+2. 核对 Key 创建地域，并使用控制台显示的 API Host；华北2（北京）通用 OpenAI-compatible 地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`，也可按官方建议使用带 WorkspaceId 的地域专属地址。
+3. 确认 Key 所属业务空间已授权 `qwen3.8-max`；无法确认时先用控制台明确可用的 `qwen-plus` 测试。
+4. 在本地页面按 `Ctrl+F5`，选择千问、重新粘贴完整 Key，点击测试，再保存配置。
+5. 前端将 401 错误本地化为“API Key 被千问拒绝，请检查 Key 是否完整，以及地域、套餐和 Base URL 是否匹配”。
+验证结果：项目已能区分“缺少 Key”和“上游拒绝 Key”；后端 27 项测试、前端构建通过。真实 Key 未被读取、输出或发送到聊天。
+
+【2026-09-11】* Qwen3.8 被错误降级为关闭思考
+错误要点：使用 `qwen3.8-max` 时，前端日志反复显示“当前模型不支持思考控制，已自动关闭思考”，请求 Low、实际关闭；Frontend 因此没有按用户选择执行思考模式。
+关键证据：旧版 Qwen Provider 能力固定返回 `supportsThinking=false`、`supportedLevels=["off"]`；前端切换到 Qwen 也固定把 Low/High/Max 置为不可用。千问官方 OpenAI-compatible 文档明确说明 Qwen3.8 支持 `enable_thinking`、`reasoning_effort` 和 `thinking_budget`，其中 Low 对应 `low`，High/Max 可映射为 `xhigh`。
+根因分析：此前为了兼容不支持思考的 `qwen-plus`，将所有 Qwen 模型统一按不支持思考处理，没有按模型名识别 Qwen3.8；这会把 qwen3.8-max 的有效思考能力误判为关闭。
+解决步骤：
+1. 后端按模型名识别 Qwen3 系列，返回支持思考和 Low/High/Max 选项；Qwen3.8 默认能力映射到 Max（官方 `xhigh`）。
+2. Qwen3.8 请求使用 `reasoning_effort=low` 或 `xhigh`；关闭时只发送 `enable_thinking=false`，不同时发送冲突参数。
+3. 前端根据当前 Provider 和模型动态刷新思考选项，输入 `qwen3.8-max` 后不再禁用 Low/High/Max。
+4. 保留旧版 `qwen-plus` 的关闭思考兼容行为，避免向不支持的模型发送额外参数。
+验证结果：后端测试 29 passed；前端 `vue-tsc` 与生产构建通过。Qwen3.8 的真实云端调用仍需用户在本地配置有效 Key 后验证，完整 Key 未被读取、输出或发送到聊天。
+
+【2026-09-11】agent.md 规范更新补丁首次定位失败
+错误要点：首次追加项目最终目标时，补丁使用了与文件实际内容不一致的上下文，导致规范内容未写入；第二次调整上下文后成功追加。
+关键证据：第一次文件补丁返回 `apply_patch verification failed`；随后使用 UTF-8 内容确认文件真实末尾，再次补丁成功，agent.md 文件长度和行数均已更新。
+根因分析：首次补丁依据了错误编码显示的旧文本和错误的列表前缀，未匹配文件实际 UTF-8 内容。
+解决步骤：
+1. 重新按 UTF-8 读取 agent.md，确认实际内容和末尾文本。
+2. 调整补丁上下文，改为匹配文件真实末尾后追加正式规范。
+3. 重新读取并检查文件，确认 LangGraph 架构、模块边界、并发和异常边界已写入。
+验证结果：agent.md 已成功更新，写入项目最终目标与 Vibe Coding 约束；该问题已解决，无敏感信息泄露。
+
+【2026-09-11】* LangGraph 审批恢复与并行状态冲突
+错误要点：切换到 LangGraph 后，普通审批链路可以继续，但并行节点曾触发 `INVALID_CONCURRENT_GRAPH_UPDATE`；后端重启后恢复的审批 Run 继续执行时又出现 `Run is no longer active`，工作流被错误判定为失败。
+关键证据：并行分支同时返回 `run_id` 时，LangGraph 报告同一状态键在一个 step 内收到多个值；恢复场景的新 Executor 使用新的内存 Checkpoint，`Command(resume=...)` 取不到原始状态，得到的 graph state 没有 `run_id`。
+根因分析：`run_id` 是单值运行标识，不应由并行节点写回；同时，内存 Checkpoint 只适合当前进程，无法单独支撑后端重启后的恢复，而数据库里的 Run/Step 状态仍然完整。
+解决步骤：
+1. 将 `run_id` 只放入 Graph 初始输入，节点快照只合并 `context` 和 `results`，避免并行分支竞争同一单值状态。
+2. 为恢复场景增加 Checkpoint 存在性检查；有 Checkpoint 时使用 LangGraph `Command(resume=decision)`，没有时根据 SQLite 中已完成、等待审批和待执行的步骤状态重放。
+3. 重放时跳过已完成/失败/跳过的节点，并通过 `resume_decision` 直接处理已持久化的审批，防止已调用的 Agent 重复消耗 Token。
+4. 为审批恢复保留数据库状态与 LangGraph 状态的双重边界，实时事件继续由原有 SSE 推送给前端。
+验证结果：`backend/tests/test_executor_e2e.py` 3 passed；后端全量测试 30 passed；应用可正常导入并使用 `SqliteSaver`。该问题已解决，未记录或输出任何 API Key。
+
+【2026-09-12】LangGraph 异步执行器错误使用同步 SqliteSaver
+错误要点：前端显示“工作流失败 · The SqliteSaver does not support async methods”，工作流启动后无法正常执行。
+关键证据：`WorkflowExecutor` 调用的是 LangGraph 异步 `ainvoke` / `aget_state` 路径，而 `backend/app/main.py` 注入了同步 `langgraph.checkpoint.sqlite.SqliteSaver`；LangGraph 明确拒绝用同步 Saver 执行异步方法。
+根因分析：Checkpoint 实现与执行器的异步模型不匹配。同步 `SqliteSaver` 只适合 `invoke`，当前平台使用 `asyncio`、异步 HTTP 和异步 LangGraph，因此不能继续使用同步 SQLite 连接。
+解决步骤：
+1. 改用 `langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`，并补充显式依赖 `aiosqlite`。
+2. 在 FastAPI startup 事件的运行事件循环内创建异步 SQLite 连接和 Saver，完成 `setup()` 后再注入 `WorkflowExecutor`；shutdown 时关闭连接。
+3. 将 Checkpoint 是否存在的检查改为 LangGraph 异步 `aget_state`，避免对异步 Saver 调用同步方法。
+4. 增加异步 SQLite 审批恢复回归测试，验证启动、暂停、审批继续和最终完成。
+验证结果：FastAPI 启动后实际类型为 `AsyncSqliteSaver`，`/api/health` 返回正常；异步 Checkpoint 测试通过，后端全量测试和前端构建随后继续验证。
+
+【2026-09-12】* SSE 重连后历史运行日志重复显示
+错误要点：前端运行动态中多次出现相同的“工作流已开始”和“已连接实时 SSE 事件流”，容易误以为工作流或 Agent 被重复执行。
+关键证据：后端 SSE 事件包含全局递增的 `id`，但前端每次重新建立连接时都会重新接收该 Run 的历史事件，并直接调用 `handleEvent`；前端的页面恢复、窗口聚焦和可见性刷新逻辑会触发重新连接。
+根因分析：SSE 重连本身是正常的可靠性机制，但客户端没有保存并校验已处理的事件 ID；同时每次建立连接都会无条件追加一条连接日志，因此历史事件和连接提示都会重复显示。该问题属于日志展示重复，不等于工作流真实执行重复。
+解决步骤：
+1. 前端按 `Run ID + SSE 事件 ID` 保存已处理集合，相同事件再次到达时直接忽略。
+2. 对同一个 Run 的“已连接实时 SSE 事件流”提示只记录一次，避免恢复页面时重复追加连接提示。
+3. 新建或重置 Run 时清空去重集合，保证不同 Run 之间互不影响；无事件 ID 的本地 Demo 事件保持原有行为。
+验证结果：前端 `vue-tsc` 与生产构建通过；后端 32 项测试保持通过。重新连接同一个 Run 时，历史事件只会展示一次。
+
+【2026-09-12】* SQLite 业务记录与 LangGraph Checkpoint 争抢写锁
+错误要点：工作流运行时失败并返回 `database is locked`，尤其容易出现在并行 Agent、状态持久化和产物写入同时发生的场景。
+关键证据：此前 `SQLiteRepository` 和 LangGraph `AsyncSqliteSaver` 都连接 `backend/data/agent_team.db`；LangGraph Checkpoint 与 Run/Step/Artifact 记录会在同一时间写入同一个 SQLite 文件，而 SQLite 同一时刻只能有一个写事务。
+根因分析：两个持久化层共享数据库文件，且业务连接没有显式 WAL、busy timeout 和进程内串行保护，短暂的写锁没有被稳定等待，最终冒泡为 `database is locked`。
+解决步骤：
+1. 将 LangGraph Checkpoint 拆分到 `backend/data/langgraph_checkpoints.db`，与业务历史 `agent_team.db` 隔离，减少跨层写锁竞争。
+2. 为业务库启用 WAL、`busy_timeout=30000`、30 秒连接超时和 `synchronous=NORMAL`。
+3. 为 SQLiteRepository 增加可重入锁，并对短暂 `database is locked` 做有限次数退避重试，避免同一连接被工作流和产物线程同时操作。
+4. 保留独立 Checkpoint 数据库的重启恢复能力；若旧 Checkpoint 不存在，继续使用已有的 SQLite Run/Step 状态重放机制。
+验证结果：后端 32 项测试通过；FastAPI 启动后实际使用 `AsyncSqliteSaver`，Checkpoint 文件为 `langgraph_checkpoints.db`，健康接口正常。
+
+【2026-09-12】* 修改运行需求后 Mock/离线演示仍显示旧需求
+错误要点：用户修改运行需求后，日志和 Agent 输出仍显示旧的“登录、菜谱搜索”等演示内容，像是运行需求被写死。
+关键证据：前端 `startRun` 原本虽然提交了需求输入，但离线 `demoSequence` 和 `demoBranchSequence` 保留了旧演示文本；后端 `MockProvider` 也曾直接返回固定的旧需求内容。后端接口本身使用 `request.requirement` 写入 Run 输入。
+根因分析：问题发生在 Mock/离线演示响应模板，而不是输入框没有提交。Mock Provider 没有根据当前 `user_prompt` 生成结果；同时，同一工作流已有未完成 Run 时，后端会返回 409，前端为避免重复执行会接入旧 Run，这也可能让新需求看起来仍在运行上一条。
+解决步骤：
+1. `startRun` 在提交前读取并清理当前输入，空需求直接提示，不再使用未捕获的旧值。
+2. `MockProvider` 从当前 `user_prompt` 提取需求摘要，动态生成需求分析、Architecture JSON、前后端方案、测试方案、审查结果和静态 HTML 预览。
+3. 离线演示的所有 Agent 分支改为使用当前需求，不再保留旧登录/菜谱业务输出；输入框移除旧默认需求，改为空白和通用示例提示。
+4. 409 接入旧 Run 时补充运行中的需求信息；如果与当前输入不同，明确提示“当前需求没有启动”，并保留旧 Run 以便先停止后重新运行。
+5. 增加回归测试，验证两条不同输入得到不同 Mock 输出，并验证静态 HTML 分类跟随当前输入。
+解决方案：真实云端 Provider 会把当前输入随 Run 传入；Mock/离线模式也必须遵守同一输入输出契约。要切换到新需求，先让上一条 Run 完成或点击“停止运行”，再提交新需求，避免 409 自动接入旧 Run。
+验证结果：后端测试 34 passed；前端 `vue-tsc` 与生产构建通过；不同需求的 Mock 输出和静态 HTML Architecture 分类回归测试通过。未读取、记录或输出任何 API Key。
+
+【2026-09-12】* Requirement Agent 输出预算耗尽后返回空可见内容
+错误要点：Requirement Agent 重试 2 次后仍失败，日志显示 `Agent 返回了空输出`；Architecture 随后被跳过。
+关键证据：截图中的最终响应记录为 `finish_reason: length`、`message.content: 空`、`reasoning_content: 有内容`、usage 为输入 132 / 输出 1200；重试日志显示第 2 次和第 3 次均使用 Low。
+根因分析：模型在输出预算达到 1200 Token 时结束生成，但没有留下可见的最终答案；思考内容存在并不等于 Agent 有可交付的 `message.content`。第一次失败后虽然自动降为 Low，剩余输出预算和响应形态没有改变，因此重试仍返回空内容。Architecture 依赖 Requirement 的成功结果，Requirement 失败后被跳过属于依赖保护。
+解决步骤：
+1. 通过 `finish_reason`、`message.content`、`reasoning_content` 和 usage 区分“正常空文本”“思考有内容但最终答案为空”和“输出长度耗尽”。
+2. 将 `finish_reason=length` 且 content 为空标记为可重试，并保留每次 Provider 响应诊断。
+3. 首次重试继续使用 Low，并确认上一请求已真正结束后再发起下一次请求。
+4. 对 Requirement Agent 调整为更适合当前输入复杂度的输出预算，或在 Auto 模式下为需求分析保留足够的最终答案空间。
+5. Requirement 仍失败时，明确显示“需求分析失败，后续 Architecture 未执行”，不要让“策略跳过”掩盖上游依赖失败。
+解决方案：这类问题的重点不是继续重复点击运行，而是让模型在预算内先输出最终结论；同时前端应把“输出长度耗尽”和“依赖跳过”分开显示，便于判断真正失败节点。
+验证结果：本条为截图证据下的原因定位记录；尚未在云端重新执行，避免在原因未确认前继续消耗 Token。未读取、记录或输出任何 API Key。
+
+【2026-09-12】* Requirement 界面改为 4000 但实际请求仍只有 1200 Token
+错误要点：用户把 Requirement Agent 的 Token 上限改为 4000，但最终日志仍显示输出 1200、`finish_reason=length` 和空的 `message.content`。
+关键证据：工作流配置中 Requirement 的基础上限为 1200；执行器在 `budget_mode=auto` 下会把用户设置与 `BOOTSTRAP_BUDGETS["requirement"]` 做最小值计算。当前 Auto 启动预算就是 1200，因此实际值为 `min(4000, 1200)=1200`。
+根因分析：界面上的 4000 是用户请求的上限，不是 Auto 模式下的最终发送值。Auto 模式会为 Requirement、Architecture 使用启动阶段的保守预算，先控制成本和上下文膨胀；该策略覆盖了更大的 UI 值。第一次重试只把思考强度降为 Low，没有提高输出预算，所以仍可能在 1200 Token 处被截断。
+解决步骤：
+1. 检查前端 `buildRuntimePayload`，确认 4000 已写入当前 Agent 的 `runtime.steps.requirement.max_tokens`。
+2. 检查后端 `_runtime_for_step`，确认 Auto 模式再次应用 Requirement 的 1200 启动预算。
+3. 用 `finish_reason=length`、usage 输出 1200 和空 `message.content` 对照确认请求确实在预算处结束。
+4. 临时验证时切换 Token 预算模式为 Manual，再将 Requirement 设为 4000；如果继续使用 Auto，则应提高 Requirement 的 `BOOTSTRAP_BUDGETS`，并重新评估成本。
+5. 将日志中的“策略跳过”与“Requirement 依赖失败”分开显示，避免掩盖真正失败节点。
+解决方案：当前配置不是 4000 没保存，而是 Auto 策略按设计把它截断到 1200。要让 4000 真正发给模型，必须使用 Manual 模式，或调整 Auto 的 Requirement 启动预算。
+验证结果：已通过代码链路和截图中的 1200 Token 结果互相印证；本轮未修改预算策略，也未重新调用云端模型，未读取、记录或输出任何 API Key。
+
+【2026-09-12】* Frontend Agent 第一次空输出、第二次重试成功
+错误要点：Frontend Agent 首次执行没有返回可见内容，约 51 秒后触发自动重试；第二次重试完成并生成内容，因此用户感觉前端必须重试一次才能通过。
+关键证据：截图显示 Frontend 20:22:30 开始，20:23:21 记录“Agent 返回了空输出”，随后第 2 次请求使用 Low；20:24:16 完成，重试 1 次，usage 为输入 1960 / 输出 3200，`message.content` 和 `reasoning_content` 均有内容。
+根因分析：直接原因是第一次 Provider 响应的可见 `message.content` 为空，Executor 按空输出重试策略重新发起了请求。第二次成功说明工作流依赖、Frontend Agent 和需求输入均可用，不是前端节点本身必须执行两次。完成记录中的 `finish_reason=length` 表示第二次输出达到 3200 Token 上限，但这次已经留下了可见内容。另有配置提示表明当前模型不支持思考控制，请求 Low 被实际映射为关闭思考；这不是本次重试的直接原因，但会让思考强度设置无法生效。
+解决步骤：
+1. 保留空输出自动重试，并在日志中区分第一次失败与第二次成功。
+2. 继续保存每次请求的 `finish_reason`、`message.content`、`reasoning_content` 和 usage，便于确认是空响应、预算耗尽还是 Provider 错误。
+3. 检查当前 Provider 和模型能力；如果需要 Low/High/Max，改用明确支持思考控制的模型，或接受实际关闭思考。
+4. 针对 Frontend 的长输入，使用 Manual 预算 3200 以上或启用更合适的 Auto 预算，减少 `finish_reason=length`。
+解决方案：这次重试是可靠性保护生效，不代表 Frontend 工作流设计上必须运行两次。若希望减少重试，应优先确认模型支持情况、缩短传给 Frontend 的上下文，并留出足够的最终答案 Token。
+验证结果：第二次请求成功并有完整可见内容；当前截图不足以锁定第一次空响应的上游具体返回形态，后续需查看第一次 Provider 脱敏诊断记录。未读取、记录或输出任何 API Key。
+
+【2026-09-12】Frontend `finish_reason=length` 但仍有可见内容
+错误要点：Frontend 第二次重试虽然返回了内容，但 `finish_reason=length` 表示响应在达到 3200 Token 上限时结束，结果可能不完整。
+关键证据：完成日志同时显示 `finish_reason: length`、`message.content: 有内容`、`reasoning_content: 有内容`、输出 usage 为 3200。
+根因分析：Provider 当前把“有内容”作为成功条件，但没有进一步判断输出是否因长度被截断。对于 HTML、JSON、代码或长方案，达到上限可能导致标签、括号、字段或结论被截断；因此“工作流成功”不一定代表产物完整。
+解决步骤：
+1. 将 `finish_reason=length` 单独标记为“输出可能被截断”，不要与正常 `stop` 完全等同。
+2. 对 JSON、HTML 和代码产物增加结构完整性校验；校验失败时触发继续生成或重试。
+3. 在 Auto/Manual 策略中为复杂 Frontend 任务预留更高输出上限，并要求 Prompt 先输出完整交付物再补充解释。
+4. 前端日志同时展示“已生成内容”和“可能不完整”提示，避免用户误把成功状态当作完整结果。
+解决方案：当前 3200 Token 可以作为验证值，但正式生成 HTML 或代码时应提高上限，或增加“截断后继续生成并合并”的机制。
+验证结果：本条为响应元数据下的风险确认；截图没有证明内容已经完整，因此只能判定为存在截断风险。未读取、记录或输出任何 API Key。
+
+【2026-09-12】* Token 不足与上下文输出不完整的落地方案
+问题要点：用户不希望 Agent 出现“有输出但不完整”或“上下文过长导致关键内容丢失”。单纯提高 max_tokens 不能解决，因为 Provider 还有上下文窗口、思考预算、模型输出上限、费用和超时限制。
+解决方案：
+1. 增加 TokenBudgetManager：请求前统计输入 Token，读取模型的 context window 和 max output 能力，预留安全余量后计算可用输出预算；用户配置作为上限，Auto 根据 Agent 角色动态分配，Manual 保留用户设置。
+2. 增加 ContextPacker：Requirement、Architecture、Backend 等结果先转换为结构化文档和 Artifact 引用，下游 Agent 只接收任务需要的字段，不再把所有历史长文本完整拼接进 Prompt；超过预算时优先保留原始需求、决策、约束和验收标准，再压缩解释性内容。
+3. 增加 ResponseInspector：同时检查 `finish_reason`、可见 content、reasoning_content、usage、JSON/HTML/代码语法和必需字段。`finish_reason=stop` 且校验通过才算完整成功；`length`、解析失败或缺少必需内容不能直接标记 SUCCESS。
+4. 增加 Continue/Repair：如果模型已经产生部分内容，优先携带已保存片段和缺失位置继续生成，而不是从头重试；JSON/代码/HTML 按章节或文件块续写，服务端合并并再次校验。若没有可安全续写的边界，再使用 Low 重试。
+5. 产物优先文件化：HTML、代码和长文档由 Agent 通过 Artifact/File 工具分块写入工作区，模型只返回文件清单、摘要和校验结果，避免把完整文件塞进单条聊天响应。
+6. 前端状态改为“生成中/续写中/已完成/可能截断/失败”，只有完整性校验通过才显示成功；同时展示已用 Token、剩余预算和续写次数。
+推荐初始策略：Requirement 约 2000-3000 Token，Architecture 约 2500-3500 Token，简单 HTML 的 Frontend 约 6000-10000 Token；这些是起始范围，不是固定值，最终由模型能力和实际输入 Token 预检决定。
+验证标准：增加超长输入、`finish_reason=length`、空 content、有 reasoning 无 content、JSON 截断、HTML 标签未闭合、续写合并和上下文压缩测试；只有内容完整且结构校验通过时，Run 才能进入 SUCCESS。
+
+【2026-09-12】* 重启项目后仍恢复上一次工作流状态
+错误要点：重启前后端进程后，页面仍显示上一次工作流的节点状态、日志和输出，用户误以为项目没有重启或需求仍被写死。
+关键证据：前端 `initializeApp` 会从当前浏览器标签页的 `sessionStorage` 读取 `orbit.activeRun` 和 `orbit.selectedWorkflow`；随后调用 `/api/runs/{run_id}` 恢复节点状态并重新连接 SSE。后端启动时会从 `backend/data/agent_team.db` 读取 `WAITING_APPROVAL` Run 并恢复审批状态。当前数据库中确实存在旧的 `WAITING_APPROVAL` Run。
+根因分析：启动脚本只负责释放端口并重新启动进程，不会清理浏览器 `sessionStorage`、业务 SQLite 数据库或 LangGraph Checkpoint。工作流结构本身来自 YAML，每次启动都会保留；运行状态则来自持久化 Run。该设计用于页面刷新、最小化和人工审批恢复，因此重启不会等同于“新建空白运行”。
+解决步骤：
+1. 需要立即新开一次时，先点击前端“重置”清除当前页面的 Run 恢复记录；若后端仍有 `WAITING_APPROVAL`，先停止该 Run，再提交新需求。
+2. 不直接删除数据库，保留历史 Run、审计记录和 Checkpoint。
+3. 后续应将“恢复上次运行”和“新建空白运行”明确分开：启动时默认加载 YAML 图结构并显示 IDLE，只有用户主动选择恢复时才读取旧 Run；对已完成、失败或停止的 Run 不再自动恢复。
+验证结果：已确认前端存在恢复逻辑，后端存在审批 Run 恢复逻辑，并在业务数据库中发现旧的未完成 Run；本次未修改代码，未清理任何用户数据或 API Key。
+
+【2026-09-13】* Auto 模式没有按需求难度动态设置 Token 上限
+错误要点：Requirement Agent 的日志持续显示输出上限为 1200 Token，复杂需求和简单需求使用同一启动预算，复杂需求容易出现 `finish_reason=length` 或空的可见输出。
+关键证据：原工作流 YAML 将 Requirement 的 `max_tokens` 写为 1200、Architecture 写为 1600；前端会把这些值发送到 `runtime.steps`，执行器在 Auto 模式中又用固定 `BOOTSTRAP_BUDGETS` 取最小值，因此需求难度无法让启动预算升高。
+根因分析：原有自适应策略只在 Architecture 输出 JSON 后才生效，无法覆盖 Requirement 和 Architecture 这两个尚未获得结构化复杂度判断的启动步骤；启动阶段使用固定预算，且固定值还被当成了用户可见上限。
+解决步骤：
+1. 增加启动阶段的通用需求难度预估：根据需求长度、多模块、数据/API、权限安全、实时异步、部署运维和质量约束计算低/中/高等级，并保留判断依据。
+2. Auto 模式按等级为 Requirement 分配 1800/3000/4600 Token，为 Architecture 分配 2200/3600/5200 Token；用户单 Agent 配置、Provider 最大输出和 context window 仍是最终硬上限。
+3. 将代码公司 Demo 中这两个 Agent 的 YAML 值提升为 6000 安全上限，让动态规划有空间升档；Manual 模式仍可按 Agent 自定义精确值。
+4. 新增 `step.budget_planned` 日志，展示难度、判断依据、建议上限和本次计划上限，避免“看不到为什么这样分配”。
+验证结果：后端测试 40 项通过，前端生产构建通过；新增测试确认简单需求为低难度、复杂需求为高难度且高难度预算更高。未读取、记录或输出任何 API Key。
+
+【2026-09-13】* 前后端购物网站在 Backend/Frontend 阶段耗尽 Token 并重复返回空输出
+错误要点：需求是“写一个前后端的简单购物网站”，Backend 和 Frontend 仍分别在 500、3200 Token 处达到长度上限；重试两次后 `message.content` 依然为空，导致两个实现分支失败。
+关键证据：截图中 Backend 为 `finish_reason=length`、usage 输入 1502/输出 500、`message.content` 空且 `reasoning_content` 有内容；Frontend 为 `finish_reason=length`、usage 输入 1544/输出 3200，表现相同。第二、第三次请求都只降为 Low，没有进一步关闭思考。
+根因分析：此前只修正了 Requirement/Architecture 的启动预算，Backend/Frontend 的 YAML 安全上限仍为 500/3200，Architecture 策略无法突破前端提交的单 Agent 上限。同时，当前模型会让 reasoning_content 与最终可见内容共同消耗 completion Token，Low 仍可能在生成 message.content 前耗尽预算；单纯重发相同上限无法解决。
+解决步骤：
+1. 在 Requirement 前新增可配置的 `token_budget_agent`，使用固定 JSON 根据原始需求、Provider 模型能力和工作流 Agent 清单，评估难度、模型强度、每个 Agent 的输出预算与建议思考强度。
+2. 该节点最多使用 800 Token、关闭思考、默认不重试；通过通用 `runtime_plan: true` 和 `failure_policy: continue` 接入，失败时切换到本地难度预检，不阻断业务 Workflow。
+3. Runtime Plan Agent 的建议与 Architecture 策略合并时取能避免截断的安全预算，随后再受用户单 Agent 上限、Provider max output 和 context window 约束。
+4. 将代码公司 Demo 中 Backend、Frontend、Tester、Reviewer 的 YAML 值统一改为 6000 安全上限，Auto 模式在该范围内动态分配，Manual 仍按用户自定义值执行。
+5. Auto 模式允许预算评估 Agent 为输出型节点建议关闭或降低思考；重试降级改为第一次 Low、第二次 Off，避免连续三次把输出预算耗在 reasoning_content。
+6. 前端新增 Token 预算评估节点以及“需求难度、模型强度、置信度、建议上限、本次计划”的中文日志。
+验证结果：新增 Runtime Plan JSON 校验、Provider 上限裁剪、下游预算/思考控制和评估失败兜底测试；后端 43 项测试通过，前端生产构建通过。未读取、记录或输出任何 API Key。
+【2026-09-13】* Token 预算评估已生效，但 Backend 的 6000 Token 全部被模型推理占用
+错误要点：新 Run 已执行 Token 预算评估，Backend 仍连续三次返回 `finish_reason=length`、空 `message.content`，最终工作流失败。
+关键证据：Run `run_fa5bfd0c1d` 中，预算 Agent 成功并把需求判断为 medium，建议 Backend 4500 Token、thinking=off；Architecture 随后判断 complexity=high，执行器取更安全的 6000 Token。Backend 三次请求均实际使用输出 6000 Token，其中 reasoning_tokens=6000、message.content 长度为 0，证明预算已下发但全部消耗在推理阶段。当前配置为 `MODEL_PROVIDER=qwen`、`MODEL_NAME=deepseek-v4-pro-0813`。
+根因分析：Provider 能力识别按 Provider 名称与模型前缀共同判断。当前使用 Qwen/DashScope 接口承载 DeepSeek 模型，但代码只在模型名以 `qwen3` 开头时发送 `enable_thinking` 或 `reasoning_effort`。因此能力接口错误宣称模型不支持思考控制，Executor 虽显示 effectiveThinking=off，真实 HTTP 请求却没有携带 `enable_thinking=false`，百炼上的 DeepSeek-V4 默认开启思考。预算 Agent 只能决定额度，不能弥补请求参数没有真正生效；增加 max_tokens 会让该模型继续推理更久。
+解决步骤：
+1. 将能力识别从“只按 Provider 名称”改成“Provider 接口族 + 具体模型能力”，识别 DashScope 上的 DeepSeek-V4 模型。
+2. 对 `deepseek-v4-pro-0813` 按百炼 OpenAI-compatible 规范发送顶层 `enable_thinking` 与受支持的 `reasoning_effort`；先用 Low 验证。若该快照拒绝关闭思考，则不要伪装为 Off，应显示“仅支持 Low/High/Max”。
+3. 在每次 Provider 尝试日志中记录脱敏后的实际生效参数，例如 `max_tokens`、`enable_thinking`、`reasoning_effort`，避免只显示 Executor 的意图值。
+4. 增加响应保护：若 `reasoning_tokens/max_tokens` 接近 100% 且 content 为空，不再用相同参数盲目重试；下一次必须切换 Low/关闭思考、换非思考模型，或终止并给出明确原因。
+5. Token 预算 Agent 应将“推理预算”和“答案预算”分开评估，并校验模型是否能执行所推荐的思考档位；不支持时必须使用兼容映射。
+验证结果：已通过数据库逐次响应记录定位根因；本轮是分析与记录，尚未修改 Provider 参数路由，也未再次消耗云端 Token。未读取、记录或输出任何 API Key。
+【2026-09-13】* DashScope 上的 DeepSeek-V4 思考参数未实际下发——解决结果
+错误要点总结：Token 预算 Agent 已计算出预算，但 `MODEL_PROVIDER=qwen` 与 `MODEL_NAME=deepseek-v4-pro-0813` 的组合被旧代码按 Qwen 模型名前缀判断，导致 Executor 显示 Off、HTTP 请求却没有发送关闭参数；同时 YAML 中未加引号的 `off` 被解析成布尔值并回退为 Auto，前端还会用普通 Agent 配置覆盖预算 Agent 的硬限制。
+解决步骤：
+1. Provider 能力改为按 DashScope 传输层与 DeepSeek-V4 模型族共同识别，支持 `off/low/high/max`，默认 High。
+2. 对 DashScope 的 `deepseek-v4-*` 请求发送顶层 `enable_thinking`；开启思考时同时发送受支持的 `reasoning_effort`。
+3. 在 Provider 响应诊断中保存脱敏后的云端实际参数，并在 Agent 日志显示 max_tokens、enable_thinking、reasoning_effort 及各次尝试的输出/推理/正文状态。
+4. 增加推理耗尽熔断：正文为空且 reasoning 基本耗尽输出额度时，下一次必须实际降低档位；无法降低或请求参数未变化时立即停止无效重试。
+5. Runtime Plan Agent 的 800 Token、0 次重试、Off 改为后端硬限制；前端不再为该系统节点发送普通运行覆盖，并禁用其配置控件。
+6. 将 YAML 的 `thinking: off` 改成 `thinking: "off"`，防止 YAML 1.1 布尔解析。
+7. Requirement Agent 增加范围控制，明确区分确认范围、最小假设、可选建议和待确认问题；Architecture、Backend、Frontend 同时接收用户原始需求，禁止把可选项升级为必做功能。
+验证结果：后端 46 项测试全部通过，前端生产构建通过。使用当前 `.env` 对 `deepseek-v4-pro-0813` 进行了最多 32 Token 的真实云端探针，实际发送 `enable_thinking=false`，返回 `finish_reason=stop`、正文 1 Token、无 reasoning_content，证明关闭思考已在云端生效。未读取、记录或输出 API Key。
+【2026-09-14】* 运行耗时显示不出来，以及个别 Agent 仍触发续写
+错误要点总结：页面顶部“运行耗时”可能一直显示 `00:00` 或没有最终耗时；同时某些 Agent 仍会出现“正在续写”。这两个现象分别属于前端计时响应式失效和输出完整性保护触发，不是同一个故障。
+关键证据：前端 `liveDuration` 使用普通变量 `runStartedAt`，而不是 Vue 响应式状态；`runStartedAt` 在 `startRun()`、恢复 Run 和 SSE 事件中被赋值，但这些赋值不会让已经缓存的 `computed` 重新计算。后端虽然会把最终 `duration_ms` 写入 SQLite，并在 `workflow.completed` 事件中发送 `durationMs`，前端没有把这个最终值保存到运行耗时展示状态。
+续写原因：Executor 只要检测到 `finish_reason=length` 且已有可见正文，就会把它判定为可能截断，保存已有输出并发起 continuation 请求；Token 预算是“单次请求的安全上限”，不是保证模型在这一轮内完成所有内容的长度。思考 Token、输出格式、代码文件数量、上下文长度和 Provider 的真实最大输出都可能使一轮输出达到上限。预算评估只能提高命中率，不能保证所有任务都不需要分块或续写。
+解决步骤：
+1. 将前端 `runStartedAt` 改为 `ref<number>(0)`，所有启动、恢复和重置路径统一更新 `.value`；增加一个轻量的响应式时钟或使用运行状态变化触发刷新，让运行中计时持续更新。
+2. 增加 `finalDurationMs` 状态；收到 `workflow.completed`、`workflow.failed` 或 `workflow.stopped` 时优先展示后端事件中的 `durationMs`，恢复历史 Run 时读取后端 `duration_ms`，避免依赖浏览器时间估算。
+3. 保留 `finish_reason=length` 的续写保护，但将日志明确区分“单次输出达到上限”和“最终合并结果仍不完整”；续写完成后再次执行 JSON、HTML、代码和必填字段校验。
+4. 对真正的代码成果物优先按文件或结构块生成，避免把多个文件、长解释和完整方案塞进同一次响应；只有确实达到完整性边界时才停止续写。
+5. 运行时日志同时展示本次 `plannedMaxTokens`、实际输出 Token、`finish_reason`、续写次数和最终校验结果，避免把合理续写误认为预算分配失效。
+解决方案：本条先完成根因分析和记录，尚未修改代码。下一次实现应优先修复前端计时的响应式状态和后端最终耗时回填，再根据实际 Run 日志判断续写属于正常的完整性保护还是预算/Prompt 仍需调整。未读取、记录或输出任何 API Key。
+【2026-09-14】验证命令在错误目录执行
+错误要点总结：后端测试已经通过，但组合执行前端构建时工作目录仍为 `backend`，因此 npm 找不到 `D:\Agent-Team\backend\package.json`。
+
+【*2026-09-14】成果物模式生成 `style.css` 仍然被 `length` 截断
+错误要点总结：用户需求为“写一个增删改查的前后端学生管理系统”。Backend/Frontend 进入成果物模式后，`style.css` 经过定点修复仍不完整，最终错误为“Provider 达到单文件输出上限”。一次 Run 的请求记录中，连续出现 10 次文件规划、生成或修复请求；最后一次实际参数为 `max_tokens=675`、`enable_thinking=false`、`finish_reason=length`，且 `message.content` 有内容，说明不是空响应，也不是思考强度没有关闭。
+根因分析：Runtime Plan Agent 给整个 Agent 步骤的建议预算过低（675 Token）。旧的成果物预算函数又把这个整步建议同时作为每个文件的上限，导致 `style.css`、修复请求都无法申请足够的独立输出空间；即使模型已经生成正文，仍会在文件末尾被 Provider 截断。重试次数没有增加，是因为成果物模式使用的是当前文件的一次定点修复，不应把同一份不足预算的完整文件反复重放。
+解决步骤：
+1. 将 Runtime Plan Agent 对普通 Agent 的最低建议预算提升为 1024 Token，避免低置信度规划直接产生不可用的极小上限；该值仍然只是上限建议，不会强制消耗。
+2. 将成果物模式改为真正的文件级预算：每个文件根据 `estimated_tokens` 加安全余量独立申请，设置 2048 Token 的文件级最低上限，并受 Provider 最大输出能力约束，不再被 675 Token 的整步建议截断。
+3. 定点修复至少继承原文件级预算，并额外保留 1.35 倍空间；修复请求仍然只发送当前文件和错误定位信息，不恢复为整条回答续写。
+4. 前端成果物日志显示文件级上限、原 Agent 规划值以及是否触发了预算提升，方便区分“规划建议”和“云端实际请求参数”。
+验证结果：后端测试 50 项通过，前端 `vue-tsc` 和生产构建通过。新增测试确认 Agent 规划为 675 Token 时，`style.css` 文件请求仍可获得 2048 Token，定点修复可获得 2765 Token。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】单 Agent 成果物任务拆分不够细，续写不应成为常规路径
+错误要点总结：用户要求单个 Agent 先拆成更细的模块任务，以减少重复生成和 Token 浪费；只有单个最小任务仍超过 Provider 上限时，才使用 continuation 兜底。原实现主要按文件拆分，较大的单文件仍可能直接生成整文件，截断后只能进入修复，任务粒度不足。
+根因分析：文件是成果物边界，但不是所有文件都是合适的最小生成单元。没有在规划阶段声明文件片段，也没有在单文件截断后先做片段规划，导致大型 CSS、路由或组件文件仍然承受单次输出压力。
+解决步骤：
+1. 扩展成果物清单，支持每个文件声明有顺序的 `parts` 片段任务；规划器对超过 1600 Token 的文件优先规划 2 到 8 个逻辑片段。
+2. 每个片段独立调用模型、独立申请预算、独立记录日志和校验，再按规划顺序合并为文件。
+3. 文件首次截断时先请求片段规划并逐段生成；片段仍不完整时先做片段级定点修复。
+4. 只有片段拆分和定点修复仍无法完成，才进入最多 2 次的最后一级 continuation，并在日志中明确标记“续写兜底”。
+5. 前端新增“已细分任务”和“最后一级续写兜底”日志，完成日志显示细分次数、定点修复次数和续写次数。
+验证结果：后端测试 54 项通过，前端 `vue-tsc` 和生产构建通过；新增测试确认规划片段时不会触发 continuation，片段拆分失败后才会依次进入文件修复和 continuation。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】`index.html` 定点修复重复生成整文件并再次达到长度上限
+错误要点总结：学生管理系统成果物生成中，`index.html` 第一次生成输出 2250 Token 后被 `finish_reason=length` 截断；定点修复又输出 3038 Token，仍然 `finish_reason=length`，最终失败。日志显示 `thinking=false` 且正文存在，问题集中在文件输出路径而不是思考强度。
+根因分析：旧的文件级定点修复提示要求模型重新输出完整 `index.html`，并把已有内容作为定位材料发送。文件已经接近或超过单次输出能力时，修复请求仍然需要重新生成全部前半部分，造成重复 Token 消耗和再次截断。
+解决步骤：
+1. 当已有正文且原因是 `Provider 达到单文件输出上限` 时，改用尾部补齐策略，只发送已有文件末尾的有限上下文，并要求模型只输出缺失后缀。
+2. 服务端将已有正文与缺失后缀直接合并，再执行 HTML、JSON 和文件完整性校验；不再把后缀响应当成完整文件覆盖原内容。
+3. 尾部补齐仍达到上限时，才进入最后一级 continuation；续写请求同样只追加新增内容，并记录为“续写兜底”。
+4. 前端日志将“从截断位置补齐”和“重新生成文件”区分显示，便于确认是否发生了整文件重复生成。
+验证结果：后端测试 55 项通过，前端源码已完成对应日志适配。新增测试确认截断文件可以通过后缀合并完成，且不会发起完整文件修复；只有后缀补齐仍被截断时才进入 continuation。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】学生管理系统的 Backend Agent 被 Architecture 策略误跳过
+错误要点总结：用户需求为开发学生管理系统并体现增删改查。某次 Run 中 Architecture 成功返回，但将项目判断为 `static_html`，并设置 `backend_required=false`；随后 Executor 按 `skip_steps=["backend"]` 主动跳过 Backend，导致用户看不到后端模块执行。
+根因分析：Architecture 当前把“没有明确写出登录、数据库或 API”作为可以使用浏览器 `localStorage` 完成的依据。学生信息的增删改查既可以做成纯前端 Demo，也可以做成前后端应用；当前规则没有把“学生管理系统”“增删改查/CRUD”“数据管理”识别为需要确认后端边界的业务信号，因此产生了过于宽松的静态页面判断。`build_adaptive_policy` 对 `project_type=static_html` 还会强制将 `backend_required` 改为 `false`，进一步放大了误判结果。
+建议解决步骤：
+1. 在 Architecture 判定中增加业务型数据管理信号：学生、用户、订单、商品、库存、管理系统、增删改查、CRUD 等不能仅凭 localStorage 直接归类为静态 HTML。
+2. 当需求没有明确“纯前端 Demo/无需后端/仅 localStorage”时，数据管理类需求默认保留 Backend 分支，或进入待确认状态而不是直接跳过。
+3. 增加硬性一致性校验：`backend_required=true` 时项目类型不能为 `static_html`；`static_html` 只能在需求明确允许本地存储且没有前后端/接口要求时生效。
+
+【*2026-09-14】需求“学生管理系统 + curd”导致 Frontend/Backend 路由不稳定
+错误要点总结：用户再次输入“生成一个学生管理系统，要求有 curd”时，Architecture 可能把需求解释为静态 HTML 或本地存储 Demo，造成实现分支被错误跳过；这不是 Provider、Token 或 Backend Agent 本身的错误，而是需求歧义没有被平台路由层保护。
+根因分析：原流程把 Architecture JSON 当作唯一的分支裁决来源；同时 `build_adaptive_policy` 会根据 `project_type=static_html` 强制跳过 Backend。模型没有把“业务数据管理”和“是否明确要求纯前端”区分开，导致“未提到 API/数据库”被错误当成“无需 Backend”。
+解决步骤：
+1. 在 `adaptive.py` 增加原始需求路由识别，识别管理系统、学生/用户/订单/商品/库存、CRUD/增删改查、Backend/API/数据库，以及纯前端/localStorage 等信号。
+2. 增加 `reconcile_architecture_decision`，当原始需求包含业务数据或 CRUD 且没有明确纯前端时，自动将冲突的 `static_html/backend_required=false` 校正为 `web_app/backend_required=true`。
+3. 将校正后的 Architecture JSON 写回 Workflow Context，确保 Backend、Frontend、Tester 和 Reviewer 看到的是同一份安全决策；同时保留原始 Architecture 输出用于审计。
+4. 调整自适应策略一致性校验：`static_html` 不再无条件覆盖 `backend_required`，出现 `static_html + backend_required=true` 时统一转为 Web 应用路线。
+5. 更新 Architecture Agent 和软件开发 Workflow 的路由规则；新增前端日志，显示路由保护是否校正、命中了哪些信号、最终保留了哪些分支。
+验证结果：后端完整测试 59 项通过，前端 TypeScript 检查和生产构建通过。新增回归测试覆盖“模型误判静态 HTML 的学生 CRUD 请求必须执行 Backend/Frontend”“明确纯前端 localStorage 时允许跳过 Backend”“Web 应用声明无需 Backend 时按安全默认值纠正”。旧 Run 已经写入 SKIPPED 的步骤不会 retroactively 重跑，需要新建一次 Run 验证修复。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】需求路由保护不能只依赖学生/订单等固定关键词
+错误要点总结：产品上线后，用户需求可能属于未知行业、未知公司或新业务。仅增加“学生、用户、订单、CRUD”等规则仍可能漏掉 CRM、ERP、业务平台、外部 API、权限、持久化和异步任务等需求；如果模型误判为静态页面，仍可能错误跳过实现 Agent。
+解决步骤：
+1. 在 `adaptive.py` 增加通用能力路由器，从原始需求提取 `frontend`、`backend`、`persistence`、`authentication`、`external_api`、`tool`、`rag`、`artifact`、`human_approval` 和 `async`。
+2. 将行业识别降级为证据来源，真正的路由依据改为能力、用户明确声明和 Architecture 返回的结构化字段。
+3. 明确纯前端、本地存储和静态展示才允许跳过 Backend；业务能力、数据持久化、权限、外部集成或异步能力默认保留 Backend。
+4. 对“做一个应用/平台”等范围不明确的需求，自动保留实现分支并设置 `needs_clarification=true`，记录 `clarification_questions`，不因模型低置信度而静默跳过。
+5. 将模型能力、原始需求证据和最终策略写入 `workflow.policy_decided` 日志，便于审计和后续恢复。
+验证结果：后端测试 63 项通过，前端 TypeScript 检查和生产构建通过。新增测试覆盖 CRM CRUD、模糊业务平台、静态广告页、纯前端 localStorage 和不一致 Architecture 决策。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】RequirementSpec、Capability Router 和 Architecture Validator 只存在功能实现，缺少企业级边界
+错误要点总结：需求路由逻辑原先集中在 `adaptive.py` 的字典和函数中，虽然能够识别能力并修正 Architecture，但没有独立的类型化需求契约、路由组件、架构校验组件，也没有在 Run 启动时持久化需求规格，后续难以扩展、审计和恢复。
+解决步骤：
+1. 新增 `RequirementSpec` Pydantic 模型，定义 Schema 版本、路由器版本、原始需求、能力清单、证据、置信度、歧义状态和二次确认问题。
+2. 新增 `CapabilityRouter`，在 Run 启动时将原始需求转换为 `RequirementSpec`，并写入 Workflow Context 与 SQLite inputs。
+3. 新增 `ArchitectureDecision` 和 `ArchitectureValidator`，Architecture 输出必须先解析为类型化决策，再与 RequirementSpec 合并校验，修正结果才能进入 Executor。
+4. 新增 `workflow.requirement_routed` 事件，前端显示必需能力、可选能力、置信度和待确认状态；保留原始 Architecture 输出用于审计。
+5. 保留 `adaptive.py` 旧函数作为兼容层，避免破坏现有测试和调用方；新的 Executor 已经改为使用 CapabilityRouter 与 ArchitectureValidator。
+验证结果：后端测试 67 项通过，前端 TypeScript 检查和生产构建通过。未读取、记录或输出任何 API Key。
+4. 在 Architecture 日志中显示“保留/跳过 Backend 的具体触发词和判定依据”，避免只显示“已跳过”。
+当前结论：这是 Architecture 自适应策略的分类问题，不是 Backend Agent 报错，也不是 Token 或 Provider 连接问题。未读取、记录或输出任何 API Key。
+解决步骤：
+1. 确认后端测试应在 `D:\Agent-Team\backend` 执行。
+2. 确认前端构建应在 `D:\Agent-Team\frontend` 执行。
+3. 不修改项目代码，改用正确目录重新执行前端构建。
+解决方案：这是验证命令路径错误，不是项目源码或依赖故障。未读取、记录或输出任何 API Key。
+
+【*2026-09-14】成果物未统一打包，Agent 日志缺少便捷复制入口
+错误要点总结：成果物原先只能逐个预览、查看源码或下载；用户希望一次性拿到当前 Run 的全部成果物。Agent 日志虽然已经显示在各自节点下方，但长日志不方便完整选中复制。
+根因分析：Artifact Service 没有按 Run 生成统一归档的能力，前端也没有 ZIP 下载入口；日志样式使用了 `overflow: hidden`，且没有提供复制当前 Agent 日志的快捷操作。
+解决步骤：
+1. 在 Artifact Service 增加按 Run 创建 ZIP 的能力，只打包 SQLite 中登记且通过工作区路径校验的文件，并通过临时文件加原子替换避免生成半成品。
+2. 增加 `GET /api/runs/{run_id}/artifacts/archive` 接口，使用后台线程生成归档，返回可下载的 ZIP，不额外调用 LLM。
+3. 在前端“工作产物”区域增加“下载全部 ZIP”；单个文件的预览、源码和下载入口继续保留。
+4. 将每个 Agent 日志区域设置为可选中文本，移除截断展示，并增加“复制”按钮；复制失败时仍可直接鼠标拖选复制。
+验证结果：后端 Pytest 68 项通过，前端 TypeScript 检查和生产构建通过；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】点击 ZIP 下载实际得到 `archive.json`，并提示“无法下载 - 没有文件”
+错误要点总结：用户期望当前 Run 的所有成果物统一下载为一个 ZIP，但页面仍可能展示历史数据库中的 `archive.json`；该记录对应的物理文件已经不存在，逐个下载时返回空文件/404，无法得到完整压缩包。
+根因分析：旧 Run 的 Artifact 数据可能出现“数据库记录存在、工作区文件不存在”的不一致；同时前端直接使用普通下载链接，无法区分后端返回的 JSON 错误与真正的 ZIP。开发环境还存在 3455/3456 端口配置曾经切换的历史，若前后端未使用同一端口，也可能命中旧后端代码。
+解决步骤：
+1. `list_public` 只返回真实存在且路径校验通过的成果物，避免继续展示不可下载的陈旧记录。
+2. ZIP 生成除读取已登记成果物外，还扫描当前 Run 工作区中的实际文件；排除 ZIP 自身和临时文件，确保未登记但已生成的文件也能打包。
+3. 前端改为先请求并校验响应类型和文件大小，再创建浏览器下载；如果返回 JSON 或空内容，页面显示明确错误，不再伪装成 `archive.json` 下载。
+4. 启动时确保前端代理端口与启动器、后端端口一致；当前项目启动器和 Vite 代理以 3456 为准。
+验证结果：补充的 ZIP 测试覆盖已登记文件和工作区未登记文件，陈旧 Artifact 行回归测试已加入；后端 Pytest 69 项通过，前端 TypeScript 检查和生产构建通过；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】Agent 日志看似可选中，但拖选时仍拖动整个 Agent 节点
+错误要点总结：日志文字的鼠标样式已经变成文本光标，但在实际拖选时触发了 Vue Flow 节点拖拽，导致节点移动而不是选中文本。
+根因分析：之前只在日志容器上阻止了 `click` 冒泡；Vue Flow 的节点拖拽在 `pointerdown/mousedown` 阶段启动，早于 `click`，因此日志区域仍把拖拽起始事件传给了节点。
+解决步骤：
+1. 在 Agent 和人工确认节点的内嵌日志容器上阻止 `pointerdown`、`mousedown` 和 `touchstart` 冒泡。
+2. 保留事件默认行为和 `user-select: text`，让浏览器继续执行原生文本选中。
+3. 日志容器和日志正文使用文本光标，复制按钮仍单独保留按钮交互。
+验证结果：前端 TypeScript 检查和生产构建通过；后端逻辑未变，未读取、记录或输出任何 API Key。
+
+【*2026-09-14】GLM-5.2 配在千问 Base URL 后，Architecture 仅返回 reasoning_content
+错误要点总结：用户将模型切换为 `glm-5.2`，但 Provider 仍为千问，Base URL 仍为 DashScope。Architecture 请求实际使用 `max_tokens=2200`，`finish_reason=length`，`message.content` 为空，`reasoning_content` 有内容，输出 Token 全部消耗在推理中，系统因无法继续降低思考强度而失败。
+根因分析：旧实现主要按 Provider 名称判断能力。`qwen + glm-5.2` 没有命中 Qwen/DeepSeek 的参数分支，因此没有向请求明确发送 GLM 的 `thinking.type=disabled` 或正确的推理参数；更根本的问题是 GLM 模型与千问 Base URL、账户体系不匹配。Provider 名称、Base URL 和模型名称三者没有经过一致性校验。
+解决步骤：
+1. 新增集中式 `ModelProfile` 能力层，先按模型族识别 GLM、DeepSeek、Qwen3，Provider 只负责 OpenAI-compatible 传输，不再单独决定模型能力。
+2. 增加 GLM 请求协议适配：关闭思考时发送 `thinking: {type: disabled}`，开启时发送 `thinking: {type: enabled}` 和规范化后的 `reasoning_effort`。
+3. 未知模型默认关闭思考控制，不猜测厂商字段；ProviderFactory 放开 OpenAI-compatible 自定义 Provider，支持不同用户接入未内置模型。
+4. 前端增加 GLM 与自定义 OpenAI-compatible Provider；GLM 默认填入智谱 Base URL 和 `glm-5.2`，检测到 GLM + 千问 DashScope URL 时显示配置警告。
+5. 正确配置 GLM-5.2 时使用 `https://open.bigmodel.cn/api/paas/v4`、智谱 API Key 和 `glm-5.2`；若使用其他网关，则选择自定义 OpenAI-compatible 并确认网关支持该模型和思考字段。
+验证结果：后端 Pytest 72 项通过，覆盖 GLM 能力识别、千问 URL 不匹配警告、GLM 思考参数和未知模型安全降级；前端 TypeScript 检查和生产构建通过；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】token_estimator 输出被 Provider 的 800 Token 上限截断
+错误要点总结：Token 预算评估 Agent 的实际参数为 `max_tokens=800`，同时返回了正文和 `reasoning_content`，`finish_reason=length`，输入约 805 Token、输出正好 800 Token，因此运行日志显示 `Agent output was truncated at the provider output limit`。
+根因分析：`token_estimator` 是一个小型 JSON 控制请求，但部分思考模型会把同一 completion 预算同时用于推理和正文；当前实现遇到截断时先按普通 JSON 不完整错误处理，虽然 `failure_policy=continue` 可以继续工作，却仍把控制节点标记为 FAILED，造成前端红色误报。若 JSON 已完整但尾部解释被截断，原逻辑也会把它误判为不完整。
+解决步骤：
+1. Runtime Plan 先尝试解析 JSON 合同；只要预算计划本身完整，即使 `finish_reason=length` 也直接采用，不再续写。
+2. JSON 不完整、空输出或推理占满预算时，使用本地需求难度预检生成 `local_difficulty_preflight` 预算计划；该过程不再调用 LLM，减少等待和 Token 消耗。
+3. 将本地计划写入 Run State 和事件日志，控制节点改为成功完成并显示“已使用本地预算兜底”，后续 Agent 继续按本地计划、Architecture 策略和 Provider 上限计算预算。
+4. 保留 Provider 的 `finish_reason`、正文、推理内容、usage 和请求参数明细，方便判断是模型思考占满、响应截断还是配置不匹配；日志不记录 API Key。
+验证结果：后端 Pytest 73 项通过，覆盖无效 Runtime Plan 兜底和“JSON 完整但尾部被截断”的场景；前端 TypeScript 检查和生产构建通过；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】Architecture 全部输出 Token 用于推理，正文为空
+错误要点总结：Architecture 请求使用 `max_tokens=2000`，`finish_reason=length`，`message.content` 为空，`reasoning_content` 有内容，输出 Token 全部消耗在推理阶段；由于本次运行的 Architecture 重试次数为 0，节点直接报 `模型已将全部输出 Token 用于推理且未生成正文`。
+根因分析：思考型模型的推理 Token 与最终 JSON 正文共用 completion 上限；`2000` 不是“正文保底 2000”，模型可以先耗尽预算而不产生 JSON。原有逻辑尊重 `retry=0`，没有为关键结构化输出提供一次自动降级恢复；当模型在关闭思考后仍不返回正文，也没有保守架构结果兜底。
+解决步骤：
+1. 对 JSON 结构化节点增加一次自动恢复：第一次出现“只有推理、没有正文”时，若模型能力允许降低思考强度，自动降级到 `off`，并在日志中标注“自动恢复”，不依赖用户配置的 retry 次数。
+2. Architecture 声明 `failure_policy: fallback`；自动恢复后仍无法得到正文时，根据已生成的 `RequirementSpec` 构造保守的 `web_app/static_html` 架构决策，保留安全的 Frontend/Backend 分支并继续进入人工确认。
+3. 仅当 Provider 已返回结构化响应但内容为空、截断或 JSON 不可解析时才允许本地兜底；HTTP 401、连接失败、模型不存在等错误不会被隐藏。
+4. 记录自动恢复次数、实际思考强度、Provider 响应明细和兜底原因，避免把“自动恢复成功”和“模型原始输出成功”混为一谈。
+验证结果：新增结构化 JSON 自动降级和 Architecture 本地保守兜底测试；后端 Pytest 75 项通过，前端 TypeScript 检查和生产构建通过；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】代码已更新但运行中的 3456 后端仍返回旧模型能力
+错误要点总结：修复后再次运行 Architecture，仍出现 `reasoning_content` 占满 `max_tokens=2000`、正文为空。直接请求当前服务的能力接口发现仍返回 `provider=qwen`、`model=glm-5.2`、`supportsThinking=false`，且没有新的 `modelFamily` 字段。
+根因分析：当前 3456 端口对应的是旧的 Python 后端进程，未加载最新的 `ModelProfile` 和结构化输出恢复代码。因此 GLM-5.2 没有被识别为 GLM，日志也没有显示 `thinking.type`、`enable_thinking` 或 `reasoning_effort`；这不是本轮代码测试失败，而是服务进程版本未切换。
+解决步骤：
+1. 停止 3456 端口对应的旧后端进程，再从 `D:\Agent-Team\backend` 重新启动 FastAPI/uvicorn；前端继续使用 5173。
+2. 重启后访问 Provider capabilities，确认返回 `modelFamily=glm`、`supportsThinking=true`、GLM 支持档位；如果仍显示 `supportsThinking=false`，说明仍连接到旧进程或错误端口。
+3. 新代码生效后，GLM 请求会发送 `thinking.type=disabled/enabled`；Architecture 只有推理没有正文时会自动降级一次，仍失败则使用保守架构进入人工确认。
+4. 不要把 GLM-5.2 配在千问 DashScope URL；应使用对应模型服务商的 Base URL 和 API Key。日志只记录脱敏后的请求控制字段，不记录 API Key。
+验证结果：当前源码后端 Pytest 75 项通过，前端 TypeScript 检查和生产构建通过；运行中的旧服务尚未被本轮工具强制终止；未读取、记录或输出任何 API Key。
+
+【*2026-09-14】工作流加载时报 `failure_policy must be one of fail, continue`
+错误要点总结：新工作流为 Architecture 增加了 `failure_policy: fallback`，但 3456 端口运行的后端仍提示解析器只接受 `fail` 和 `continue`，导致工作流配置无法加载。
+根因分析：当前源码的 Workflow Parser 已扩展为支持 `fallback`，但运行中的 Python 后端仍是旧进程/旧代码版本。新 YAML 与旧解析器不兼容，因此错误发生在工作流解析阶段，还没有进入 LLM 调用。
+解决步骤：
+1. 停止 3456 端口上的旧后端进程，从 `D:\Agent-Team\backend` 重新启动 FastAPI。
+2. 重新请求工作流接口，确认 `software-development` 能正常返回，并确认 Provider capabilities 中出现新的 `modelFamily` 字段。
+3. 新进程加载后，`failure_policy: fallback` 才会生效；Architecture 结构化输出异常时会自动恢复或使用保守架构兜底。
+4. 如果接口仍提示同一错误，说明前端代理仍指向旧端口/旧后端，需检查 5173 的代理目标是否为 3456。
+验证结果：源码 Parser 已支持 `fallback`；此前后端 Pytest 75 项、前端生产构建均通过；未读取、记录或输出任何 API Key。
+【*2026-09-14】双击启动器后 3456 仍返回旧后端
+错误要点总结：通过 curl.exe http://127.0.0.1:3456/api/provider/capabilities 仍得到旧格式响应：supportsThinking=false，没有 modelFamily；工作流接口继续提示 failure_policy must be one of fail, continue。
+根因分析：旧 Uvicorn 实例没有被可靠清理，启动器原先只按命令行文本匹配进程，遇到无法读取进程信息或多进程重载时会误判端口已释放，随后仍可能命中旧服务。
+解决步骤：
+1. 重构 start-dev.ps1：按后端 3456、前端 5173 分别检查监听进程，递归结束项目进程树，并在清理后再次确认端口。
+2. 后端启动后自动请求 Provider capabilities 和工作流接口；只有检测到 modelFamily 且 Architecture 的 failurePolicy=fallback 已加载，才认为启动成功。
+3. 所有健康检查使用 Invoke-WebRequest -UseBasicParsing，避免 PowerShell 网页解析安全提示。
+4. 更新 启动开发环境.bat：固定工作目录、关闭 Logo 干扰，并将启动结果返回给用户。
+验证结果：启动脚本语法检查通过；当前源码临时端口启动验证成功；3456 旧服务仍运行在当前工具无法访问的终端会话中，需要关闭该会话后再双击启动器；未读取、记录或输出任何 API Key。
+后续处理：通过端口对应的 Python 子进程树定位并关闭旧 Uvicorn 工作进程；再次验证 3456、5173 均已无监听，3456 API 已无法连接，说明旧后端已成功释放。
+
+【*2026-09-14】Codex CLI 连接不到
+错误要点总结：用户反馈网页无法连接本机 Codex CLI。检查发现本机 Codex 登录状态正常，但 3456 后端和 5173 前端均未监听，网页没有可用的服务链路。
+根因分析：这次不是 Codex 账号未登录，也不是 API Key 配置问题；后端和前端进程没有启动，因此浏览器无法把本地 Provider 测试请求转发到 Codex CLI。另发现双击启动时若 PATH 不完整，后端可能找不到已安装的 codex.exe。
+解决步骤：1. 启动 backend 3456 和 frontend 5173；2. 让本地 Provider 测试只执行 codex login status，不发起模型请求；3. 增加 Windows 官方安装目录自动发现；4. 将 CLI 启动失败、工作目录无效转换为可读的 LLMError；5. 通过前端代理和后端接口分别验证连接。
+验证结果：本机 `codex login status` 返回成功；`GET /api/health` 返回 200；通过 3456 后端和 5173 前端代理调用本地 Provider 测试均返回 200，显示“本地 Codex 登录可用”；后端 77 项测试和前端生产构建通过。未读取、记录或输出任何 API Key、Session 或 OAuth 文件。
+
+【2026-09-15】运行耗时与 Token 汇总缺少统一展示
+错误要点总结：运行页面的耗时使用非响应式时间变量，运行中不会持续刷新；总耗时还把架构人工确认等待时间混在一起；页面没有统一查看整条 Run 和各 Agent Token 消耗的入口。
+根因分析：前端原先直接用 `Date.now() - runStartedAt` 计算显示值，但 `runStartedAt` 不是响应式状态，且浏览器时间变化不会主动触发 Vue 重算。后端只保存了墙上时钟耗时，未在 Run 查询结果中按审批记录扣除等待时间，也没有聚合各步骤的输入/输出 Token。
+解决步骤：
+1. 后端查询 Run 时按 `started_at`、`finished_at` 和审批创建/解决时间计算有效运行耗时，返回 `active_duration_ms`、`approval_duration_ms`。
+2. 后端从每个 Agent 步骤的已持久化 Token 字段汇总输入、输出、总量，并返回 `token_usage.by_agent`。
+3. 执行器在进入/结束人工确认时单独记录等待区间，完成、失败、停止事件均携带有效耗时和审批耗时。
+4. 前端用每秒时钟刷新运行中的有效耗时；等待架构确认时停止累加，恢复后继续累加，并以服务端快照作为最终值。
+5. 在右上角增加“运行统计”入口，展示有效运行耗时、已排除的架构确认时间、总/输入/输出 Token，以及每个 Agent 的明细。
+验证结果：新增 Run 指标单元测试；后端 Pytest 78 项通过，前端 TypeScript 检查和生产构建通过；未记录任何 API Key 或其他敏感信息。
+
+【*2026-09-15】Frontend 成果物规划持续达到 800 Token 上限
+错误要点总结：用户要求使用 Spring Boot 和 Vue 开发带 CRUD 的学生管理系统；Token 预算 Agent 已将 Frontend 规划为 6000 Token，但 Frontend 在成果物规划阶段仍以 `max_tokens=800` 请求模型，输出恰好达到 800，`finish_reason=length`，随后零重试直接失败。
+根因分析：`artifact_generation.py` 将成果物规划请求硬编码为 `min(800, safe_max_tokens)`，因此 Agent 的 6000 Token 预算没有传递到规划阶段。规划 Schema 还允许最多 12 个文件，并要求复杂文件附带 `parts` 明细，Spring Boot/Vue 多文件工程的 JSON 清单可能超过 800 Token。当前逻辑在解析已有正文前先判断 `finish_reason=length`，并抛出 `retryable=False`，所以即使正文中可能已有可解析清单，也不会解析或重试。Frontend 系统 Prompt 的“代码需求必须返回源码”与规划阶段“只返回 JSON”也存在指令边界不够清晰的问题。`CURD` 拼写不是本次根因，难度评估日志已经按完整 CRUD 识别。
+解决步骤：
+1. 将成果物规划预算从固定 800 改为独立的自适应规划预算，并设置合理下限和 Provider 上限，例如根据技术栈/预计文件数使用 1200～2000 Token。
+2. 收紧规划 JSON，只保留文件名、语言、简短职责和估算量；不要在总文件清单里为每个文件生成冗长 `parts`，文件拆分放到后续独立步骤。
+3. 即使 `finish_reason=length`，也应先尝试解析完整 JSON；解析成功则继续，解析失败后使用更紧凑 Prompt 自动重试一次，而不是直接 `retryable=False`。
+4. 规划重试仍失败时启用确定性 Manifest 兜底，按 Architecture 的技术栈和能力需求生成最小安全文件清单，避免整条工作流中断。
+5. 为 `artifact_plan` 使用专用规划系统 Prompt，明确禁止源码、Markdown 和解释，消除与 Frontend Agent 通用系统 Prompt 的冲突。
+当前结论：这是内部成果物规划器的预算与恢复策略缺陷，不是用户需求过长，也不是 Frontend Agent 的 6000 Token 分配失效。
+修复结果：成果物规划已改为 1200～1600 Token 自适应预算，精简重试上限为 2000 Token；使用专用 JSON 系统 Prompt，移除总清单中的 `parts`；`finish_reason=length` 时先解析已有 JSON；解析失败自动重试一次，再失败使用按 Agent/技术栈生成的本地保守 Manifest。前端日志新增“规划自动恢复”和“本地规划兜底”事件。新增 3 项截断回归测试；后端 Pytest 81 项通过，前端 TypeScript 检查和生产构建通过，3456 健康接口返回 200。
+
+【*2026-09-15】流程成功但成果物不完整（Run: run_029ee02ed5）
+错误要点总结：用户要求使用 Spring Boot + Vue 开发带 CRUD 的学生管理系统；Run 状态为 SUCCESS，但成果物目录只有 `final-report.md` 和 `App.vue`，缺少 Backend 的 Spring Boot 文件以及 Vue 的入口、样式、依赖等文件。
+现场证据：该 Run 的 `backend`、`frontend`、`tester`、`reviewer` 均为 SUCCESS；Backend 实际执行了文件清单规划和多次独立文件生成，Provider 记录中包含 `StudentController.java`、`Student.java`、`StudentRepository.java`、`StudentService.java`、启动类和配置文件等响应；但最终工作区只留下 `App.vue` 和自动生成的 `final-report.md`。因此本次主要不是 Token 上限导致的失败，Backend 和 Frontend 都已经返回了成功响应。
+根因分析：
+1. Backend 和 Frontend 在 Architecture 审批后属于同一并发层级。每个 LangGraph 节点返回的是整个 `context` 快照，而当前 `_merge_dicts` 只做浅层合并；`__artifact_files__` 是一个列表，两个并发分支写入同名列表时采用最后写入的一方，前一个 Agent 的成果物列表被覆盖。本次最终留下 `App.vue`，符合 Frontend 分支覆盖 Backend 成果物列表的现象。
+2. `ArtifactService` 只 materialize `__artifact_files__`、实现输出中的代码围栏和 `final_report`。Backend 的完整源码响应如果已经存在于并发分支被覆盖的结构化列表中，最终 materialize 阶段就没有可写入的 Backend 文件；`final-report.md` 始终会被写入，所以会出现“有报告但没有完整代码”的假成功。
+3. 当前完成条件只检查各 Workflow Step 是否成功，没有依据 Architecture/RequirementSpec 对成果物做完整性验收，因此“所有 Agent 成功”被错误等同于“交付包完整”。
+4. Backend 的文件规划还出现了 `App.vue`、`api.js` 等跨 Agent 文件，说明成果物合同没有约束文件归属；同时当前工作区安全文件名策略只支持单层文件名，不适合直接表达 Spring Boot 的标准包目录结构。它们会进一步增加产物缺失或互相覆盖的风险，但不是本次 Backend 文件全部消失的首要原因。
+5. 该 Run 生成内容中还出现中文乱码，说明输入/Provider/文件展示链路存在独立的 UTF-8 编码问题；它不会解释文件数量变少，但会影响源码可读性和后续编译验证。
+解决步骤：
+1. 修复 LangGraph 并发状态合并：节点只返回本次产生的 context 增量，或为 `__artifact_files__` 增加专用的追加去重 Reducer，禁止用最后写入覆盖其他 Agent 的文件列表。
+2. 为每个成果物携带 `owner_step`、规范化相对路径和唯一键；Backend、Frontend 只能写入自己的文件，允许安全的多级目录，仍要阻止 `..` 和绝对路径逃逸。
+3. 从 Architecture/RequirementSpec 生成通用 Artifact Contract：记录必需能力、文件责任人、期望文件和可选文件。不要把三家公司写死在执行器中，具体文件清单由 Agent/Workflow 配置提供。
+4. 在 materialize 前增加成果物完整性校验：缺文件、空文件、路径冲突、重复归属或未通过源码结构检查时，Run 标记为“成果物不完整”，不能直接显示 SUCCESS；先进入定点补齐/恢复，仍失败才报告失败原因。
+5. 将 Backend/Frontend 的结构化清单、实际生成文件、校验结果和缺失项写入运行日志；ZIP 只允许在合同校验通过后标记为可交付。
+6. 增加并发分支、Backend + Frontend 同时产物、缺失文件拦截、路径规范化和 UTF-8 读写的回归测试。
+当前结论：这是“并发状态合并 + 缺少成果物验收门槛”的框架问题，不是用户需求难度评估错误，也不是本次 6000 Token 配置没有生效。下一步应先修复成果物状态合并，再加 Artifact Contract/Completeness Validator。
+
+修复结果：
+1. LangGraph 的并发 context Reducer 已对 `__artifact_files__` 使用追加去重合并，Backend 与 Frontend 的文件不会再因为最后写入覆盖而丢失。
+2. 成果物规划增加可选的 `enforce_artifact_contract` 配置；软件开发工作流的 Backend、Frontend 已开启。Vue 会补齐 `package.json`、`index.html`、`main.js`、`App.vue`、`style.css` 等启动文件，Spring Boot 会补齐构建、启动、配置和 CRUD 核心文件，同时过滤错误归属到另一 Agent 的文件。
+3. Finalize 阶段新增成果物完整性门槛：启用成果物模式的成功 Agent 必须至少返回一个非空文件；不同 Agent 生成同名文件时会报告冲突；materialize/写入失败也会将 Run 标记为失败，不再继续显示 SUCCESS。
+4. ArtifactService 增加 Java、Kotlin、Properties 和普通文本类型识别，避免后端文件因语言类型不完整而降级或丢失。
+验证结果：后端 Pytest 83 项通过，前端 TypeScript 检查和生产构建通过；3456 工作流接口已返回 `backend.enforceArtifactContract=true`、`frontend.enforceArtifactContract=true`。尚未使用真实云端模型重新生成本次 Run，避免在验证代码修复时额外消耗用户 Token。
+
+【*2026-09-15】Run、Artifact、Checkpoint 与失败恢复闭环补齐
+错误要点：此前 Run 状态主要依赖内存，服务重启后无法可靠恢复；SSE 事件没有持久化，刷新页面可能丢失历史日志；Artifact 写入不是原子操作且没有完整性校验；失败后缺少只重试失败节点及下游节点的恢复入口。
+证据：新增 `state_json`、`workflow_snapshot_json`、`heartbeat_at`、`recovery_count`、`run_events`，Artifact 增加 SHA-256；恢复测试覆盖崩溃发生在首个 Checkpoint 前、事件总线重建和失败节点重试。
+根因：运行态、工作流定义、事件和成果物元数据没有形成可持久化的一致状态，SSE 回放仅根据旧终态事件判断连接结束，在重试竞态下可能提前关闭。
+解决步骤：
+1. Run 保存版本化状态快照、不可变 Workflow 快照、心跳和恢复次数。
+2. 启动时扫描未完成 Run；恢复中断节点，保留已成功前置节点，审批状态继续等待。
+3. LangGraph 使用 `AsyncSqliteSaver` 作为 Checkpoint；失败恢复接口只重新执行失败节点及其下游节点。
+4. EventBus 将事件持久化到 `run_events`，SSE 先回放历史；重试时以 durable Run 状态判断是否仍应保持连接，避免旧 `workflow.failed` 提前关闭新流。
+5. Artifact 使用临时文件、flush/fsync、原子替换和 SHA-256 校验；ZIP 排除临时文件。
+验证结果：后端 Pytest 88 项通过，前端生产构建通过；新增失败重试、启动恢复、事件回放、SSE 重试竞态和 Artifact 完整性测试。未记录任何 API Key 或敏感信息。
+
+【*2026-09-15】新需求运行后仍显示旧 Agent 日志
+错误要点：用户修改运行需求后再次点击运行，画布中的新需求已经更新，但 Agent 输出和运行日志仍属于上一条需求，造成需求与结果错配。
+关键证据：创建 Run 接口返回 `409 Conflict`；前端在 409 分支自动接入已有 `runId`，截图中当前输入为学生管理系统，而右侧输出仍是上一条 Web 应用需求。
+根因分析：后端按 Workflow 限制同一时间只能有一个活动 Run，这个限制本身有效；前端没有比较当前输入与已有 Run 的需求文本，收到 409 后无条件复用旧 Run，导致新需求展示旧状态和旧日志。
+解决步骤：
+1. 检查前端 `startRun` 的 409 处理、`runId` 生命周期、SSE 连接和 `sessionStorage` 恢复逻辑，确认旧日志来自自动接入已有 Run，而不是 Agent 重复读取上下文。
+2. 增加当前需求与活动 Run 需求的比较；需求不一致时不设置旧 `runId`、不连接旧 SSE、清除当前页面的旧 Run 标记，只保留当前新需求。
+3. 增加“停止旧运行”入口，调用原有停止接口；停止成功后用户可以直接运行当前新需求。
+4. 需求一致时仍保留原有接入逻辑，支持继续审批或恢复同一条 Run，不改变同一 Workflow 的并发保护。
+验证结果：前端 TypeScript 检查和生产构建通过；新流程在遇到不同需求的活动 Run 时会显示冲突提示，不再把旧 Agent 日志绑定到新需求。旧 Run 不会被自动终止，需用户点击“停止旧运行”后再开始新 Run。
+
+【2026-09-15】新增 Tester Agent 成果物真实验证门禁
+错误要点：工作流中所有 Agent 请求成功时就直接显示绿灯，但生成的前后端成果物可能无法编译、启动或互相匹配，导致“流程成功、成果物不可运行”的假成功。
+关键证据：原有 `tester_agent` 只生成测试方案；Finalization 阶段仅检查非空文件和文件冲突，没有执行 `npm build`、Maven 编译或 HTTP 启动检查。此前成果包已出现缺少 `src/main.js`、Java 文件未放入 `src/main/java` 等问题。
+根因分析：Agent SUCCESS、Artifact 已落盘和成果物可交付被视为同一个状态；测试 Agent 没有受控工具调用能力，Artifact Service 也只支持单层路径，无法表达标准 Vue/Spring Boot 源码树。
+解决步骤：
+1. 新增通用 `ArtifactValidator`，从 Run 的结构化成果物中识别前端和后端目标，检查入口、构建脚本、依赖声明、Java 源码目录、package 路径和 resources 目录。
+2. 通过不经过 Shell 的受控子进程执行 `npm install/npm run build`、`mvn compile` 等允许命令，并分别设置命令超时和启动探测超时；启动检查使用临时端口，进程取消或超时后递归终止子进程。
+3. 将验证结果写入 `artifact_validation` Context，Tester Agent 读取真实检查结果后再生成测试报告；验证失败或阻塞时强制 Tester 节点失败，禁止最终 Workflow 进入 SUCCESS。
+4. 新增验证事件 `step.validation_started`、`step.validation_check`、`step.validation_succeeded` 和 `step.validation_failed`，前端在对应 Agent 的展开日志中展示命令、状态、摘要和关键输出。
+5. 扩展 Artifact 路径为安全的多级相对路径，支持 `src/main.js`、`src/App.vue`、`src/main/java/...` 和 `src/main/resources/...`，仍拒绝绝对路径、`..` 和路径穿越。
+6. 更新代码开发 Workflow 的 Tester 配置，启用构建、启动和依赖安装检查；新增结构校验、验证门禁和嵌套路径归档测试。
+验证结果：后端 Pytest 97 项通过，前端生产构建通过；旧成果包被验证器正确判定为 FAILED，并识别出前端入口/依赖及后端 Java 目录、配置目录问题。未执行真实云端模型请求，未记录 API Key、密码或其他敏感信息。
+
+【2026-09-15】验证失败时成果物不可见
+错误要点：Tester 验证门禁触发失败后，Run 会提前结束，原先的终结流程在失败判断前返回，导致已生成但未通过校验的文件无法落盘，用户只能看到错误日志，无法下载现场成果物继续排查。
+根因分析：Artifact 物化只挂在成功收尾分支；Run FAILED 与 Artifact 是否保留没有区分，失败状态被错误地当成“无需保存成果物”。
+解决步骤：
+1. 在失败收尾前检查当前 Run 是否存在结构化成果物。
+2. 即使 Run 最终为 FAILED，也先使用 Artifact Service 保存当前文件、校验路径并发布 `artifact.created` 事件。
+3. 成果物保存失败只追加 `artifact.failed` 事件，不覆盖原始工作流失败原因，保证错误定位信息完整。
+验证结果：`python -m compileall -q app tests` 通过；后端 Pytest 97 项通过；前端生产构建通过。
+
+【*2026-09-15】完整 Spring Boot + Vue CRUD 工作流真实回归与自动修复闭环
+错误要点总结：按“前后端管理系统、Spring Boot + Vue、体现增删改查”运行真实云端 Agent 全流程时，Token Estimator、Requirement、Architecture、Backend、Frontend 均能生成结果，但早期 Run 先后暴露成果物重名、Windows 子进程不兼容、源码分片拼接破坏语法、前后端跨文件契约不一致，以及 ZIP 未按前后端目录归档。单看 Agent 绿灯不能证明成果包可构建、可启动和可直接解压使用。
+关键证据：
+1. `run_15d2eba535` 在 Tester 前发现 Frontend/Backend 重复登记根目录 README 和跨 Agent 文件。
+2. `run_283bc64ea8` 的确定性验证最初遇到 Windows/Uvicorn 事件循环不支持异步子进程；切换执行方式后，真实构建又发现 App.vue 与 Java 文件因源码片段直接拼接而损坏。
+3. `run_4685661955` 已无 Token 截断，但真实构建发现 Frontend 语法错误以及 Controller/Service 返回类型不一致，证明该阶段主因是文件契约而非 Token 不足。
+4. `run_4ede6db044` 的 Backend、Frontend 均一次完成文件生成，无 `finish_reason=length`、无文件续写和生成重试；Tester 首轮真实构建发现 `App.vue` 导入的 `fetchItems` 未由 `src/api/itemApi.js` 导出。恢复执行后只定点修复导出方，前端安装、构建、启动和后端编译、启动全部通过，最终 Run 状态为 SUCCESS。
+5. 首次归档虽然包含全部 15 个文件，但 Frontend 与 Backend 共用 ZIP 根目录；这会让两个项目的 `src/` 混合，不能作为规范的全栈源码包直接使用。
+根因分析：
+1. Provider 单次最大输出仍是 6000 Token；“测试不设项目上限”只能让 Runtime 不再主动压低预算，不能突破云端模型硬上限。因此长代码必须按独立文件生成，而不是依赖一次无限输出。
+2. 旧的预分片阈值过低，中等文件在本可单次完成时被拆段；模型生成的源码片段不是可靠的文本边界，直接拼接容易重复 import、template 或类型声明。
+3. Tester 原先只报告失败，缺少使用真实编译输出反向驱动产物 Agent 的最小修复闭环；初版修复候选又会同时重写导入方与导出方，造成二次命名漂移。
+4. Windows 的 Uvicorn 事件循环不保证支持 `asyncio.create_subprocess_exec`，导致验证器在真正执行 npm/Maven 前抛出无消息的 `NotImplementedError`。
+5. Artifact 在 API 中保留原始相对路径和 Owner，但归档直接使用原始路径，没有在多 Owner 场景恢复项目边界；工作区中的旧下载 ZIP 还可能被递归收入新归档。
+解决步骤：
+1. 本次 Run 请求使用 128000 Token 的项目侧上限、4 次重试并关闭思考；实际单次请求由 Provider 能力层钳制到 6000。源码按文件独立估算，Backend/Frontend 生成阶段均未出现长度截断、分片或续写。
+2. 提高源码片段最小预算并加入安全余量；只有估算确实接近 Provider 硬上限时才预分片，真实 `finish_reason=length` 才进入拆分/续写兜底。
+3. Windows 验证命令改为在线程中使用 `subprocess.Popen`，保留总超时、异步取消、进程树终止和敏感环境变量清理。
+4. Tester 增加 `repair_attempts` 自动修复循环：解析真实编译文件/行号，导入导出错误只选择导出方；每修复一个文件后刷新项目上下文，修复结果按 `(owner_step, path)` 覆盖旧 Artifact，再运行完整门禁。
+5. Artifact 归档在存在多个 Owner 时按 Owner 分目录；已带前缀的路径不重复添加，并排除未登记的旧 ZIP，最终包形成标准 `backend/`、`frontend/` 与根目录 `final-report.md`。
+6. 诊断期间一次控制台输出因 Windows GBK 无法显示 Unicode 对勾触发 `UnicodeEncodeError`，随后改用 ASCII 转义读取，不影响产品运行；一次测试命令误引用不存在的 `tests/test_parser.py`，随后执行完整测试集纠正；工作区根目录没有 `.git`，因此 `git status/diff` 检查返回“not a git repository”，该错误不影响构建和运行，当前环境无法提供 Git 变更状态。
+验证结果：最终 Run `run_4ede6db044` 为 SUCCESS，8 个 Workflow 节点全部成功；12 项成果物确定性检查全部通过，包括 Frontend 安装/构建/HTTP 启动与 Backend Maven 编译/Spring Boot 启动。生成物包含 14 个源码文件和 1 个最终报告。又从最终 ZIP 解压到隔离临时目录，真实启动 Spring Boot 并执行 POST 新增、GET 查询、PUT 修改、DELETE 删除、再次 GET 查询，依次得到新增 ID=1、列表数量=1、修改成功、删除 HTTP 204、删除后数量=0。恢复后的 Token 统计已改为累计所有成功/失败终态事件，本 Run 真实累计为输入 88734、输出 17451、合计 106185 Token，其中 Tester 包含首次失败和恢复成功共 48854 Token，不再只显示最后一次尝试。平台后端完整测试与平台前端生产构建通过；修复归档分层和恢复 Token 累计均有新增回归测试。未记录 API Key、Session 或其他敏感信息。
+
+【2026-09-15】生成项目缺少浏览器级前后端联调验证，可能被 CORS 阻断
+错误要点总结：`run_4ede6db044` 的 Vue 与 Spring Boot 已分别构建、启动成功，后端 CRUD 也已通过直接 HTTP 调用，但这仍不能证明浏览器中的 Vue 页面能够调用 Spring Boot。当前 `src/api/itemApi.js` 把 Base URL 写死为 `http://localhost:8080`，而 Vite 虽配置了 `/items` 代理，绝对 URL 会绕过代理；后端 Controller 没有 CORS 配置。从 `http://localhost:5173` 打开页面时，浏览器可能拦截跨源请求。
+根因分析：现有 Tester 门禁验证了前端构建/启动和后端编译/启动，却没有同时启动两端并从浏览器或带 Origin 的客户端执行契约与 CORS 检查；因此“两个单端通过”被当成了较强但不完整的交付证据。
+建议解决步骤：
+1. 前端 API 默认改用相对地址 `/items` 并统一经 Vite/生产反向代理转发，或由环境变量配置 API Base URL；不要在源码中固定开发机端口。
+2. 如确需跨域，后端增加受控的全局 CORS 配置并限制允许来源，不建议直接允许全部来源。
+3. Tester 增加 Integration 阶段：同时启动 Frontend 与 Backend，检查前端 API 契约中的方法、路径和字段是否对应后端路由，并发送带 `Origin` 的预检/实际请求。
+4. 后续增加浏览器 E2E，至少覆盖页面加载、创建、列表刷新、编辑和删除。
+当前状态：尚未修复。这不影响已经确认的源码完整性、单端构建、单端启动和后端 CRUD，但意味着“浏览器端完整 CRUD 闭环”仍未被证明，不能把当前成果包标记为生产级完全验收。
+
+【2026-09-15】“启动开发环境.bat”双击启动失败
+错误要点总结：用户双击 `D:\Agent-Team\启动开发环境.bat` 后无法正常启动。原启动器会在后端启动前执行过期的接口断言，并要求 Workflow 返回已经不存在的 `modelFamily` 与 `failurePolicy=fallback`；同时 5173 端口被 nginx 占用时，脚本会把正常的非项目服务直接判定为错误，导致整个启动流程退出。
+根因分析：启动脚本把旧版本 API 字段和旧失败策略写死，健康检查没有只验证当前仍稳定的能力/工作流接口；端口释放逻辑也没有区分“项目进程”和“其他已经提供可用页面的服务”。
+解决步骤：
+1. 后端健康检查改为验证 `/api/provider/capabilities` 和 `/api/workflows/software-development` 返回 HTTP 200 且正文非空，不再依赖过期字段。
+2. 端口 3456 仍只释放属于本项目的后端进程；不终止其他服务。
+3. 5173 被非项目进程占用时，先探测页面是否 HTTP 200；若页面可用则安全复用并继续启动后端，否则给出明确提示，不强制终止无关进程。
+4. 使用真实 `.bat` 入口执行验证，返回 `BAT_EXIT_CODE=0`；随后确认后端能力接口 200、工作流接口 200、前端页面 200。
+当前状态：已解决。`start-dev.ps1` 与 `启动开发环境.bat` 均可用；仍需注意，若 5173 被无关程序占用且不能提供页面，启动器会安全停止并要求用户更换端口或手动释放该程序。
+
+【2026-09-15】前端开发端口调整为 2199
+错误要点总结：原项目启动器和 Vite 配置使用 5173，而该端口存在其他服务占用，用户要求切换到 2199。
+解决步骤：同步修改 `start-dev.ps1`、`frontend/vite.config.ts`、后端 CORS 允许来源和 README 启动地址；后端仍保持 3456。
+验证结果：启动器可在 2199 启动本项目 Vite，后端能力接口与工作流接口仍在 3456 返回 HTTP 200；原 5173 的无关服务不再影响本项目启动。
+
+【2026-09-16】代码公司工作流增加按需 Database Agent
+错误要点总结：原工作流只有 Architecture、Backend 和 Frontend，CRUD/业务数据需求虽然被路由为完整 Web 应用，但没有独立的数据模型成果物，Backend 与 Frontend 可能分别猜测实体字段、接口字段和表结构，导致实现不一致。
+根因分析：持久化能力只存在于 RequirementSpec 的能力标签中，没有对应的工作流节点；前后端任务也没有读取数据库文件级上下文。纯展示 HTML 仍不应因为新增节点而增加无效 Token 或耗时。
+解决步骤：
+1. 新增 `backend/agents/database_agent.yaml`，限定它只生成表结构、约束、迁移和初始化数据文件，不生成应用代码。
+2. 在 `software-development.yaml` 中把 Database Agent 放在人工确认之后、Backend 与 Frontend 之前；Backend/Frontend 通过 `database_result_files` 读取数据库 Agent 的实际文件内容。
+3. 在能力策略中仅当 `persistence` 或 `database` 能力被确认时启用数据库节点；纯 HTML、明确 `localStorage` 或无持久化的后端服务自动跳过。
+4. 增加 Spring Boot 文件路径规范：优先生成 `src/main/resources/schema.sql`，并由成果物清单校验过滤跨 Agent 的应用代码。
+5. 为数据库路由、成果物清单、工作流拓扑和文件级上下文增加回归测试。
+验证结果：后端测试 108 项全部通过，前端生产构建通过；主工作流包含 `database_agent`，CRUD 需求保留该节点，纯展示需求跳过该节点。
+【* 2026-09-16】LangGraph 多依赖节点被提前执行，导致 Backend、Frontend、Tester、Reviewer 被跳过
+
+错误要点总结：本次真实需求为“开发学生管理系统，使用 Spring Boot + HTML，实现增删改查”。RequirementSpec 和 Architecture 已正确识别为需要 Frontend、Backend、Persistence，策略中的 skip_steps 为空；但 Run 中 Backend、Frontend、Tester、Reviewer 被标记为 SKIPPED。
+
+根本原因：LangGraph 的 `add_edge(parent, child)` 多次调用表示任一父节点完成即可触发子节点，不表示所有依赖都完成。工作流把 Backend/Frontend 配置为依赖 `architecture_approval + database`，但编译图时分别添加两条边，Backend/Frontend 在 database 仍为 PENDING 时就被调度，执行器按依赖状态误判为“Dependency failed or was skipped”，随后 Tester 和 Reviewer 也被连锁跳过。
+
+解决步骤：
+1. 修改 `backend/app/workflow/langgraph_runtime.py`：单依赖继续使用单边；多依赖改用 `builder.add_edge(list(step.depends_on), step.id)`，建立真正的 AND 汇聚屏障。
+2. 保留执行器的依赖状态校验，确保策略跳过的节点与真实失败节点区分处理。
+3. 增加 `backend/tests/test_langgraph_runtime.py` 回归测试，验证 `architecture_approval + database` 未全部完成前不会进入 join 节点。
+4. 在正确目录 `D:\Agent-Team\backend` 执行完整测试，结果为 109 项通过。
+
+修复结果：学生管理系统需求将按 `token_estimator → requirement → architecture → architecture_approval → database → backend + frontend → tester → reviewer` 执行；仅当 Capability Router 明确判定不需要某能力时才允许策略跳过。
+【* 2026-09-16】Tester 报告 `src/main/resources/application.yml` 被重复登记
+
+错误要点总结：本次 Run 的成果物清单共有 14 个文件，其中 `src/main/resources/application.yml` 出现 2 次。实际不是同一个 Agent 的普通重复，而是两个 Agent 同时登记了同一条路径：Database Agent 生成了 `src/main/resources/application.yml`，Backend Agent 也生成了同一路径。
+
+根本原因：Database Agent 的职责虽然要求只生成数据库文件，但 Provider 返回的数据库文件规划仍额外包含了运行配置 `application.yml`。`artifact_generation.py` 对同一 Agent 内部的同名文件做了去重，却没有把 Database Agent 的运行配置文件过滤掉；最终 `ArtifactValidator._normalize_files()` 按完整相对路径全局校验，发现同一路径已有两个登记项后直接失败。这属于 Agent 文件边界和成果物所有权冲突，不是 Token 不足或 Spring Boot 配置语法错误。
+
+解决方案：Database Agent 只允许拥有 `schema.sql`、`data.sql`、迁移脚本和数据库说明文件；`application.yml`、`application.properties` 等运行配置必须由 Backend Agent 独占。生成器应在 Database Agent 的清单标准化阶段过滤这些配置文件，并增加跨 Agent 文件所有权回归测试；校验错误中应同时显示重复路径和两个 owner，方便定位。
+
+当前状态：已完成原因定位，代码修复待执行。历史 Run 中已登记的重复项不会自动改变，修复后需要重新运行工作流验证。
+【* 2026-09-16 补充】跨 Agent 重复登记修复完成
+
+解决步骤：在 `artifact_generation.py` 的 Database Agent 文件边界中增加 Spring Boot 运行配置黑名单。无论 Provider 如何规划，`application.yml`、`application.yaml` 和 `application.properties` 都会从 Database Agent 成果物清单中移除，继续由 Backend Agent 独占；`schema.sql`、`data.sql` 和迁移脚本仍由 Database Agent 生成。新增回归测试覆盖 Database Agent 同时返回 schema 与 application 配置的情况。
+
+验证结果：成果物生成、合并和验证相关测试 23 项通过；后端完整测试 110 项通过。历史失败 Run 不会被原地改写，需要新建 Run 重新生成成果物。
+【* 2026-09-16】下载成果包后 Spring Boot 根路径 404，前端查询参数与 Controller 不一致
+
+错误要点总结：Run `run_0e353aeb39` 在平台中显示 SUCCESS，但下载并解压 ZIP 后，HTML 位于 `frontend/src/main/resources/static/index.html`，没有进入 `backend/src/main/resources/static/index.html`，因此只运行 backend 工程时访问 `/` 返回 404。前端搜索使用 `name` 和 `className`，后端 `StudentController` 只声明了 `keyword`，搜索请求虽然能够发出，但后端不会按前端字段执行预期查询。
+
+根本原因：成果物验证工作区把所有 Agent 文件平铺到同一个临时工程中，而 ZIP 归档又按 owner 拆成 frontend/backend/database 三个目录，导致“验证布局”和“下载布局”不一致。启动检查把任意小于 500 的 HTTP 状态都视为成功，错误地把 404 当成服务可用。Tester 只执行结构、编译和启动检查，没有静态比对前端 `URLSearchParams` 与 Spring `@RequestParam`。
+
+解决步骤：
+1. ZIP 打包时，如果存在 Backend，Frontend/Database 生成的 `src/main/resources/**` 自动归入 `backend/src/main/resources/**`；静态 HTML、schema.sql 和 data.sql 与 Spring Boot 工程保持同一可运行目录。
+2. 启动门禁只接受 HTTP 2xx/3xx；404 不再代表启动成功。
+3. 新增前后端查询参数契约校验，提取前端 `.append('参数名', ...)` 与 Java Controller `@RequestParam`，字段不一致时 Tester 失败并把具体前端文件、缺失参数和后端支持参数交给定点修复。
+4. 重新生成现有 Run 的 ZIP 后确认包含 `backend/src/main/resources/static/index.html`、`backend/src/main/resources/schema.sql` 和 `backend/src/main/resources/data.sql`，不再保留错误的 `frontend/src/main/resources/static/index.html`。
+
+验证结果：相关测试通过；后端完整测试 113 项通过。对现有成果包执行新契约检测，能够准确报告前端 `className/name` 与后端 `keyword` 不一致。历史已下载 ZIP 不会自动更新，需要重新下载归档；历史 Run 的源码内容不会自动改写，查询参数修复需在新 Run 中由 Tester 门禁触发。
+
+【* 2026-09-16】Tester 定点修复选错文件并超时
+
+错误要点总结：Run `run_f190797434` 首次验证发现 `StudentController.java` 编译错误，定点修复后 Maven 编译已经通过；随后启动验证失败，真实异常为 `Cannot load driver class: org.h2.Driver`。修复器却选择了 `StudentManagementApplication.java`，该次模型调用在 120 秒后超时，因此日志显示“定点修复未生效”。
+
+根本原因：本次成果物的 `application.properties` 明确配置了 H2（`jdbc:h2:file:...`、`org.h2.Driver`），但 `pom.xml` 只有 MySQL 驱动，没有 H2 依赖，运行配置与依赖不一致。候选文件选择器没有识别“数据库驱动缺失”这一类启动错误，而是从异常堆栈中匹配到 `StudentManagementApplication.java:10`，误把普通调用栈位置当成根因文件。兜底规则又会避开未被日志直接点名的 `pom.xml`，所以没有选择真正需要修改的 `pom.xml` 或 `application.properties`。这不是 Token 不足导致的；120 秒超时发生在错误修复目标上，即使模型返回内容，也不能补齐缺失的运行时驱动。
+
+建议解决步骤：
+1. 给修复候选选择器增加错误分类：出现 `Cannot load driver class: org.h2.Driver` 时优先选择 `pom.xml` 和 `application.properties/application.yml`，禁止选择主启动类。
+2. 在修复前执行依赖与配置一致性检查：H2 URL/Driver 必须存在 H2 runtime 依赖；MySQL URL/Driver 必须存在 MySQL 驱动，二者不能混配。
+3. 每次定点修复后先重新执行 Maven compile，再执行 Spring Boot startup；只有确定性验证通过才记为修复成功。
+4. 精简传给模型的启动日志，只保留根因链、目标配置和依赖清单，避免错误目标上的 120 秒无效等待。
+5. 增加回归测试，覆盖“堆栈出现 Application.java，但根因是驱动缺失”的场景。
+
+当前状态：已完成深度定位并记录方案，尚未修改定点修复选择器。当前 Run 的 Tester 仍处于运行/恢复流程中，不能视为已修复。
+
+【* 2026-09-16 补充】代码公司统一使用 H2 完成前后端数据库联调
+
+需求要点：代码公司生成包含持久化的 Spring Boot 项目时，交付测试默认使用隔离的 H2 内存数据库，不依赖开发机上的 MySQL/PostgreSQL。验收目标不是三个 Agent 分别生成文件或分别显示绿灯，而是前端请求、后端 REST API、数据库 CRUD 能形成真实闭环。
+
+解决步骤：
+1. Backend Agent 和工作流明确要求 `pom.xml` 声明 `com.h2database:h2` runtime 依赖；Database Agent 生成的 schema、data 和 migration SQL 必须兼容 H2 MySQL mode，禁止 `ENGINE=InnoDB`、`DEFAULT CHARSET` 等专用表选项。
+2. Tester 在 Maven 编译前增加 H2 依赖契约检查。持久化项目缺少 H2 时直接失败并定位 `pom.xml`，不再等到 Spring Boot 启动后才出现 `org.h2.Driver` 异常。
+3. Spring Boot 验证启动时覆盖为独立的 `jdbc:h2:mem:agent_team_test`。存在 Flyway migration 时验证 migration；存在 schema.sql 时验证 schema 初始化；两者都没有时才使用 JPA create-drop。
+4. 增加前后端 REST 契约门禁：比较前端 `/api/...` 路径、HTTP 方法以及 JSON 调用语义与 Spring Controller。前端使用 fetch/axios JSON 时，后端必须提供匹配的 `@RestController`/`@ResponseBody` 以及 GET、POST、PUT/PATCH、DELETE。
+5. 对可识别的 CRUD 项目执行真实 HTTP 闭环：在 H2 中新增记录、查询记录、修改记录、删除记录，并确认删除后记录不再存在。
+6. 数据库 migration/schema 启动错误改为回传 Database Agent；H2 驱动缺失回传 Backend Agent 的 `pom.xml`；调用栈中的 `Application.java` 不再被误判为驱动错误的修复目标。
+
+验证结果：使用历史失败 Run `run_f190797434` 的成果物重新执行新门禁，能够同时识别“pom.xml 缺少 H2”和“前端 `/api/students` 与后端 `/students` 页面型 Controller 不一致”。后端完整测试 118 项通过，前端 TypeScript 检查与生产构建通过。历史 Run 保持 FAILED，不会被原地改写；新规则需要创建新 Run 验证完整联调。
+
+【* 2026-09-16】合法的 Maven 测试文件被验证器重复误判
+
+错误要点总结：Run `run_2f12d493c0` 的 Tester 报告 `src/test/java/com/example/studentmanagement/StudentControllerTest.java` 不在标准源码目录，并连续两轮把同一文件交给 Backend Agent 定点修复，重新验证后错误完全相同，最终 Tester FAILED、Reviewer 被跳过。
+
+根本原因：验证器当前把所有“不以 `src/main/java/` 开头”的 `.java` 文件都归类为根目录散落文件，因此把 Maven 标准测试目录 `src/test/java/` 也误判为非法。该测试文件的 owner 确实是 Backend，现有机制也已经两次回传 Backend Agent，但它只执行单文件定点重写，没有回退并重新运行完整 Backend 节点；更关键的是，无论 Agent 如何修改文件内容，只要合法路径保持 `src/test/java/...`，错误就不会消失。这属于平台校验规则缺陷，不是生成代码、Token 或 Provider 故障。
+
+建议解决步骤：
+1. Java 目录规则同时允许 `src/main/java/**` 和 `src/test/java/**`；只把这两个目录之外的 Java 文件判定为散落文件。
+2. 对测试源码单独校验 package 与 `src/test/java` 路径，并执行 Maven `test` 或至少 `testCompile`，避免只是放宽路径却不验证测试能否编译运行。
+3. 为验证错误生成稳定指纹（check id、target、根因、文件路径）。第一次失败执行定点修复；第二次出现相同指纹时停止重复改单文件，回退到 owner Agent 的运行前 Checkpoint，注入结构化缺陷包并重新执行该 Agent 与下游 Tester。
+4. 如果回退重跑后仍是同一指纹且文件哈希/诊断没有进展，标记为“平台规则疑似错误”并停止自动循环，保留完整日志等待框架修复。
+5. 跨 Agent 契约错误按 owner 集合联合回退，例如前后端接口不一致同时通知 Backend/Frontend；数据库脚本错误回退 Database；不必重跑 Requirement 和 Architecture。
+
+当前状态：已确认误判原因和现有两轮定点修复行为，尚未修改验证器与 Checkpoint 回退策略。
+
+【* 2026-09-16 补充】测试目录误判与责任 Agent 回退整改已完成
+
+解决步骤：
+1. Java 结构校验同时接受 `src/main/java/**` 和 `src/test/java/**`；测试源码单独显示“Java 测试源码目录”检查，并按 `src/test/java + package` 核对路径。只有两个标准目录之外的 Java 文件才会报“Java 文件不在标准源码目录”。
+2. Spring Boot 构建门禁由跳过测试的 Maven compile 改为执行 `mvn test`，同时验证主源码、测试源码以及测试用例，不再出现“结构绿灯但测试根本没编译”的情况。
+3. 为失败检查增加稳定错误指纹，归一化临时目录和耗时等易变内容，用于判断修复前后是否真正取得进展。
+4. 第一轮失败仍执行低成本单文件定点修复；第二轮仍未通过时，保存责任 Agent 的最后成功状态作为恢复点，移除该 Agent 的旧成果物，向其注入包含 check id、命令、日志、根因和验收条件的缺陷包，然后重新执行完整责任 Agent。
+5. 责任 Agent 成功后只重新验证合并成果物；Requirement、Architecture 和人工确认不重跑。责任 Agent 自身执行失败时恢复整改前的成果物与 Step 记录，避免留下半生成状态。
+6. 责任 Agent 回退整改后仍出现相同错误指纹时触发 `step.validation_no_progress`，停止无效循环并保留完整诊断；前端、后端、数据库错误分别回退到对应 Owner Agent。
+
+验证结果：历史失败 Run `run_2f12d493c0` 的同一成果物使用新结构规则重新验证，`src/test/java/com/example/studentmanagement/StudentControllerTest.java` 被正确识别，测试目录与 package 检查均通过，静态验证状态为 passed。后端完整测试 121 项通过；前端 TypeScript 检查和生产构建通过。历史 Run 状态不会被原地改写，新机制在新 Run 中生效。
+
+【2026-09-16】* 责任 Agent 回退重生成导致编译回退
+错误要点：Run `run_de48578b90` 第一轮 Controller 定点修复后 Maven test 与启动均通过，但 POST /api/students 返回 HTTP 500。第二轮责任 Agent 整批重生成后产生 28 个编译错误，导致项目从可启动状态回退到不可编译状态。
+关键证据：14:54:11 第一轮重新验证出现 CRUD HTTP 500；事件 step.validation_owner_reexecuting/reexecuted 确认第二轮 Backend 重跑已触发；15:01:12 新 pom.xml 只有 spring-boot-starter-jdbc，没有 spring-boot-starter-data-jpa，源码却导入 jakarta.persistence 并继承 JpaRepository。Controller 调用 findAll/findById/create/update/delete，Service 实际提供 getAllStudents/getStudentById/createStudent/updateStudent/deleteStudent。
+根因分析：责任 Agent 回退已生效，但目前以重新生成全部文件代替保留契约的整改。单文件生成只收到原任务和文件名清单，没有已生成兄弟文件的源码/签名，导致依赖和跨文件方法漂移。H2 门禁只验证 H2 依赖存在，没有验证 JPA 源码对应 JPA starter。候选成果物在生成成功后立即替换，未通过编译和联调再提交；错误指纹变化被标记为 madeProgress，即使从 CRUD 失败退化为编译失败。失败缺陷包只收集 failed 检查，CRUD 500 检查没有后端异常堆栈；启动日志只保留末尾 12000 字符，实际 500 根因链已缺失，故首次 500 的具体原因仍待确认。另外最终持久化成果物同时保留旧分层包与新 student 包，LangGraph 合并规则只做并集，没有 owner 版本替换语义，存在旧文件回流风险。
+解决步骤：
+1. 读取用户完整日志，并核对本地 Run、Maven 检查、修复事件及最终 pom/Controller/Service/Repository，确认第一轮修复成功及第二轮生成回退。
+2. 对照 artifact_generation 的单文件提示、Owner 回退缺陷包、LangGraph Artifact 合并和修复进展判定代码，定位框架缺口；本轮为原因分析，尚未修改运行代码。
+3. 下一步建议使用当前源码与冻结依赖/API/方法签名合同驱动多文件补丁；先在候选工作区校验编译、测试、启动、CRUD，再原子提交或保留上一版。
+4. 下一步建议保留后端异常根因链并将其附到 CRUD 失败检查；按阶段评分判断进展，不把更低阶段失败当作进展；为 Artifact 增加 owner revision/删除语义避免旧包文件回流。
+验证结果：确认当前 Run FAILED；首次 HTTP 500 根因因日志截断无法确认。已确认最终编译失败的依赖和方法合同错误。本轮未调用云端模型、未修改业务代码，问题仍待修复。
+
+【2026-09-16】* H2 联调与责任整改防回退机制已补齐
+错误要点：历史故障中，整批重生成把可启动项目改成无法编译，且 CRUD 500 缺少根因日志，旧包文件有 Checkpoint 回流风险。本轮按保留源码、暂存验证、通过再提交的方向修复框架，不原地修改历史失败 Run。
+关键证据：历史 Run run_de48578b90 存在 JPA 源码/JDBC 依赖不匹配及 Controller/Service 方法漂移；本轮新增验证倒退回滚、JPA 依赖、真实兄弟源码输入、500 根因日志、CRUD 数据生效和 owner revision 回归测试。
+根因分析：原整改以责任模块重生成代替基于当前源码的修复，且错误指纹变化被当作进展。单文件调用缺少真实兄弟源码、日志截断丢失根因，状态并集合并缺少版本淘汰语义。
+解决步骤：
+1. 保留有数据库的 Spring Boot 成果物默认 H2 内存联调，补充 Backend 职责约束；源码使用 jakarta.persistence/JpaRepository 时检查 pom.xml 必须包含 spring-boot-starter-data-jpa，不能用 JDBC/H2 替代。
+2. 文件生成注入本次已完成兄弟文件源码；定点整改提供当前项目实际源码（包括数据库合同），冻结路径、技术栈、公开方法和已有测试。第二轮升级为必要关联文件整改，不再删除原文件并重新生成整套责任模块。
+3. 使用独立候选上下文和临时验证工作区；只有全部门禁通过才替换主上下文。失败、阻塞或异常保留原产物；从 CRUD 故障退化为编译故障判为倒退并撤回候选，不把错误指纹变化当作成功。
+4. HTTP 500 检查附上后端异常输出，长日志保留关键根因链。CRUD 探测确认新增记录可查询、更新字段真实生效、删除后记录消失，不只检查 HTTP 状态码。
+5. 提交时更新 Artifact owner revision 和关联文件上下文；LangGraph 合并过滤过期 owner 文件，防止旧 Checkpoint 恢复旧目录。前端接入关联整改、候选撤回、无进展停止的中文日志。
+6. 回归测试发现新增提交函数误用了不支持默认参数的 WorkflowContext.get，改为 snapshot().get；更新原整批重生成测试以验证基于当前源码的关联整改，随后重新运行完整测试与前端构建。同步 agent.md 和 README 的门禁准则。
+验证结果：后端完整测试 129 项通过；前端 TypeScript 检查与生产构建通过。未调用云端模型重跑历史 Spring Boot 成果物，因此历史首次 HTTP 500 的具体业务根因仍待新 Run 日志确认，不能声明历史成果包已可运行。新机制不保证模型一次生成正确，也不替代上线隔离沙箱与完整浏览器端验收。
+
+【2026-09-16】* Flyway 候选依赖配置错误与下载行为分析
+错误要点：Tester 第二轮候选整改修改 pom.xml 后，Maven 在解析项目阶段因 org.flywaydb:flyway-database-h2 缺少版本而退出；候选被撤回，最终摘要仍保留原版本的启动退出错误。这两个阶段的错误不能混为同一个根因。
+关键证据：用户日志 15:28:10 显示 dependencies.dependency.version is missing、候选文件 pom.xml、撤回候选版本及停止无效整改。验证器默认前端执行 npm ci/install，后端执行 mvn test 和 spring-boot:run；Artifact 从结构化源码提取，不从验证目录递归打包依赖。
+根因分析：候选 POM 的依赖没有显式版本，也没有生效的依赖管理提供版本。Flyway 官方源码将 H2 支持放在 flyway-core 内，额外生成 flyway-database-h2 的声明需纠正，不能盲目补版本。原始进程退出码 1 的业务启动根因仅凭这段日志仍待确认。
+解决步骤：
+1. 对照用户日志区分原启动失败、候选 Maven 解析失败和撤回行为，确认保留原版本的防回退机制已触发。
+2. 核对验证器及 Artifact 提取代码，确认依赖由本地构建工具在验证阶段解析/下载，不由 LLM 下载，不自动附入成果 ZIP；缓存命中时不必重复下载同一依赖。
+3. 查阅 Flyway 官方 H2 文档与 flyway-core 的 H2DatabaseType 源码，建议核对当前版本后删除错误模块声明，保留实际需要的 flyway-core 和 H2 驱动，并由正确的 Spring Boot 依赖管理统一版本。
+验证结果：本轮仅分析并记录，未修改生成/修复代码、未运行云端工作流或下载依赖。候选 POM 错误已确认；原启动根因及历史成果物可运行性未验证。
+
+【2026-09-16】* H2 初始化误选 Flyway 路线及错误依赖生成已修复
+错误要点：Run run_5ff418dccb 的原成果物具备 schema.sql，但验证器因同时存在迁移脚本启用无依赖支持的 Flyway 路线，关闭普通 SQL 初始化后让 JPA 校验空库，导致启动失败。随后模型生成不存在的 H2 专用 Flyway 模块声明，整改再次失败。
+关键证据：读取本地 run_events 发现 Schema-validation: missing table [students]；原 pom.xml 无 flyway-core，数据库 Agent 同时交付 schema.sql/data.sql 与 V1__create_students.sql。候选错误为 flyway-database-h2 缺少版本。原配置还启用 defer-datasource-initialization=true，必须在验证的 schema + validate 路线中改为先初始化。
+根因分析：框架按脚本目录而不是实际可用依赖选择执行路线，未区分普通初始化和迁移执行能力；没有约束和确定性纠正错误模块。另发现前端 method: id ? "PUT" : "POST" 的写法未被识别，原验证会遗漏 CRUD 探测；原通用字符串样例也可能超过 gender 的 16 字符限制，造成验证自身的无效错误。
+解决步骤：
+1. 核对最新失败 Run 的启动检查与结构化源码，确认真实原始故障是缺表，而不是 Maven 环境或 Token 限制。查阅 Flyway 官方 H2DatabaseType 源码，核实 H2 支持在 flyway-core 内。
+2. 修正 H2 验证参数：只有存在迁移脚本和执行依赖才启用 Flyway；无 Flyway 且有 schema.sql 时启用普通初始化，固定 classpath schema/data 路径并关闭延迟初始化，在 JPA validate 前建表。仅有迁移且无执行器时报告依赖合同错误，不继续错误初始化路线。
+3. 新增 Maven 合同纠正函数，生成和整改的 pom.xml 中错误的 org.flywaydb:flyway-database-h2 会改为 flyway-core；同一依赖列表已有 core 时移除冗余错误模块，不猜测版本、不修改其他数据库模块。函数保持格式和注释，区分依赖管理与运行依赖，畸形 XML 不盲改。已存在的已知错误可不调用模型直接暂存纠正并复验。
+4. 补充 Backend/Database YAML 职责约束，默认选择单一初始化路线，禁止生成错误 H2 模块；结构门禁与定点修复优先定位 POM 依赖错误。前端加入依赖纠正的中文事件日志。
+5. 修复 HTTP 方法识别，支持常见条件表达式及 axios 方法，避免漏测 POST/PUT；缩短通用字符串探测数据，避免本次 gender 长度校验误报。新增生成归一化、零模型修复、初始化路线、依赖管理/注释保护及条件方法回归测试。同步 agent.md 和 README。
+6. 使用历史 Run 的原始上下文在临时目录执行新验证器，不调用云端、不修改历史记录：完成本机 Maven test、Spring Boot 启动、根路径 HTTP 200、POST/GET/PUT/DELETE H2 数据闭环。执行完整后端测试与前端构建。
+验证结果：历史原始成果物使用修正后的验证器复测 passed，H2 CRUD 检查明确通过；后端 138 项测试通过，前端 TypeScript 与生产构建通过。没有重跑完整 LLM 工作流或改写历史 FAILED 状态。当前验证仍使用本机工具链和临时目录，不是 Docker 安全沙箱，也不等同于浏览器端全部功能验收。
+
+【2026-09-16】* 服务已启动却误报超时及 Thymeleaf 页面缺失
+错误要点：Run run_00b172967b 的 Spring Boot 已启动，但 Tester 仅探测不存在的默认地址，误报无可用 HTTP 响应；重复整改 pom.xml 无法解决路由问题。进一步核对发现前端交付 Thymeleaf 模板，后端没有渲染依赖和 MVC 页面处理，存在真实页面不可访问的问题。
+关键证据：用户完整日志中 16:19:22 Tomcat started on port 51521、Started StudentManagementApplication in 3.944 seconds、JPA 初始化成功；16:19:50 仍显示启动超时。本地 Controller 提供 /api/students，而 HTML 没有该 API 字面量，旧探测只访问 /api/health、/actuator/health、/。前端模板链接 /students、新增、详情、编辑及删除表单，后端只有 @RestController。
+根因分析：探测地址仅从浏览器源码和默认健康路径构造，忽略真实后端 GET 路由；收到不通过的 HTTP 响应时未保留状态码，误归类为无响应。没有针对服务器模板的依赖/视图合同门禁，使前端模板和 REST-only 后端漂移。同时实体 JsonProperty 使用 student_number/class_name，而通用 CRUD 样例先前使用 Java 属性名，可能制造校验自身的字段错误。
+解决步骤：
+1. 读取用户附件及最新 Run 状态、Controller、模板、配置和 POM，区分“服务未启动”与“访问地址不匹配”，确认数据库和 Maven 本次已通过，不把问题归结为 Token 不足或启动时间太短。
+2. 启动探测补充真实 Controller 的具体 GET 路由并跳过动态占位路径；保留端点 HTTP 状态，对 404/401/500 等报告路由、权限或接口错误，不再统一提示无响应启动超时。
+3. 无前端 API 字面量时，从对应 REST Controller 提取 CRUD 测试路线，避免 MVC 首页被误当成 JSON 新增接口；样例生成识别 JsonProperty 实际字段名及 Size 最大长度。
+4. 加入 Thymeleaf 模板依赖与 MVC 视图合同门禁，错误分别定位到 POM 和 Controller，禁止重复改变 Maven 版本逃避缺失页面。补充 Frontend/Backend YAML，普通 HTML 默认 static + REST，服务器模板必须与 MVC 路由、模型和表单配套。同步 agent.md/README。
+5. 将本次原成果物复制到 repaired-artifacts/run_00b172967b-fixed-20260916 独立目录，不修改原 Artifact 哈希或历史 FAILED 状态。补齐 Thymeleaf 依赖和 StudentPageController，保留现有 API，实现首页跳转、列表、新增、详情、编辑、修改、删除表单处理，并加入页面集成测试与启动说明。
+6. 本机 Maven 验证 API 和页面表单两个集成测试通过；使用通用验证器在临时目录复验修复副本，Maven test、服务启动、根路径 HTTP 200 与 H2 POST/GET/PUT/DELETE 数据闭环均通过。最初直接在 PowerShell 传 Maven -Dstyle.color 参数发生参数拆分错误，改为不传该显示参数后执行成功，与生成项目业务错误无关。
+7. 运行平台完整后端测试与前端构建，将修复副本的 src/docs/POM/README 打包为独立 ZIP，排除 target 与依赖缓存。
+验证结果：平台后端 142 项测试通过，前端 TypeScript/生产构建通过；修复副本两项 Maven 集成测试通过，实际启动和 H2 CRUD 复验 passed。ZIP 完整性通过，包含新 MVC 与页面测试，不包含构建缓存。本轮未调用云端重新生成或改写历史 Run；页面验收为服务器渲染/表单集成测试，不声称完成完整浏览器视觉验收。
+
+【2026-09-16】* 新需求可靠交付闭环与真实回归发现的边界缺陷
+错误要点：既有流程可显示成功，但前后端没有冻结统一接口/页面合同，测试证明与最终源码/ZIP 未绑定；切换输入及静态路由时仍有边界错误，不能用人工修复副本证明后续用户需求可靠。
+真实回归证据：第一轮隔离运行 Spring Boot+HTML、Spring Boot+Vue、静态 HTML，分别发现 Architecture 返回 fields 类型映射却被数组 Schema 拒绝，以及跳过 Database 后 database_result_files 未定义。第二轮 HTML 文件清单混入 Vue 启动文件，已主动取消无效生成并保留现场，未把失败或取消计为成功。
+根因要点：
+1. Agent 各自解释技术栈/字段/响应格式，缺少 Run 级不可变实现合同和实际前端/数据库闭环验收。
+2. LangGraph 边只等待上游节点执行结束；旧审批分支未验证上游状态，Architecture FAILED 后仍可进行审批。
+3. 自适应跳过只生成输出摘要，遗漏对应文件数组变量。
+4. 文件清单补全扫描整段 Prompt 中的“Vue”，将条件说明/可选能力误当作用户选定技术栈。
+5. 静态验证 HTTP 未明确 UTF-8，浏览器脚本中文异常可能被错误解码；浏览器异常测试发现此问题。
+6. 旧统计将整改后成功当作首次通过，遗漏历史重试/续写及失败生成的修复调用，不能准确衡量效率。
+解决步骤：
+1. 独立 DeliveryContract 模块统一栈、入口、API 方法/字段/请求样例、Java/SQL 类型、H2 默认和浏览器约定；Architecture 完成、审批前冻结并保存 SHA-256。仅确定性归一化等价 Schema，不猜测未知字段类型。
+2. 原始需求与冻结合同禁止压缩截断；输入预算不够明确阻止请求。新增 Run、Checkpoint、Artifact 工作区隔离，保留真实输入及工作流快照。
+3. 统一依赖放行条件：SUCCESS、真正自适应 SKIPPED、显式允许继续的 FAILED；PENDING/RUNNING/等待审批不因配置而放行。跳过 Agent 时设置对应文件数组为空 JSON，防止残留或未定义变量。
+4. 文件补全只消费冻结技术栈，而非扫描包含其他框架的提示词；HTML/static_rest 只生成必要静态成果物，不额外创建平台已有的 Vue/Playwright 测试工程。
+5. 验证增加页面入口/脚本样式 HTTP、真实 Chromium 渲染及新增/编辑/删除操作；Vue 与本次 H2 后端同时启动，通过环境变量注入隔离 API 代理。缺工具/未验证即阻塞，不以模型报告代替测试。
+6. 失败按责任 Agent 定点/关联源码整改；候选隔离、有限轮数、复验进度判定、无效整改回滚，允许补齐合同要求的缺失入口文件，保留原版本和错误日志。
+7. 验证绑定源码指纹及合同哈希，打包保留原始 UTF-8 字节与 Owner 目录，拒绝未登记旧文件；最终 ZIP 校验全部源码/CRC，包含 delivery-report.json。成功后下载仍重新检查证据与文件，防止文件变更后继续提供缺损包。
+8. 真实回归工具默认不调用模型；显式 live 可重复三类新需求，使用独立异步 SQLite Checkpoint、总超时和取消清理，保存失败现场、Token/耗时与首过/整改/续写/恢复指标。
+阶段性验证：平台 483 项测试通过，前端 TypeScript/生产构建通过；后续新增的类型与规划范围测试已通过。原需求真实全链路回归仍在执行，最终结果将补充到此记录，不把第一轮失败或第二轮取消隐藏为成功。本地受控命令并非 Docker/多租户安全沙箱，不承诺任意需求必然成功。
+
+【* 2026-09-19】新需求可靠交付闭环最终回归与跨模型格式修复
+
+【* 2026-09-19】企业级架构优化第一阶段
+错误要点：在保留现有 YAML Workflow、LangGraph、Approval、Checkpoint、Artifact、Validator 和 Repair Loop 的前提下，平台缺少统一的需求澄清状态、项目蓝图、结构化证据/失败事实、执行状态与交付状态分离，以及 Artifact 版本审计边界。
+根因分析：RequirementSpec 只有零散布尔字段；Architecture 的判断结果没有独立的 Blueprint 作为单一事实源；校验结果没有统一 Evidence/FailureFact 契约；Run 记录只保存一个 status；Artifact 只有当前文件记录，无法表达 Candidate/Stable/Rejected 版本。
+解决步骤：
+1. 新增 `workflow/platform_contracts.py`，统一 Requirement State、ClarificationRequest、ProjectBlueprint、EvidenceRecord、FailureFact 和 ArtifactVersion。
+2. 新增 `workflow/clarification.py`，对业务数据/CRUD 且未声明边界的需求在 Architecture 前暂停；答案写回 RequirementSpec、Assumption Log，并通过 LangGraph Checkpoint 恢复。
+3. 新增 `workflow/integration_gate.py` 和 `workflow/platform_runtime.py`，把确定性证据归一化，并为预算、超时、重试和后续模型升级保留平台边界。
+4. SQLite 增加澄清、Blueprint、Evidence、FailureFact、Decision/Assumption Log、Execution/Delivery 状态和 Artifact 版本表；Artifact 落盘后登记 Stable 版本。
+5. API 增加 `POST /api/runs/{run_id}/clarification`，Run 查询返回 Blueprint、澄清请求、结构化证据、失败事实和 Artifact 版本；前端增加澄清卡片和事件展示。
+验证结果：后端 545 项测试通过；前端 TypeScript 检查与 Vite 构建通过；本地 `/api/health` 返回 `{"status":"ok"}`。保留旧的非 delivery-enabled 自定义 Workflow 兼容行为，代码公司正式 Workflow 启用澄清门。
+错误要点总结：
+1. 第一轮真实回归发现架构模型把 `api_contract.fields` 输出为字段映射，而旧 Schema 只接受数组；Architecture 失败后旧审批边仍可能继续执行。静态项目跳过 Database 后还缺少 `database_result_files` 空输出。
+2. 第二轮发现文件规划器扫描整段提示词中的条件说明，把并未选用的 Vue/Playwright 误加入 Spring Boot + HTML 文件清单，已主动取消该无效运行。
+3. 第三轮前半段因本地 Codex 账号触发用量上限而停止；这属于 Provider 外部额度限制，不是源码、Token 分配或数据库错误。上游失败后审批和全部下游节点已正确跳过。
+4. 新回归中架构模型把 methods 写成 `GET /api/students`、`PUT /api/students/{id}`，旧合同只接受纯 HTTP 动词；严格校验因此在架构阶段失败。
+5. 后续生成的 Controller 一度使用集合 PUT/DELETE 并在请求体传 id，而 Tester 按冻结标准调用 `/{id}`，返回 HTTP 404。旧整改候选因 Maven 日志中出现 `pom.xml` 而误选依赖文件，未定位到 Controller。
+6. 前后端 Artifact 规划曾在 120 秒边界同时超时一次；底层 Codex 子进程结束后才发起重试，第二次成功。该次没有 `finish_reason=length`、输入截断或输出 Token 不足，不能靠盲目提高 max_tokens 解决。
+
+解决步骤：
+1. DeliveryContract 接受字段数组和字段类型映射的等价输入；methods 归一化兼容纯动词、逗号/空格文本及“HTTP 动词 + 路径”，只提取允许的 GET/POST/PUT/PATCH/DELETE，未知方法继续拒绝。
+2. 架构确认前冻结 Spring Boot + HTML + H2 合同、API 集合路径、方法、请求 payload、实体 Java/SQL/JSON 类型、页面入口和 data-testid，并保存需求哈希与合同哈希；下游发现合同变化立即停止。
+3. 增加 Spring CRUD 明细路由门禁：PUT/PATCH、DELETE 和约定详情 GET 必须实现集合路径后的 `/{id}`。失败信息明确包含 Controller 源文件；此类 404 只回退给 Backend Controller，不再误改健康的 pom.xml。
+4. Tester 在临时验证副本中执行 Maven test、Spring 启动、页面和同源资源访问、Chromium 真实增删改查、标准 REST CRUD；额外安装只读 H2 探针，逐次核对新增、更新和删除后的真实表数据，禁止内存 Map 冒充数据库。
+5. H2 更新验证从单一标记字段扩展为合同 payload 中每个可安全变更字段；API 查询结果与 H2 表都必须反映全部修改。数字、普通文本、纯数字字符串和邮箱使用保持格式的测试值，日期等无法安全变更的字段不伪造。
+6. 验证证据绑定源码指纹和合同哈希；最终交付门禁要求构建、启动、页面、浏览器 CRUD、API 方法/字段、H2 存储审计全部通过。ZIP 只包含已登记源码及 final-report.md、delivery-report.json，并校验 CRC 和逐字节内容。
+
+最终验证结果：
+1. 全新 Run `regression-685134e81cc745eaa624a6c4b12e8007`（目录 `backend/data/regression/20260919-171706-0cd25a66`）状态 SUCCESS，deliverable=true；技术栈识别为 Spring Boot + HTML + H2，未跳过 Database、Backend、Frontend、Tester 或 Reviewer。
+2. Maven test、Spring Boot 启动、`/` 页面、同源 JS/CSS、标准 `/{id}` REST、Chromium 页面 CRUD、H2 POST/GET/PUT/DELETE 及真实存储检查全部通过；交付 ZIP 包含完整后端源码、静态前端、schema、说明和两份交付报告。
+3. 在工作流结束后，又使用最新增强版验证器对同一源码与 ZIP 独立复验：validation=passed、delivery gate=passed、deliverable=true、missing=[]，排除旧验证逻辑误放行。
+4. 平台后端完整测试 541 项通过；前端 TypeScript 检查及 Vite 生产构建通过。成功 Run 的首次通过率为 0%，原因是前后端规划各发生一次 120 秒超时重试，不是 Token 长度截断；该指标保留，不伪装为首轮成功。
+5. 当前证明覆盖这条原始 Spring Boot + HTML + H2 CRUD 需求及同合同模式的确定性门禁；本机工具链验证仍不等同 Docker/多租户沙箱，也不能承诺任意未来需求或 Provider 故障必然成功。
+【* 2026-09-19】Architecture 契约格式不兼容与二次确认弹窗不可见
+
+错误要点：
+1. Architecture 生成的 `api_contract.query_parameters` 是分组对象（例如 `{"collection":["keyword","page","size"],"item":[]}`），而平台契约要求字符串列表，触发 Pydantic `Input should be a valid list`。
+2. 模型为实体补充了 `createdAt`，但没有给出可识别类型，契约转换器把它判定为未知字段并抛出“实体字段 createdAt 的类型未明确”。
+3. 需求路由进入 `WAITING_CLARIFICATION` 后，前端原先只在右侧 Inspector 渲染确认卡片，Inspector 隐藏或选中其他节点时用户看不到二次确认入口。
+
+根因：
+- Provider 输出结构不是固定 JSON 形状，契约边界缺少针对常见模型变体的归一化层。
+- `createdAt/updatedAt` 是跨框架通用的审计时间字段，但原规则只接受显式 `java_type + sql_type` 或有限类型字符串。
+- 后端虽然已通过 LangGraph interrupt 和 SQLite checkpoint 暂停，但 UI 没有把等待状态提升为全局阻塞操作。
+
+解决步骤：
+1. 在 `ApiContract` 增加 `query_parameters` 预处理：支持列表、文本和分组对象，并统一去重、截断到契约上限。
+2. 仅对 `createdAt`、`updatedAt`、`deletedAt`、`createdTime`、`updatedTime` 等封闭的审计时间字段推断 `LocalDateTime/TIMESTAMP/string`；任意其他未知业务字段仍然失败，避免无依据猜测。
+3. 新增 `StepStatus.WAITING_CLARIFICATION`，后端在暂停 Architecture 前持久化节点状态并发送 `step.waiting_clarification` 事件。
+4. 前端增加全局确认弹窗，收到事件或恢复 Run 快照时自动选择首个可用选项；确认后继续原 Checkpoint，不重复执行上游节点。
+5. 扩大结构化 Architecture 失败的安全兜底识别范围，仅用于 `query_parameters`、实体字段类型和输出格式错误；网络、权限、Provider 不可用等运行时错误仍直接失败。
+
+验证结果：
+- 后端定向契约、执行器和平台测试：22 项通过。
+- 后端完整测试：547 项通过。
+- 前端 `vue-tsc` 与 Vite 生产构建通过。
+- 未执行真实云端请求；需要重启后端后，用新 Run 验证实际 Provider 输出和二次确认弹窗。
+
+【* 2026-09-20】单个 Agent 失败后缺少统一责任回退，且修复链路耗时过长
+
+错误要点：
+1. 工作流已有 Tester 候选修复能力，但失败归属主要依赖检查的 `target`，遇到 Artifact、Integration 或跨端契约错误时容易落到 Tester，无法稳定回退给真正拥有源码的 Database、Backend 或 Frontend Agent。
+2. 节点最终失败时没有统一区分 Provider 配置、临时网络、结构化输出、源码构建和运行联调问题；无效 API Key 等平台故障也可能被当作业务 Agent 可修复问题。
+3. 修复是否有效主要参考失败数量；错误内容变化但验证阶段没有推进时，仍可能继续消耗模型调用。
+4. 确定性预检已经发现目录、依赖声明或接口契约错误后，验证器仍可能继续安装依赖、构建和启动服务。
+5. 定点修复 Prompt 最多携带约 4.8 万字符的全项目源码，包含大量与当前故障无关的文件，增加输入 Token、延迟和误改风险。
+
+根因：
+- Repair Engine 只有基础目标提取和简单指纹，没有统一的 Failure Classifier、责任所有者推断、修复计划和熔断状态。
+- Validator 没有显式的预检快速失败阶段。
+- 修复上下文按全项目收集，而不是按候选文件、错误日志、清单、合同和责任域选择。
+
+解决步骤：
+1. 扩展 `RepairEngine`：统一分类 Provider 配置、网络超时、结构化输出、构建、运行和联调错误；Provider 配置问题归平台处理，不再错误派发给业务 Agent。
+2. 根据检查目标、错误日志、文件路径和检查类别推断责任 Agent；跨端 API 契约错误可同时流转给 Backend 与 Frontend，Maven/Flyway 依赖错误优先归 Backend，SQL/迁移错误归 Database。
+3. 每轮修复生成可审计计划，记录责任 Agent、检查项、错误类别、策略、失败指纹和处理动作；前端运行日志展示“已定位失败责任”。
+4. 保留候选版本隔离：先定点修复，再做关联源码整改；只有确定性验证推进才保留候选，未推进立即撤回，连续两轮无进展触发熔断。
+5. 增加 Validator `fail_fast` 预检：结构或契约失败时跳过依赖安装、构建和启动，并在前端显示“已快速停止本轮验证”。
+6. 将修复上下文从全项目缩减为候选相关的 Manifest、配置、SQL、Controller/Service/Repository/DTO/Entity 或前端 API/Router/Store 文件，上限降至约 2.8 万字符；候选文件正文单独传递，避免重复。
+7. 将最终 FailureFact 的 owner 写为推断后的源码责任域，保留失败事实和完整日志，便于 Checkpoint 恢复及后续审计。
+
+验证结果：
+- 新增失败分类、责任路由、熔断、上下文裁剪和快速失败测试 6 项。
+- 后端完整测试 564 项通过。
+- 前端 `vue-tsc` 与 Vite 生产构建通过。
+- 本轮未调用真实云端模型；真实运行速度仍会受 Provider 响应时间和本机 Maven/npm 首次下载影响。
+
+【* 2026-09-20】企业级失败定位、责任修复与分层回归闭环
+
+错误要点：
+1. 原有自动整改虽能依据 Tester 日志修改源码，但节点错误与验证错误没有完全统一为同一种失败事实，责任归属、阶段和可重试性仍分散在执行器分支中。
+2. 整改循环位于普通 Python 控制流中，缺少可独立审计的 LangGraph 条件回边；候选内容主要隔离在内存 Context，Backend 与 Frontend 也没有独立可写工作区。
+3. 每轮整改倾向重新执行整套验证，快速结构错误与耗时构建、启动、联调没有清晰分层；连续失败的“错误文字变化”可能被误认为进展。
+4. 前端只能看到零散修复日志，无法直接查看失败位置、责任 Agent、修复轮次、Target Gate 与完整回归的连续证据；运行统计也缺少首次成功率、自动修复率、平均轮数及阶段成本。
+
+根因：
+- FailureFact、分类器、修复调度器、候选工作区和运行指标尚未形成一条统一平台控制链；Executor 同时承担归类、循环、候选状态和验证策略，边界不清晰。
+- Validator 只有检查项，没有明确的预检/执行阶段事件；指标层只累计 Run/Agent Token，没有消费修复和阶段事件。
+
+解决步骤：
+1. 扩展统一 `FailureFact`，补充 stage、repairable、retryable、repair_action、fingerprint 和 attempt；节点失败与验证失败均从同一结构化事实进入审计记录。
+2. 新增 `FailureClassifier`，确定性识别 Provider 配置/传输、结构化输出、成果物结构、构建、运行与联调错误，并映射到 Platform、Database、Backend 或 Frontend 责任域。
+3. 新增独立 LangGraph `RepairCoordinator` 子图，以“计划 → 责任 Agent 修复 → Target Gate → 完整回归”为主链；失败通过条件边回到计划节点，成功后才结束，主业务 Workflow 仍保持 DAG。
+4. 新增真实 Candidate Workspace 生命周期：建立、同步、验证后提升 Stable，失败则撤回或删除；为 Backend、Frontend 建立独立 Agent Workspace，避免并发写同一目录。
+5. 目标 Gate 只验证责任域；通过后才执行完整回归。错误指纹、验证质量排序和连续两轮无进展计数共同触发熔断，不再靠错误文本不同继续循环。
+6. Validator 增加 preflight 与 execution 阶段事件；目录、Manifest、契约等快速检查失败后立即停止，不再执行依赖安装、构建和启动。
+7. SQLite Run 指标增加首次成功、修复轮次、自动修复率、平均修复轮数、熔断次数，以及需求/实现/验证/审查和验证子阶段的耗时与 Token。
+8. 前端运行统计增加修复质量、阶段成本和“失败位置 → 责任 Agent → 修复轮次 → 验证结果”链路；候选建立、提交、撤回、Target Gate、完整回归和熔断均有中文日志。
+9. 增加分类器、条件回边、Target Gate/完整回归顺序、候选工作区隔离/提交/撤回、分层验证事件和指标持久化回归测试，并保持旧 Token 统计接口兼容。
+
+验证结果：
+- 后端完整测试 568 项通过；新增定向测试覆盖修复子图两轮回边后成功、候选工作区生命周期、责任分类和统计结果。
+- 前端 TypeScript 检查和 Vite 生产构建通过。
+- 本轮验证不调用真实云端模型；真实 Provider 延迟、额度和本机 Maven/npm 首次下载仍属于外部运行条件，但失败现在会被分类、保留证据并进入有限修复或明确熔断。
+
+【2026-09-20】* L2 否定需求被误判为数据库 CRUD
+错误要点：用户明确说“不使用数据库、不做 CRUD”，交付合同却要求 H2/CRUD，导致无需数据库的前后端场景在 Tester 被错误验收。
+关键证据：首次 DeepSeek L2 运行的冻结合同错误包含 H2/CRUD；修复后 L2 `regression-c2da55a4e01c4e7ab5d85057ab2f7437` 为 SUCCESS，交付门禁 PASSED。
+根因分析：能力路由将否定短语中的数据库、CRUD 关键词当成正向信号，交付合同又采纳模型的超范围建议。
+解决步骤：
+1. 对照原需求、RequirementSpec 和冻结合同，确认错误从需求路由传入，而非 Maven/页面源码故障。
+2. 在能力推断中排除被中文否定语包裹的技术词，明确记录 `crud_requested`；交付合同尊重用户的“无数据库、无 CRUD”边界。
+3. 增加否定语、合同边界和真实 L2 回归测试。
+验证结果：DeepSeek L2 正式运行成功，合同为 `database_mode=none`、`crud_required=false`，Maven、后端启动和浏览器渲染通过。此问题经历首次失败与重新运行，故标 *。
+
+【2026-09-20】* L3 前后端重复登记 package.json
+错误要点：Spring Boot + Vue 并发生成时，Backend 和 Frontend 都把 `package.json` 登记为成果物，Tester 在构建前直接拒绝交付。
+关键证据：首次 DeepSeek L3 的 `package.json` 同时出现在 backend/frontend 文件清单；预检报告为重复文件。
+根因分析：模型规划文件清单时跨越 Agent 责任域，Manifest 规范化只去除同 Agent 重复项，未过滤 Backend 误领的前端构建文件。
+解决步骤：
+1. 对照两侧 Manifest 和合并后的 Artifact 清单，确认同一路径由两名 Agent 同时拥有。
+2. 在通用 Manifest 规范化中按技术责任域过滤前端构建描述文件及 Vue 文件，保留 Frontend 的唯一所有权。
+3. 增加跨 Agent 文件归属回归测试并重跑 L3。
+验证结果：后续 DeepSeek L3 已越过重复文件预检，`package.json` 仅由 Frontend 生成。此前重复失败并反复定位，故标 *。
+
+【2026-09-20】* L3 Vue 构建与 Java 编译被错误源码和误路由阻断
+错误要点：L3 文件清单通过后，Vue 缺少启用单文件组件的 Vite 配置；Java 文件末尾残留 Markdown 围栏，Controller 缺少注解导入。自动整改还把 Java 编译错误误指向 `pom.xml`。
+关键证据：Vite 提示安装/启用 `@vitejs/plugin-vue`；Maven 指向 `DomainEntityRepository.java:[9,*]` 的反引号；整改历史却选择 `pom.xml`、`App.vue` 且两轮无进展。
+根因分析：生成器未补齐 Vue 工程级配置，分块源码仅做完整围栏剥离，未清理孤立结束围栏；修复路由被 Maven 下载日志中的依赖名称抢先匹配，压过精确编译位置。
+解决步骤：
+1. 用失败成果物离线逐层复验，分清 Vue 配置、Java 源码和修复目标选择三类原因。
+2. 对 Vue/Vite 补齐插件配置与可变后端代理；对非 Markdown 源码清除孤立围栏并补齐确定性的 Spring Web 注解导入。
+3. 让 Maven 明确的 `*.java:[行,列]` 编译位置优先于依赖关键词，避免错误整改构建文件；增加对应单测。
+验证结果：上一轮 L3 成果物应用上述平台修复后，Vue 构建、Maven 测试、H2 启动与浏览器 CRUD 均通过；后端全量测试 578 项通过。此问题跨多轮生成和定点复验，故标 *。
+
+【2026-09-20】* L3 验收探针与种子数据邮箱冲突
+错误要点：新生成 L3 在 Maven 和服务启动成功后，H2 CRUD 的 POST 返回 500，浏览器新增也未出现记录；并非 API 或前端代码本身不能运行。
+关键证据：服务日志显示 H2 `SQLState 23505`，`uk_student_email` 唯一约束冲突；冻结合同的示例邮箱和 `data.sql` 的种子邮箱都是 `zhangsan@example.com`。
+根因分析：API 与浏览器验收探针直接复用合同示例值执行新增。模型合理地将同一示例值放进种子数据时，测试自身制造重复键错误，并把它误报为 Agent 源码故障。
+解决步骤：
+1. 对照冻结合同、种子 SQL、H2 服务异常和浏览器 CRUD 失败，定位相同邮箱的唯一约束冲突。
+2. 保持冻结业务合同不变，仅为每次 API/浏览器验证生成独立且格式合法的探针邮箱。
+3. 增加模拟种子邮箱冲突的回归测试，并用新生成的真实 L3 成果物执行完整离线交付门禁。
+验证结果：同一份 DeepSeek L3 成果物在修正后通过 Maven、Vue、H2 CRUD 和浏览器 CRUD；后端全量测试 579 项通过。旧进程仍加载旧探针，保留其失败证据并启动全新进程验证，故标 *。
+
+【2026-09-20】* L3 模型遗漏前端模块与 Java 异常类，责任 Agent 定点修复后通过
+错误要点：采用修正后的平台全新生成 L3 时，前端 `App.vue` 引用了未生成的 `./api/students`；后端 Service 引用了未定义的 `ResourceNotFoundException`，使构建失败。
+关键证据：Vite 报 `Could not resolve "./api/students" from "src/App.vue"`；Maven 指向 `DomainEntityService.java:[26,40]` 缺少 `ResourceNotFoundException`。新 Run `regression-e2bc4819c53543ac88b4af16ba8b3ea4` 的修复历史显示两处责任文件均被定点修复。
+根因分析：这两处是模型生成的跨文件依赖不完整；平台的工程配置和数据库探针在本轮已正常运行，构建错误不能靠增加 Token 或改写验收条件解决。
+解决步骤：
+1. 从真实 Vite/Maven 构建日志定位到具体文件与缺失符号，确认不是 Provider 连接、H2 或 Vite 插件问题。
+2. 修复调度将原始错误和兄弟文件合同发送给 Frontend/Backend Agent，仅整改 `src/App.vue` 与 `DomainEntityService.java`。
+3. 先跑目标 Gate，再跑完整 Maven、前端构建、启动、H2 API 与浏览器 CRUD；只有两层验收都通过才提升候选成果物。
+验证结果：正式 DeepSeek L3 运行 `SUCCESS`、`delivery_status=PASSED`，一次验证整改成功，目标 Gate 与完整回归均 PASSED；后端全量单测 579 项通过。L2 正式运行也为 `SUCCESS/PASSED`。该场景经历多次真实生成和定位，故标 *。
+
+【2026-09-20】Architecture 实体 fields 结构不符合交付合同
+
+错误要点：Architecture 的云端调用正常结束，`finish_reason=stop`，正文和推理内容均存在，但模型把 `entities[].fields` 输出成了数组、文本或其他非对象结构。平台要求该位置必须是“字段名到字段类型”的映射，因此在冻结交付合同时抛出 `ValueError：实体合同 fields 必须是字段名到类型的映射`。
+
+根因分析：Architecture 契约中存在两个同名但形状不同的字段：`api_contract[].fields` 要求字段名数组，例如 `["id", "name"]`；`entities[].fields` 则要求对象，例如 `{"id": "Long", "name": "String"}`。当前 Prompt 对前者给了明确数组示例，却没有同等明确地约束后者，模型容易复用错误形状。该错误发生在 LLM 请求成功后的 `build_delivery_contract()` 后处理阶段，不在现有 LLM 重试循环内；结构化兜底识别列表也未包含“fields 必须是映射”，所以日志显示重试 0 次并直接失败。
+
+解决步骤：1. 在 Architecture JSON Schema/Prompt 中分别给出 `api_contract[].fields` 与 `entities[].fields` 的完整示例并明确禁止互换。2. 在冻结合同前增加确定性归一化：对可安全识别的实体字段数组或 `{name,type}` 数组转换为映射，无法确定类型时再要求模型修复。3. 将交付合同 `ValueError` 转换为可重试的结构化输出错误，把具体 JSON 路径、期望类型和实际类型反馈给 Architecture Agent。4. 将该错误加入安全 fallback/RepairCoordinator 分类，并增加不同模型返回变体的回归测试。
+
+修复结果：已完成通用修复。本次不是 Token 不足、网络异常或模型名不匹配；输出接近 3000 Token 上限，但 `finish_reason=stop`，直接原因仍是 JSON 语义结构错误。交付合同现在可归一化字段映射、`name/type` 字段定义列表、单键对象列表、带类型文本以及能从 API payload 安全推断的纯字段名列表；无法可靠推断的业务字段仍会被严格拒绝。Architecture Prompt 已明确区分实体 fields 对象与 API fields 数组，该结构错误也已纳入安全兜底。验证结果：Architecture/合同/Executor 等定向测试 92 项通过，后端全量测试 584 项通过。
+
+【2026-09-20】* 代码公司多 Agent 契约漂移与漏验收
+错误要点：模型或旧路由可能选错实体/数据库；默认实体生成后未进入交付合同；Backend/Frontend/Database 的文件和接口可能不一致；Tester 未等待 Database 结束。单个 Agent 显示成功不代表整套成果物完整。
+根因分析：需求、Architecture、文件规划、Agent Prompt 和 Tester 各自保留部分独立推断；默认实体只用于 API 兜底却未传给实体合同；显式 MySQL 未压过模型默认 H2；文件计划无拓扑和生成前依赖校验；验收门禁仅有部分启发式检查。
+解决步骤：1. 用 Requirement Gap Analyzer 区分高影响澄清与安全默认，明确实体/数据库优先于模型草案。2. 审批冻结 ProjectBlueprint，编译显式 Entity/API、Dependency Manifest、Artifact Ownership、File DAG 与角色合同。3. 在生成前补齐缺失文件、校验 provides/requires、按依赖排序并拒绝跨 Agent 写文件。4. Tester 等待三分支完成，构建前检查文件、路由、字段、导入、SQL 等与冻结合同一致；错误标责任 Agent 交给候选整改。5. 增加 L1/L2/L3、MySQL 和故意冲突用例，并执行后端全量回归、前端构建。
+验证结果：静态契约与故意冲突回归通过；真实云端 Provider 的多轮 L1/L2/L3 交付成功率仍需隔离 Run 实测，不把平台单元测试等同于真实交付。该问题跨此前多轮成果物不完整与修复讨论，故标 *。
+
+【2026-09-20】* 契约改造后的真实 L1/L2/L3 回归暴露边界缺陷
+错误要点：首次 L1 的 Frontend 文件生成遇到 Provider 连接超时/网络中断，节点级重试丢失已完成文件计划；再次 L1 的 CSS/JS 因模型在“关闭思考”下仍消耗隐藏推理 Token，2048 输出上限反复截断并耗尽总时限。首次 L2 被错误澄清门禁拦住；再次 L2 的完整 CRUD Controller 实现了详情 GET，却因冻结合同未标 detail_required 被误判为合同外路由。
+根因分析：① 传输错误上抛到节点层，导致整段文件生成重跑；② 单文件预算只按规划大小估算，未利用模型实际 reasoning usage；③ 澄清服务仍按旧业务信号规则要求确认，忽略明确的 Spring Boot + HTML 技术边界和 H2 安全默认；④ Architecture 的集合 CRUD API 行未自动编译出详情 GET。
+解决步骤：1. 在文件生成层仅对可重试传输错误重试当前请求，保留文件计划及已完成内容，并等待底层请求结束。2. 一旦实际响应出现推理内容/推理用量，后续文件和分片使用 Provider 可用输出上限，避免反复小额度分块。3. 统一 Requirement Router 与 Clarification Gate：完整显式前后端技术栈直接使用已记录的数据库安全默认，不重复追问。4. CRUD 集合含 GET 且绑定明确实体时，确定性冻结详情 GET 路由；合同门禁不再把正常的详情查询视为额外 API。5. 为网络中断、隐藏推理、明确技术栈和详情 GET 加回归，并重新从原始需求运行隔离工作流。
+验证结果：L1 `SUCCESS/deliverable=True`，页面 HTTP、资源、浏览器渲染、ZIP CRC 通过（约 257 秒、43,688 Token，仍有 2 次尾部续写）；L2 `SUCCESS/deliverable=True`，Spring Boot + HTML + H2 全链路通过（约 335 秒、82,939 Token，无重试/续写）；L3 `SUCCESS/deliverable=True`，Vue 构建、H2 CRUD、浏览器 CRUD、数据库审计和 ZIP 均通过（约 356 秒、106,418 Token，Backend/Frontend 共 2 次定点修复）。首次 L1/L2 失败和取消的隔离报告保留作证据，不把单次通过宣称为稳定成功率；该问题经历多轮真实复跑，故标 *。
+
+【2026-09-20】* 冻结 API 路径与前端代理不一致导致整改误改后端
+错误要点：Run `run_b3d202d9fb` 的合同要求 `/products`，前端却调用 `/api/products`；自动整改把本已通过的后端路由改为 `/api/products`，两轮目标 Gate 均未推进并撤回候选成果物。
+关键证据：最初 `backend-api-contract=passed`，`frontend-api-contract=failed`，`frontend-backend-route-contract=failed`；候选版本中 `backend-api-contract=failed`，缺少合同路由 `/products` 与 `/products/{id}`；Vite 原配置只代理 `/api`。
+根因分析：Architecture 建议的裸集合路径未经统一默认前缀处理，前端 Prompt 与 Vite 模板却固定 `/api`；跨端检查标为 Backend，整改器没有利用“后端合同已通过”的证据缩小责任范围。原后端的 `/{id}` 并未缺失，缺失提示针对错误改成 `/api/products/{id}` 的候选版本。
+解决步骤：
+1. 对未由用户明确指定的裸集合路径，在冻结前统一为 `/api/...`；用户明确指定的 `/products` 保持原样，并将冻结路径首段交给 Frontend 角色合同。
+2. Vite 自动补全配置按合同路径生成代理，Frontend Prompt 不再硬编码 `/api`；前端合同与路由校验也识别非 `/api` 路径，并单独检查 Vite 代理覆盖。
+3. 当前端路径失败而后端合同已通过时只将整改分派给 Frontend；定点选取页面与 Vite 配置；已通过检查若在候选版本中退化，则不视为进展。
+4. 增加显式 `/products`、默认 `/api/products`、代理、责任路由和候选退化的回归测试。
+验证结果：后端完整测试 624 项通过，定向测试 107 项通过。历史 Run 的冻结合同与成果物未被直接改写；新运行将使用修复后的策略，真实 Provider 新 Run 的端到端结果仍需单独验证。
+
+【2026-09-20】测试文件独立运行时触发循环导入
+错误要点：单独先运行 `test_delivery_contract.py` 时，测试收集阶段抛出部分初始化模块的 `ImportError`，导致 0 项测试执行；调整测试顺序可暂时通过。
+关键证据：`artifact_validator -> integration_gate -> code_company.__init__ -> verification -> artifact_validator`，报错对象为 `ArtifactValidationResult`。
+根因分析：`code_company.__init__` 在包导入时急切加载 VerificationEngine，形成与 ArtifactValidator 的循环依赖；全量测试的导入顺序掩盖了这一问题。
+解决步骤：
+1. 用定向测试不同文件顺序复现并确认导入链。
+2. 将包级导出改为按需加载，保持现有导出名称，同时避免包初始化期间提前加载验证器。
+3. 按原失败顺序重跑定向测试，再运行完整后端测试。
+验证结果：原失败顺序的定向测试 107 项通过，完整后端测试 624 项通过。
+
+【2026-09-20】* Maven 编译失败后，实体表名冲突导致自动整改未完成
+错误要点：Run `run_52045c74e9` 的 Tester 首先因缺少 Java 异常类而编译失败；候选修复通过编译后，后端启动又因 JPA 表名与 SQL 表名不一致失败。原前置校验漏检表名冲突，后续整改误选 `pom.xml`，最终候选被撤回。
+关键证据：`ProductService.java:26` 引用未定义的 `ProductNotFoundException`；`Product.java` 声明 `@Table(name = "products")`，而 `schema.sql` 创建 `product`。候选整改后 Maven `test` 已通过，启动日志报 `Schema-validation: missing table [products]`；第二轮整改选中 `pom.xml`，目标 Gate 仍失败。
+根因分析：冻结合同的数据库表是 `product`，数据库 Agent 的 SQL 与合同一致，后端 Agent 的显式 JPA 表名与合同冲突。既有合同校验只比对 SQL 字段和 Java 字段，没有比对 `@Table`，使错误推迟到运行期；运行期 Maven 输出中的 `pom.xml` 干扰了定点文件选择。缺失异常类是另一个独立的后端生成错误，并非模型思考强度直接导致。
+解决步骤：
+1. 查询 Run 的验证事件，区分最初编译错误和候选修复后的启动错误，并核对冻结实体合同及各 Agent 的文件归属。
+2. 在合同一致性检查中增加 `backend-table-contract`，把 Java 实体的显式 `@Table(name=...)` 与冻结数据库表名比较，冲突时归责 Backend。
+3. 在定点整改选择中优先使用该校验指明的实体 Java 文件，避免 Maven 日志中的 `pom.xml` 抢占修复目标。
+4. 增加表名冲突和整改文件选择的回归测试；保持历史失败 Run 和原成果物记录不变，避免伪造成功状态。
+验证结果：定向测试 59 项通过，完整后端测试 632 项通过；把历史 Run 的真实 Product.java 与 schema.sql 输入新校验后，SQL 合同通过、后端表名合同准确失败并指向 Product.java。历史 Run 未重新执行，真实模型的新 Run 端到端通过情况仍待验证。
+
+【2026-09-20】* 成果物验证虽可回交 Agent，但两轮后中止且最终只显示原始错误
+错误要点：代码公司生成结束后已进入 Tester 验证和候选整改；同一项目逐层暴露编译、启动、联调错误时，默认两轮整改可能用尽。候选未通过完整回归会撤回，最终错误回到原始失败；失败后仍调用 Tester 模型总结，增加耗时和 Token。
+关键证据：`software-development.yaml` 原设 `repair_attempts: 2`；`WorkflowExecutor` 原上限为 3；历史 Run 第一轮修复通过 Maven 测试后出现 `Schema-validation: missing table [products]`，第二轮选中 `pom.xml` 无进展，候选撤回，最终仍显示 Maven 测试失败。
+根因分析：生成产物跨文件一致性无法仅凭 Agent 完成状态保证；验证门禁会真实暴露缺陷。原有限回边存在，但轮数不足以覆盖逐层故障，运行期缺表日志对修复文件的定位不够准确；失败时保留原成果物是正确的，但缺少最后候选失败信息使用户误以为没有继续修复。
+解决步骤：
+1. 检查 LangGraph 修复子图、目标 Gate、完整回归和候选回滚流程，确认生成分支完成后 Tester 已执行自动定位与修复，不能取消失败门禁或无限循环。
+2. 将代码公司模板的自动整改上限从 2 轮调整到 4 轮，并保持连续两轮无进展熔断及候选隔离/回滚；执行器上限同步到 4 轮。
+3. 对 Hibernate `Schema-validation: missing table [...]` 日志优先定位具有相应 `@Table` 的实体 Java 文件，避免 `pom.xml` 抢占目标。
+4. 候选失败时持久化最后一次验证结果并在最终错误中展示最新失败检查；验证失败后不再额外调用 Tester 模型写无效总结。
+5. 增加四阶段连续故障、缺表定点路由和失败不调用 Tester 模型的回归测试。
+验证结果：定向测试 64 项通过，完整后端测试 634 项通过。新代码尚未对真实云端模型发起新 Run；不同需求下的端到端成功率仍需实际回归，不能保证所有生成错误都可自动修复。
+
+【2026-09-21】* 合同冻结前失败未回交 Architecture，验证器误判诱发无效源码整改
+错误要点：多实体需求的架构草案漏写 entity_id 时，合同编译原本延迟到人工审批，失败无法在 Architecture 阶段有界回退；Tester 又把继承的 Spring CRUD 路由及前端基础前缀 /api 误判为缺失接口，导致原本可用的源码被反复派给生成 Agent。失败事实与前端主要原因、刷新后的修复链路也不完整。
+关键证据：历史 08/09 场景在合同冻结前出现 entity_id 校验失败；本次 08 首轮真实 Run（20260921-001220-579c13ec）虽通过架构预检，却因 frontend-api-contract、frontend-backend-route-contract、backend-item-route-contract 的假阳性耗尽整改并失败。实际 StudentController/CourseController 继承 DomainEntityController 的 GET/POST/PUT/DELETE；新校验对原源码识别到两套完整路由。另有 @Table(name="students/courses") 与冻结表 student/course 不一致，属于真实生成错误。
+根因分析：架构步骤未在审批前完整运行 ContractCompiler；原修复协调器主要面向文件验证，缺少架构合同回边。两个静态验证器只扫描具体 Controller 中的 Mapping，忽略抽象父类；前端路径提取把 API 基础前缀当请求端点。模型建议的数据库还可能被错误提升为交付必需项。
+解决步骤：
+1. 排查 Requirement/Architecture、合同编译、Tester、修复协调器与前端事件入口，区分模型合同错误、真实源码错误和验证器假阳性；保留原始诊断及旧 Run。
+2. 扩展 FailureFact 的阶段、规则码、证据、关联文件/合同、简要原因、责任与修复范围；加入分类和平台归责。Architecture 在审批前执行完整合同预检，通过带 Checkpoint 的有界 LangGraph 回边只修相关实体/API/字段；重复指纹熔断，取消后可恢复；不放宽 entity_id 约束。
+3. 仅在原需求明确且唯一对应实体/API 路径时确定性补齐 entity_id；需求排除项优先于模型建议，用户确认的技术边界写入 RequirementSpec。成果物缺组件/Controller 时在候选工作区按证据定点创建，目标 Gate 后再完整回归；未推进则撤回。异常验证器归平台，不派给代码 Agent。
+4. 修正继承 Controller 路由、JPA @MappedSuperclass 字段、/api 基础前缀、静态 HTML npm 误要求及 BigDecimal 测试值等校验问题；前端启动失败保留子进程输出以便归因。前端展示主要原因和持久化修复链路，统计修复率、熔断、耗时与 Token。
+5. 增加架构回边/取消恢复/双实体、验证器异常、缺文件候选、继承路由与失败统计回归，并用真实模型分别跑静态网页和双实体 Vue + Spring Boot + H2 场景。
+验证结果：后端完整测试 656 项通过，前端生产构建通过。L1 真实 Run（20260921-000556-b33ccd55）SUCCESS/deliverable=True；08 双实体新 Run（20260921-002341-50c91196）SUCCESS/deliverable=True，Maven 测试、Vue 构建、两实体 H2 CRUD、浏览器 CRUD、ZIP CRC 均通过，2 轮验证修复后提交候选。08 单次约 761 秒、219722 Token，L1 单次约 370 秒、67371 Token；两次均非首次无修复通过。剩余风险：未对 09 及所有技术栈做真实 Provider 重复抽样，抽象 Controller 跨多层继承只覆盖单层，慢启动与多文件生成仍耗时；不能推断普遍成功率。未修改历史 Run 或放宽 Gate，未写入密钥。
+补充处理与验证：进一步禁止“只有一个实体”时在用户未明确命名 API 路径的情况下猜补 entity_id；Architecture 修复只合并报错涉及的实体/API 行，保留无关合同；取消修复时删除未提交候选，Stopped Run 的在途节点从稳定 Checkpoint 重试；关联文件超过 16 个时明确升级而不静默截断。补充取消恢复、合同范围和关联文件测试后，后端完整测试 661 项通过，前端生产构建再次通过。候选工作区向稳定目录逐文件复制尚非原子文件系统事务，极端磁盘故障下需另行设计原子发布；真实多次抽样仍待进行。
+
+【2026-09-21】* 单实体学生管理需求的 Architecture 回退两轮后仍漏写 entity_id
+错误要点：用户明确要求 Vue + Spring Boot 学生 CRUD，Run `run_7200c9ee22` 的架构合同在审批前因 API 路由缺少实体关联失败；回退 Architecture 两轮仍返回无 entity_id 的 API，重复指纹熔断。界面把单实体错误误称为“多实体 API”，容易误导为需求不明确。
+关键证据：该 Run 的 architecture.contract_failed、architecture.repair_started 各出现两轮，最终 architecture.repair_circuit_open；两次修复响应均包含 /api/students 路由但未写 entity_id，Provider finish_reason=stop，并非 Token 截断。RequirementSpec 已明确 primary_entities=[Student]，原始需求未指定 API 路径。
+根因分析：Architect Agent YAML 的 API 字段清单漏列 entity_id，修复提示也没有把它明确列为必填；修复回调原来只解析 JSON，不检查候选补丁是否真正包含实体关联。为遵守“不凭模型 URL 猜补实体”的合同约束，平台未自动填入，最终在有界回退后失败。错误摘要用“多实体”概括所有 entity_id 错误，文案不准确。
+解决步骤：
+1. 读取该 Run 的事件、Provider 尝试和需求快照，确认已回退两轮，且原始需求与路由之间不存在用户明确给定的路径映射。
+2. 在 Architect Agent 定义中明确：每条 API 必须写与实体名称一致的 entity_id，单实体也不能省略；这属于内部合同，不要求用户补充自然语言需求。
+3. 在 Architecture 修复提示中列出可用实体名称和必填关联规则；对缺失、未知或未覆盖失败实体的修复补丁先拒绝，再把具体拒绝原因反馈给下一轮，保留原有轮次与熔断约束，不自动猜补、不放宽合同 Gate。
+4. 将单/多实体通用错误摘要改为“API 合同缺少明确的实体关联 entity_id”，并将修复提案拒绝原因展示在前端日志与持久化修复轨迹中。
+5. 增加单实体学生 CRUD 回归：首次无效修复被拒，下一轮显式关联后合同预检通过并进入架构审批；保留双实体和取消恢复回归。
+验证结果：定向架构回归 8 项通过，完整后端测试 663 项通过，前端生产构建通过。没有发起新的真实云端 Provider Run，因此不同模型能否稳定遵循新提示仍需实际抽样验证；即使模型持续漏写，系统也会给出明确拒绝原因并有界停止，不会伪造成功。
+
+【2026-09-21】* 需求确认把不明 CRUD 对象错误推荐为 Product，且自定义答案未传递
+错误要点：酒店等未列入实体别名的 CRUD 需求会收到通用 Product 推荐；即便前端选择“自定义”，此前也只发送选项标识，无法把用户想管理的对象写入需求合同，后续 Agent 可能围绕错误实体生成文件。
+关键证据：RequirementGapAnalyzer 对所有未知 CRUD 主体写入 Product；App.vue 的需求确认提交体原来只有 option 字段，未包含 primary_entity。
+根因分析：平台把特定电商示例当成跨行业默认值；确认弹窗缺少参考问题和自定义输入，后端也未在恢复前校验自定义值。
+解决步骤：
+1. 核对需求缺口分析、确认请求模型、后端答复应用及前端提交链路，确认错误实体的来源和答案丢失点。
+2. 将实体建议改为显式、需用户选择的领域建议：酒店可建议 Room、电商可建议 Product；无可靠建议时只提供自定义，不再暗中套用 Product。确认请求附“你想管理的对象是什么”等参考提问。
+3. 在确认弹窗展示建议与参考问题，提供自定义对象输入；提交时连同选项发送，后端在恢复前校验并规范化名称，将用户选择与默认字段纳入 RequirementSpec，保留其他已明确实体。
+4. 增加酒店推荐、自定义预订、未知领域禁止 Product 默认、空自定义拒绝等回归测试。
+验证结果：后端完整测试 674 项通过，前端 TypeScript 检查与 Vite 生产构建通过。没有重新发起真实云端酒店 Run；不同模型在确认后的生成质量仍需实际复测。
+
+【2026-09-21】* Maven 缺少异常类时修复器只改引用文件，无法连续推进编译 Gate
+错误要点：表名合同修好后，Maven 报引用的 Java 类不存在；旧修复器只挑现存源码，不能把缺失类加入隔离候选，同一编译 Gate 的下一条缺类错误也容易被判作无进展而撤回。
+关键证据：编译日志定位 ProductService.java 的 ProductNotFoundException；旧 _validation_repair_candidates 只返回已有文件，修复后未建立对应 Java 文件。工作流配置的修复轮数 4 还被解析上限截成 3。
+根因分析：缺少“编译器符号 → 引用文件 → 目标包路径”的证据链与受控文件创建分支；进展判断主要比较 Gate 阶段及错误数，不能识别同一 Gate 内已消除的缺失符号。
+解决步骤：
+1. 从 Maven 英文/中文 symbol class 日志定位唯一引用源码，要求源码中确有本地构造调用，检查包名、已有声明和文件归属边界；外部依赖、模糊路径或已有语义等价异常不盲目新建。
+2. 将可确认的缺类归类为 missing_declaration，优先交 Backend Agent 只补建该 Java 文件；有通用 NotFound 异常时保留现有文件，由 Agent 检查构造器并修正引用，不把其他业务实体的异常误认为等价。前端相对模块缺失也归入同一错误类别。所有改动仍只进入 Candidate Workspace。
+3. 目标 Gate 重新执行 Maven；表名 Gate 通过后遇到编译缺类、或同一编译 Gate 暴露下一缺类时保留已有进展。前端日志显示“已通过检查 → 当前失败检查”和缺失符号、引用文件。
+4. 完整回归跨轮保护之前通过的 Gate；显式失败时撤回本轮候选，短路导致未执行则保留候选但不能因此宣布完整通过。无进展连续两轮熔断，达到工作流最多 4 轮即停止，未完整通过不提交候选。
+5. 增加编译符号解析、受控新文件创建、同 Gate 进展、候选保留与回归破坏撤回测试。
+验证结果：后端完整测试 674 项通过；定向修复回归 21 项通过；前端生产构建通过。此次使用模拟 Provider/验证回调验证修复链，没有发起真实云端生成或对新产物执行独立的 Maven 集成试跑；真实模型补类质量、复杂构造器和多文件依赖仍需在下一轮实际 Run 中验证，失败时保持原 Gate 与熔断保护。
+
+【2026-09-21】Token 预算评估早于需求分析，导致后续预算依据不完整
+错误要点：代码公司工作流先运行 token_estimator、再运行 requirement；预算评估只能读取原始输入，无法利用需求摘要与人工确认结果，可能为错误分支或错误复杂度分配预算。
+关键证据：software-development.yaml 原依赖为 token_estimator → requirement → architecture；Requirement 完成前 runtime_budget_plan 已写入 Run State。
+根因分析：早期设计把 Runtime Plan 当作所有业务节点的统一前置节点，没有区分 Requirement 所需的启动预算和后续 Agent 所需的正式预算。
+解决步骤：
+1. 将真实执行顺序改为 requirement → token_estimator → architecture；Requirement 不设前置依赖，继续使用 Auto 启动预算或用户 Manual 配置。
+2. 让 token_estimator 读取 requirement_doc、requirement_spec 与 clarification_answers，只规划尚未完成的后续 Agent，禁止反向覆盖 Requirement 已使用的预算。
+3. Runtime Plan 无法解析时，本地兜底也改为读取已确认需求；保留 failure_policy=continue，不阻断 Architecture。
+4. 同步前端默认画布、演示事件顺序、Agent 描述、README 与 agent.md；架构和成果物文件清单确定后仍保留现有文件级预算细化。
+5. 增加执行顺序、依赖关系、需求启动预算和后续预算生效范围回归。
+验证结果：预算与工作流定向测试 11 项通过，后端完整测试 674 项通过，前端 TypeScript 检查及 Vite 生产构建通过。此次未调用真实云端模型；真实模型给出的预算质量仍需下一次实际 Run 观察，但无效计划会继续使用确定性本地兜底。
+
+【2026-09-21】页面最小化或 API 进程重启后运行状态与实时日志容易丢失
+错误要点：长任务由 FastAPI 进程内 asyncio Task 执行，活动 Run、事件订阅与控制信号依赖单进程内存；前端仅保存临时会话状态，浏览器挂起或关闭后难以准确续接。API 存活并不代表存在实际消费任务的执行进程。
+关键证据：原执行入口直接 create_task，事件总线使用进程内 Queue，前端恢复记录位于 sessionStorage；重启 API 或页面后只能依赖不完整的内存状态，缺少 Worker 所有权与真实 Provider 尝试账本。
+根因分析：SQLite 虽已持久化 Run、Step、Checkpoint 和事件，但执行调度、实时广播、控制命令与执行权没有独立协调层；API 生命周期、浏览器生命周期和长任务生命周期被错误绑定。
+解决步骤：
+1. 保留 SQLite 作为 Run、Artifact、Checkpoint、事件和审计的最终事实来源，引入 Redis Streams 仅承担任务队列、实时事件、审批/澄清/停止命令及 Worker 存活信号，不把密钥或不可替代数据写入 Redis。
+2. 新增独立 Worker 进程，从 Redis 消费 Run；每个 Run 执行前取得带随机 token 的可续租租约。租约丢失时先取消底层执行、保存可恢复状态并放弃本地所有权，禁止误报失败或成功，其他 Worker 可在租约过期后接管。
+3. 增加 Provider Attempt Ledger 与 Worker Lease Ledger，Run 详情记录每次模型尝试、Token、finish_reason、Worker、租约取得和释放原因；新增可分页运行历史接口。
+4. 前端改用 localStorage 保存活动 Run、工作流和最后事件游标；恢复时先读取权威 Run 快照，再从游标续接 SSE，并按事件 ID 去重。新增“运行记录”入口，可重新打开历史 Run。
+5. Redis 实时分发故障时 SSE 回退到 SQLite 轮询；健康检查同时验证 Redis 与活动 Worker。启动器自动启动本地 Redis、API、Worker 和前端，后台诊断写入 backend/data/logs。
+6. 修复事件流兼容回归：无 Repository 的测试事件总线在回放终态事件后必须主动结束，避免测试永久等待。
+7. 修复真实存活回归：Worker 执行 Run 或等待审批时也必须续报全局 Worker 心跳；恢复到审批节点时只重新挂载持久化状态，不重跑 LangGraph/模型，并根据等待节点类型恢复为 WAITING_APPROVAL 或 WAITING_CLARIFICATION。非等待 Run 连续自动恢复达到上限后进入明确失败，避免僵尸 Run 无限重启。
+验证结果：后端全量回归 681 项全部通过、1 项真实 Redis 测试默认跳过；显式连接本地 Redis 后定向测试 7 项全部通过，覆盖事件游标、Attempt/Lease 审计幂等、双 Worker 防重复执行、租约丢失可恢复、恢复熔断、审批状态重挂载及真实 Redis 队列/事件/心跳/租约。前端生产构建通过。Docker Redis 7、API、独立 Worker 和前端已由启动器真实启动；持续观察后 /api/health 仍返回 Redis 可用且 1 个 Worker 活跃，旧审批 Run 恢复为 WAITING_APPROVAL 且未重新调用模型，运行历史接口与前端首页均可访问。真实云端模型完整 Run 未在本轮重复触发，避免产生额外 Token；多主机共享 SQLite 仍不属于支持范围，生产多机部署应迁移 PostgreSQL 与集中式 Artifact Storage。
+
+【2026-09-21】点击运行后画布无变化，多个新 Run 长期停留在 PENDING
+错误要点：前端点击实际已成功创建 Run，后端连续返回 202，但唯一 Worker 被一个历史“等待架构审批”Run 的监控循环占用，无法回到 Redis 队列继续领取新任务。前端立即切换为“停止运行”，但没有显示“正在提交/等待 Worker”，停止未被 Worker 接管的 PENDING Run 又返回 409，因此用户感知为点击无反应。
+关键证据：API 日志显示 POST /runs 两次均为 202 Accepted；run_c2cd5ad676 与 run_aaf954a496 均长期保持 PENDING。健康检查显示 Worker 活跃，但旧 WAITING_APPROVAL Run 持有租约。并发修复并重启后，两条 PENDING Run 被同一 Worker 同时接管并推进到 WAITING_CLARIFICATION。
+根因分析：Worker 虽有 Redis 队列和 Executor 并发限制，但消费循环对 `_run_claimed` 使用同步 await。暂停节点需要长期保留执行上下文和租约，导致该 await 永不返回，队列消费者被单个等待人工操作的 Run 阻塞。前端缺少请求提交中的互斥与明确反馈，并且无租约 PENDING Run 的停止逻辑只支持向 Worker 发控制命令。
+解决步骤：
+1. Worker 消费器改为受 `REDIS_WORKER_CONCURRENCY` 限制的并发任务集合；领取任务后创建独立托管 Task，主循环继续领取后续 Run。完成任务及时收割异常，进程关闭时统一取消并等待托管任务。
+2. 每个 Run 仍使用独立 fencing lease、控制流和心跳；并发只扩大 Run 托管数量，不允许两个 Worker 同时执行同一 Run。
+3. 新增回归测试：第一个 Run 进入 WAITING_APPROVAL 后，第二个排队 Run 必须仍能执行成功，防止暂停节点再次堵塞队列。
+4. 前端增加 `isStartingRun` 防重复点击，点击后立即显示“正在创建 Run 并提交到后台队列”，收到 202 后显示 Run ID 与“等待 Worker 接管”；停止操作不再吞掉 409/网络错误，而是显示原因并刷新权威快照。
+5. 后端允许无租约的 PENDING/QUEUED Run 被直接、持久化地停止并发布终态事件；已被 Worker 接管的 Run 仍通过带租约 token 的控制命令停止。
+6. 停止用户重复点击产生的较早 Run，只保留最新 Run，避免重复调用模型。
+7. 进一步将 WAITING_APPROVAL/WAITING_CLARIFICATION 视为稳定暂停点：Worker 持久化后确认队列消息、移除本地活动状态并释放租约/并发槽。用户提交审批或澄清时，API 重新投递带答案的恢复任务，Worker 重新取得租约，从原 Checkpoint 恢复后应用答案。等待人工操作不再长期占用任何 Worker 并发名额。
+验证结果：并发 Worker、恢复与审批依赖定向测试 67 项通过；后端全量测试 682 项通过、0 失败、1 项真实 Redis 测试默认跳过；前端 TypeScript 与 Vite 生产构建通过。真实现场两条 PENDING Run 均被接管并推进，队列堵塞已消失；历史 WAITING_APPROVAL Run 保持暂停状态但 `workerLease=null`，健康检查仍为 ok、1 个 Worker 活跃。最新 Run 随后失败的独立原因是当前 Provider 为 `chatgpt_local / gpt-5.6-luna`，Codex CLI 返回 usage limit，证明按钮、API、Redis 与 Worker 链路已正常；需等待额度恢复或在 API 配置中切换到有可用 Key 的云端 Provider 后重试。
+
+【2026-09-21】架构审批未弹窗，失败/停止节点点击重试后无有效反馈
+错误要点：Architecture 已完成并把审批节点持久化为 WAITING_APPROVAL，但前端只收到 `step.waiting_approval`，没有收到用于切换全局状态的 `workflow.waiting_approval`，因此没有出现同意/拒绝界面。用户停止该 Run 后点击重试，API 先返回 202，随后 Worker 才发现 Run 没有 FAILED 或 RUNNING 节点并抛出 `Run has no recoverable failed node`，造成“点击无反应”的假象。
+关键证据：Run `run_fafd3ac388` 的事件流中，`step.waiting_approval` 后紧接 `worker.lease_released(reason=paused_for_user)`，缺少 `workflow.waiting_approval`；三次 retry 均先被 Worker 领取，随后记录 `worker.execution_error(ValueError)`。该 Run 的真实节点状态是 WAITING_APPROVAL，而不是可重新执行的失败节点。
+根本原因：Worker 根据数据库中的 WAITING 状态释放租约时，没有等待 Executor 完成两个连续暂停事件及 LangGraph 稳定中断；状态写入发生在第一个事件之前，形成了可取消执行的竞态窗口。前端又只在工作流级事件到达时切换全局审批状态，缺少节点级事件兜底。Redis 模式的 retry 接口没有在入队前同步检查可恢复节点，异步 Worker 拒绝无法反映到原 HTTP 响应。界面原本也只有右侧检查器内的审批卡片，没有与需求确认一致的全屏审批页。
+实际解决步骤：
+1. Worker 发现 Run 进入 WAITING_APPROVAL/WAITING_CLARIFICATION 后，必须等待当前 Executor 调用完成，再释放租约和并发槽，确保工作流级暂停事件与 Checkpoint 已稳定落盘。
+2. 前端把 `step.waiting_approval` 也视为完整暂停信号：立即设置全局 WAITING_APPROVAL、选中审批节点并持久化活动 Run，防止 Worker 切换或 SSE 重连时漏掉弹窗。
+3. 新增全屏“请确认架构方案”页面，明确提供“批准并继续”和“拒绝”两个操作；原右侧审批卡仍保留。
+4. 把重试目标计算提取为统一的有界 Retry Plan。Redis 入队前同步校验；没有可恢复节点时直接返回 409 和明确原因，不再先返回伪成功。
+5. 对“用户停止时正处于审批/需求确认”的 Run，显式点击重试会恢复到原暂停点并重新展示对应确认页，不重新调用已完成 Agent。
+6. 前端按 retry 响应中的真实状态切换 RUNNING、WAITING_APPROVAL 或 WAITING_CLARIFICATION，并先刷新权威快照再续接 SSE。
+7. 清理历史遗留 retry 消息的重复投递：Worker 在领取 retry 前再次核对 Run 必须为 FAILED/STOPPED；已经恢复到 WAITING 或 RUNNING 的旧 retry 直接确认消费，不取得租约、不重新执行。执行期间出现确定性的 ValueError 也会记录一次后确认消息，避免 Redis pending 队列无限重放。
+8. 现场热更新时发现 Uvicorn 会等待仍连接的 SSE 流而长时间停在 graceful shutdown；开发启动器增加 3 秒优雅关闭上限，避免代码重载期间 API 看似失联。该限制只用于进程重载，不改变 Run/Checkpoint 的持久化语义。
+验证结果：审批/恢复/Redis Worker 定向测试 20 项通过、0 失败、1 项真实 Redis 测试默认跳过；新增竞态回归确认 `workflow.waiting_approval` 一定早于租约释放，并确认过期 retry 消息会被确认且不会重新执行。后端全量测试 684 项通过、0 失败、1 项跳过；前端 TypeScript 检查与 Vite 生产构建通过。现场将 `run_fafd3ac388` 从 STOPPED 恢复为 WAITING_APPROVAL 后，运行记录可重新打开，全屏“请确认架构方案”以及“确认架构/拒绝”按钮均实际可见。未点击审批按钮、未重新调用云端模型、未消耗模型 Token。API、Redis、Worker 与前端最终健康检查均通过。
+
+【2026-09-21】* 3456 端口可访问，但 Windows 返回的占用 PID 已不存在
+错误要点：启动器检测到 3456 正在监听，端口表返回 PID 20688；但 `Get-Process`、WMI 与 `tasklist` 都无法找到该 PID，原脚本只能打印“Windows did not expose its process details”，随后无法可靠释放端口。
+根本原因：Uvicorn `--reload` 由父级 reloader 打开监听套接字，再把套接字传给 multiprocessing 子进程。父进程 20688 已退出，但子进程 44808 仍在提供 Agent-Team API；Windows 端口表继续显示已经消失的父 PID。因此对 20688 执行 `taskkill` 不会终止仍存活的子进程，这不是权限不足，也不是其他程序占用了 3456。
+实际解决步骤：
+1. 启动器增加后端 PID 文件 `backend/data/backend.pid`，以后启动后端时记录 reloader PID，下一次启动优先按已知进程树清理。
+2. 增加 Agent-Team 后端健康特征校验；只有 3456 返回本项目健康结构，且失效父 PID 下存在 Uvicorn multiprocessing 子进程时，才按项目残留进程处理，避免误杀无关服务。
+3. 端口表返回失效父 PID 时，不再只执行无法生效的 `taskkill`，而是沿 `ParentProcessId` 递归停止仍存活的子进程，然后重新检查监听状态。
+4. 保留无关进程保护：无法验证为本项目进程树时仍只告警并最终给出占用 PID，不会盲目终止其他程序。
+5. 增加 `AGENT_TEAM_NO_BROWSER=1` 自动验证开关，便于重复运行启动器时不弹出浏览器；普通双击行为不变。
+验证结果：PowerShell 语法解析通过。第一次运行 `启动开发环境.bat` 成功识别并释放“失效父 PID 20688 + 孤儿子进程 44808”，后端、Redis Worker 与前端全部启动；第二次连续运行成功按 PID 文件停止后端 PID 11456 及其子树，再启动新后端 PID 5028。最终 3456 健康接口返回 `status=ok`、Redis 可用、1 个 Worker 活跃，2199 返回 HTTP 200；启动器退出码均为 0。
+
+【2026-09-21 补充】快捷启动入口重新整理
+改进要点：`启动开发环境.bat` 固定使用系统 Windows PowerShell，启动前检查入口脚本是否存在，失败时展示明确退出码和 `backend/data/logs` 诊断目录。PowerShell 启动流程新增前端 HTTP 就绪检查，只有后端能力接口、Redis Worker 和前端页面全部可用才显示 READY；同时输出前后端地址和日志目录。
+验证结果：PowerShell 语法检查通过；连续执行两次同一个快捷启动文件，均能停止上一轮后端、Worker 和前端并完整重启。两次启动退出码均为 0，3456 后端验证、Redis Worker 注册和 2199 前端 HTTP 验证全部通过。
+
+【2026-09-21】* WorkflowExecutor 重名死代码与职责过载重构
+错误要点：`backend/app/workflow/executor.py` 曾达到 3741 行，同时承担 Workflow 调度、LangGraph 状态推进、Provider 调用、Token/Skill 策略、Artifact 收集与交付、架构合同校验和失败记录；类内曾有两个同名 `_run_state`，Python 只会保留后一个实现，前一个实际为不可达死代码。单个 `_execute_step` 超过千行，使审批、恢复、模型请求和合同修复的变更容易相互影响。
+根因分析：项目从旧 DAG Runtime 演进到 LangGraph Runtime 时保留了被覆盖的旧入口；后续功能持续直接加入 Executor，缺少清晰的应用层门面和领域服务边界。测试主要验证业务结果，没有约束重复方法、直接 Provider 调用和文件体积，导致结构退化长期未被发现。
+实际解决步骤：1. 删除旧的重复 `_run_state`，只保留 LangGraph 状态执行入口。2. 将 `RunState` 移到独立状态模块。3. 抽离 `ModelInvocationService`、`RuntimePolicyResolver`、`FailureFactRecorder`、`WorkspaceArtifactCollector`、`ArtifactDeliveryService` 和 `ArchitectureContractService`。4. 将 Architecture 的合同预检、有界回退、错误指纹熔断、Blueprint 冻结从 Executor 移入架构合同服务，Executor 仅编排调用。5. 保留兼容门面，避免现有 API 和测试导入失效。6. 新增结构守卫测试：禁止重复方法、禁止 Executor 直接调用 Provider、限制主文件行数，防止职责重新膨胀。7. 在 `agent.md` 写入模块边界约束。
+修复过程发现的回归：首次抽离架构服务后，测试对 Executor 模块内 `build_delivery_contract` 的替换不再生效，导致“合同构建失败必须阻止审批”用例失真。根因是服务直接静态导入构建器，绕过原有注入点。已改为构造函数注入 `contract_builder` 与 `blueprint_builder`，并让修复回调继续通过 Executor 兼容入口进入，既保持模块边界也保留可测试性。
+验证结果：Executor 从 3741 行降至 3157 行，方法数从 63 降至 53，重复方法为 0；架构修复、审批依赖、端到端和结构专项测试 71 项通过；后端全量测试 688 项通过、0 失败、1 项按环境跳过；前端 TypeScript 检查与 Vite 生产构建通过。当前剩余风险是 `_execute_step` 仍约 1045 行，Artifact 验证/候选修复编排仍应作为下一阶段独立服务继续拆分，但本次未用高风险重写替换已通过的恢复链路。
+
+【2026-09-21】Docker Engine 未运行导致快捷启动器整体终止
+错误要点：双击 `启动开发环境.bat` 时，本地 6379 端口没有 Redis；Docker CLI 虽已安装，但 Docker Desktop Linux Engine 的命名管道不存在。旧启动器直接执行 `docker compose up` 并将非零退出码视为致命错误，因此 API、Worker 和前端都未启动。
+根因分析：项目后端已经支持 `redis` 与 `local` 两种执行模式，SQLite 也能持久化 Run 和 LangGraph Checkpoint，但快捷启动器只实现了 Redis 强依赖路径，没有检查 Docker Engine 状态、尝试启动 Docker Desktop，也没有调用既有 local 模式作为有界降级。另一个隐患是 local 模式仍会仅因环境中存在 `REDIS_URL` 而构造 Redis Coordinator，可能继续访问不可用 Redis。
+实际解决步骤：1. 启动器先探测 Redis TCP，再探测 Docker Engine；Engine 离线时自动查找并隐藏启动 Docker Desktop，最多等待 45 秒。2. Docker 或 Redis 仍不可用时，仅本次进程切换为 `AGENT_TEAM_EXECUTION_MODE=local` 并清除继承的 `REDIS_URL`，不改写 `.env.runtime`。3. local 模式下后端不再构造 Redis Coordinator，继续使用独立 SQLite Checkpoint 恢复 Run。4. 提供 `AGENT_TEAM_REDIS_REQUIRED=1` 严格开关，生产或 Redis 专项验证时仍可禁止降级。5. 启动日志明确说明降级后保留的持久化能力以及暂时关闭的多 Worker、跨进程事件和租约功能。6. README 增加两种启动路径和严格模式说明，并增加启动器回归测试。
+验证结果：PowerShell 脚本语法通过；修正后的快捷启动流程实际完成 Redis、API、Worker 和前端启动；健康接口返回 `status=ok`、`executionMode=redis`、Redis 可用且 1 个 Worker 在线；前端返回 HTTP 200；Docker Redis 容器状态 healthy。启动器/Redis/平台专项测试 18 项通过、0 失败、1 项按环境跳过；后端全量测试 690 项通过、0 失败、1 项按环境跳过。
+
+【2026-09-21】* browser-render/browser-crud 超时被错误归责给 Frontend
+错误要点：糖果广告网站 Run `run_6b4791aaf5` 的 Backend 节点显示成功但实际生成 0 个后端文件，Tester 在浏览器新增记录后等待 `crud-row` 中的随机名称超时，候选验证进一步显示 `/api/candies=HTTP 404`。旧失败分类只看到检查目标为 frontend，因此反复要求 Frontend 修复，不能建立后端接口。
+根因分析：Architecture 返回了描述型技术栈 `Spring Boot + Spring Data JPA + H2` 和 `HTML/CSS/JavaScript，static/index.html，同源 REST`。交付合同没有将它们规范化为平台内部枚举 `springboot` 与 `html`，导致 Blueprint 使用普通 Python 后端的 Ownership，ContractCompiler 不能产生 Spring Boot 文件 DAG；Backend Agent 收到空文件计划后仍被标记成功。验证器随后按静态页面运行，真实 REST 地址自然返回 404。浏览器超时是下游症状，不是单纯的前端刷新问题，也不是模型强度或 Token 不足。
+实际解决步骤：1. 在合同冻结层增加 Backend/Frontend 技术栈规范化，兼容模型返回的描述性名称。2. `DeliveryContract` 自身加入字段规范化，确保其他入口也只能向下游提供稳定枚举。3. ContractCompiler 为 Python 后端补齐确定性文件 DAG，并在 Architecture 冻结前检查所有必需 Agent 必须拥有非空 `file_plan`；空计划直接回退 Architecture，不再生成“0 文件成功”。4. Spring Boot + HTML 现在确定生成 `pom.xml`、Application、Entity、Repository、Service、Controller、application.yml，以及 `src/main/resources/static` 下的前端文件。5. FailureClassifier 识别浏览器日志中的 `/api/...=HTTP 404/405/5xx`，同时归责 Backend 与 Frontend，允许联合修复接口实现、路径和代理，而不是只改表单。6. 增加描述型技术栈、Blueprint Ownership、文件计划和浏览器 API 404 责任路由回归测试。
+验证结果：合同、Blueprint、Artifact、Architecture 和 Repair 专项测试通过；后端全量测试 693 项通过、0 失败、1 项按环境跳过。历史失败 Run 使用的是已经冻结的错误合同，不应只重试 Tester；需要从原始需求创建新 Run，或显式从 Architecture 重新生成合同。

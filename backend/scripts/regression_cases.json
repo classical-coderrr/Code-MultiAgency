@@ -1,0 +1,5 @@
+[
+  {"id":"springboot-html-original","requirement":"开发一个学生管理系统，用 Spring Boot 和 HTML 作为技术栈，要体现增删改查功能。","expected_stack":"springboot_html"},
+  {"id":"springboot-vue-original","requirement":"开发一个学生管理系统，用 Spring Boot 和 Vue 作为技术栈，要体现增删改查功能。","expected_stack":"springboot_vue"},
+  {"id":"static-html-original","requirement":"开发一个简单的 HTML 广告网页，纯前端无需后端。","expected_stack":"static_html"}
+]

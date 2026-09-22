@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+PyYAML==6.0.2
+pydantic==2.10.5
+python-dotenv==1.1.0
+httpx==0.28.1
+pytest==8.3.4
+pytest-asyncio==0.25.3
+langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1
+aiosqlite==0.22.1
+redis==5.2.1
