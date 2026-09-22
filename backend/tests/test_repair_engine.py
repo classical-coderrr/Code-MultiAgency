@@ -155,6 +155,62 @@ def test_compiler_location_selects_exact_path_when_basenames_repeat():
     assert [item["name"] for item in selected] == ["src/main/java/com/example/b/Product.java"]
 
 
+def test_owner_reexecution_rejects_contract_and_cross_owner_changes():
+    before = {
+        "delivery_contract": {"api": "/rooms"},
+        "delivery_contract_hash": "frozen",
+        "blueprint": {
+            "artifact_ownership": {
+                "backend": ["src/main/java/**"],
+                "frontend": ["src/**"],
+            }
+        },
+        "__artifact_files__": [
+            {"name": "src/main/java/app/Room.java", "content": "old", "step_id": "backend"},
+            {"name": "src/App.vue", "content": "old", "step_id": "frontend"},
+        ],
+    }
+    after = {
+        **before,
+        "delivery_contract": {"api": "/changed"},
+        "__artifact_files__": [
+            {"name": "src/main/java/app/Room.java", "content": "fixed", "step_id": "backend"},
+            {"name": "src/App.vue", "content": "changed by backend", "step_id": "frontend"},
+        ],
+    }
+
+    violations = WorkflowExecutor._owner_reexecution_violations(
+        before,
+        after,
+        allowed_owners={"backend"},
+    )
+
+    assert "protected_contract_changed:delivery_contract" in violations
+    assert "owner_boundary:frontend:src/App.vue" in violations
+
+
+def test_owner_reexecution_allows_owned_file_changes_only():
+    before = {
+        "delivery_contract": {"api": "/rooms"},
+        "blueprint": {"artifact_ownership": {"backend": ["src/main/java/**"]}},
+        "__artifact_files__": [
+            {"name": "src/main/java/app/Room.java", "content": "old", "step_id": "backend"},
+        ],
+    }
+    after = {
+        **before,
+        "__artifact_files__": [
+            {"name": "src/main/java/app/Room.java", "content": "fixed", "step_id": "backend"},
+        ],
+    }
+
+    assert WorkflowExecutor._owner_reexecution_violations(
+        before,
+        after,
+        allowed_owners={"backend"},
+    ) == []
+
+
 def test_no_progress_opens_repair_circuit_after_two_rounds():
     engine = RepairEngine()
     validation = failed("backend-build", "backend", "compile failed")

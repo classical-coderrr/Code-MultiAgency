@@ -3168,12 +3168,82 @@ class WorkflowExecutor:
                 "reason": "基于现有源码整改关联文件，保留目录、技术栈和测试；验证通过前不提交。",
             },
         )
-        return await self._repair_failed_artifacts(
+        before = state.context.snapshot()
+        before_files = before.get("__artifact_files__", [])
+        repaired_files, responses = await self._repair_failed_artifacts(
             state, validation, repair_attempt, validation_step_id,
             validator_step.timeout_seconds,
             self.token_budget_manager.provider_max_tokens(self.provider.capabilities()),
             bundle=True,
         )
+        after = state.context.snapshot()
+        allowed_owners = {
+            str(check.target or "").lower()
+            for check in validation.checks
+            if check.status == "failed" and str(check.target or "").lower() in {"backend", "frontend", "database"}
+        }
+        violations = self._owner_reexecution_violations(
+            before,
+            after,
+            allowed_owners=allowed_owners,
+        )
+        if violations:
+            state.context.set("__artifact_files__", before_files if isinstance(before_files, list) else [])
+            for protected_key in ("blueprint", "delivery_contract", "delivery_contract_hash", "compiled_contract"):
+                if protected_key in before:
+                    state.context.set(protected_key, before[protected_key])
+            await self.event_bus.emit(
+                "step.validation_owner_reexecution_blocked",
+                state.run_id,
+                {
+                    "stepId": validation_step_id,
+                    "repairAttempt": repair_attempt,
+                    "status": StepStatus.RUNNING.value,
+                    "violations": violations,
+                    "reason": "责任 Agent 的候选修改越过文件归属或冻结合同边界，已撤回本轮修改。",
+                },
+            )
+            return [], responses
+        return repaired_files, responses
+
+    @staticmethod
+    def _owner_reexecution_violations(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        *,
+        allowed_owners: set[str],
+    ) -> list[str]:
+        """Detect contract mutation and cross-owner writes during owner replay."""
+        violations: list[str] = []
+        for key in ("blueprint", "delivery_contract", "delivery_contract_hash", "compiled_contract"):
+            if before.get(key) != after.get(key):
+                violations.append(f"protected_contract_changed:{key}")
+
+        def file_map(snapshot: dict[str, Any]) -> dict[tuple[str, str], Any]:
+            files = snapshot.get("__artifact_files__")
+            if not isinstance(files, list):
+                return {}
+            return {
+                (str(item.get("step_id") or "").lower(), str(item.get("name") or "").replace("\\", "/")): item.get("content")
+                for item in files
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            }
+
+        old_files = file_map(before)
+        new_files = file_map(after)
+        changed = {
+            key
+            for key in old_files.keys() | new_files.keys()
+            if old_files.get(key) != new_files.get(key)
+        }
+        ownership = (before.get("blueprint") or {}).get("artifact_ownership") if isinstance(before.get("blueprint"), dict) else {}
+        for owner, name in sorted(changed):
+            if owner not in allowed_owners:
+                violations.append(f"owner_boundary:{owner or 'unowned'}:{name}")
+                continue
+            if isinstance(ownership, dict) and ownership and not path_allowed(owner, name, ownership):
+                violations.append(f"path_boundary:{owner}:{name}")
+        return violations
 
     @staticmethod
     def _validation_quality(validation: ArtifactValidationResult) -> tuple[int, int, int]:
