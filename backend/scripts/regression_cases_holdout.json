@@ -1,0 +1,20 @@
+[
+  {
+    "id": "holdout-reading-shelf-static",
+    "difficulty": "L1",
+    "requirement": "做一个个人阅读清单网页，纯 HTML、CSS、JavaScript，不需要后端或数据库。用户可以新增书目、按待读/在读/已读筛选、修改阅读状态和删除书目；使用 localStorage 保存列表，刷新后保留。交付可直接打开的 index.html。",
+    "expected_stack": "static_html"
+  },
+  {
+    "id": "holdout-repair-tickets-html",
+    "difficulty": "L2",
+    "requirement": "开发一套设备报修工单管理系统，后端 Spring Boot REST API，前端使用 Spring Boot static 下的原生 HTML/CSS/JavaScript，同源访问。工单字段为 id、设备名称、报修人、描述、状态；实现新增、列表查询、按状态筛选、详情查询、修改状态和删除。数据仅需在服务运行期间保存在内存中，不需要数据库、登录或外部服务。请提供启动说明并保证页面实际调用后端 API。",
+    "expected_stack": "springboot_html"
+  },
+  {
+    "id": "holdout-club-events-vue-crud",
+    "difficulty": "L3",
+    "requirement": "开发社团活动管理系统，前端 Vue 3 + Vite，后端 Spring Boot REST API，使用 H2 数据库。只管理活动这一种实体，字段为 id、title、location、startTime、capacity、status；实现活动新增、分页/列表查询、按标题搜索、详情查询、编辑和删除。前后端 API 与 JSON 字段必须一致，页面需要真实调用接口并展示操作结果。不要增加报名、用户、登录或支付功能；提供自动化测试和本地启动说明。",
+    "expected_stack": "springboot_vue"
+  }
+]

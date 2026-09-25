@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -35,7 +36,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 BACKEND = Path(__file__).resolve().parents[1]
 TERMINAL = {"SUCCESS", "FAILED", "STOPPED", "CANCELLED"}
@@ -50,6 +52,7 @@ class Case:
     expected_stack: str
     clarification_answers: dict[str, Any] | None = None
     difficulty: str = ""
+    cohort: str = "known"
 
 
 DEFAULT_CASES = (
@@ -67,7 +70,9 @@ DEFAULT_CASES = (
 )
 
 
-def load_cases(path: Path | None = None) -> tuple[Case, ...]:
+def load_cases(path: Path | None = None, *, cohort: str = "known") -> tuple[Case, ...]:
+    if cohort not in {"known", "unseen"}:
+        raise ValueError("cohort must be known or unseen")
     if path is None:
         return DEFAULT_CASES
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -83,7 +88,7 @@ def load_cases(path: Path | None = None) -> tuple[Case, ...]:
         case = Case(
             item.get("id", ""), item.get("requirement", ""),
             item.get("expected_stack", ""), answers,
-            str(item.get("difficulty", "")).strip().upper(),
+            str(item.get("difficulty", "")).strip().upper(), cohort,
         )
         if not isinstance(case.id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", case.id):
             raise ValueError("invalid case id")
@@ -97,6 +102,99 @@ def load_cases(path: Path | None = None) -> tuple[Case, ...]:
     if len({case.id for case in cases}) != len(cases):
         raise ValueError("duplicate case id")
     return tuple(cases)
+
+
+def _safe_base_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host += f":{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path.rstrip("/"), "", ""))
+    except ValueError:
+        return "[invalid-url]"
+
+
+def provider_snapshot(provider: Any, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Return a stable, secret-free Provider identity and its fingerprint."""
+    environment = environment or os.environ
+    capabilities = _dict(provider.capabilities())
+    safe_parameters = {
+        name: str(environment[name])
+        for name in (
+            "MODEL_PROVIDER", "MODEL_NAME", "MODEL_TEMPERATURE", "MODEL_TOP_P",
+            "MODEL_MAX_TOKENS", "MODEL_REASONING_EFFORT", "MODEL_THINKING",
+        )
+        if environment.get(name) not in {None, ""}
+    }
+    safe_parameters["MODEL_BASE_URL"] = _safe_base_url(
+        environment.get("MODEL_BASE_URL") or getattr(provider, "base_url", "")
+    )
+    public = {
+        "provider": str(capabilities.get("provider") or "unknown"),
+        "transport": str(capabilities.get("transport") or "unknown"),
+        "model": str(capabilities.get("model") or getattr(provider, "model_name", "unknown")),
+        "modelFamily": str(capabilities.get("modelFamily") or "unknown"),
+        "baseUrl": safe_parameters.get("MODEL_BASE_URL", ""),
+        "parameters": safe_parameters,
+        "credentialConfigured": bool(getattr(provider, "api_key", "")) or
+                                str(capabilities.get("authentication") or "") == "local_login",
+        "capabilities": {
+            key: capabilities.get(key)
+            for key in ("supportsThinking", "supportsJsonMode", "supportedLevels", "defaultLevel", "maxTokens")
+        },
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(public, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    return {**public, "fingerprint": fingerprint}
+
+
+def _hash_directory(directory: Path) -> str:
+    digest = hashlib.sha256()
+    if not directory.exists():
+        return digest.hexdigest()
+    for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+        relative_path = path.relative_to(directory)
+        if "__pycache__" in relative_path.parts or path.suffix.lower() in {".pyc", ".pyo"}:
+            continue
+        relative = relative_path.as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def freeze_runtime_configuration(suite: Path, workflow_digest: str, provider: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot prompt registries so every repeated Run sees identical policy."""
+    config_root = suite / "config-snapshot"
+    agent_directory = config_root / "agents"
+    skill_directory = config_root / "skills"
+    shutil.copytree(BACKEND / "agents", agent_directory)
+    shutil.copytree(BACKEND / "skills", skill_directory)
+    agent_digest = _hash_directory(agent_directory)
+    skill_digest = _hash_directory(skill_directory)
+    identity = {
+        "workflow_sha256": workflow_digest,
+        "agents_sha256": agent_digest,
+        "skills_sha256": skill_digest,
+        "runtime_code_sha256": _hash_directory(BACKEND / "app"),
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "provider_fingerprint": provider["fingerprint"],
+    }
+    config_fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        **identity,
+        "fingerprint": config_fingerprint,
+        "agent_directory": str(agent_directory),
+        "skill_directory": str(skill_directory),
+    }
 
 
 def _number(value: Any) -> int:
@@ -351,6 +449,7 @@ def measure(case: Case, run: dict[str, Any], events: list[dict[str, Any]], durat
     matched = stack_matches(case, run)
     deliverable = success and matched and _gate_passed(gate)
     corrections = attempt_metrics(run, events)
+    parameter_profile, parameter_fingerprint = resolved_parameter_profile(events)
     summary = error or run.get("error_message")
     if not summary and not deliverable:
         summary = (_dict(gate).get("summary") or
@@ -362,9 +461,12 @@ def measure(case: Case, run: dict[str, Any], events: list[dict[str, Any]], durat
             "duration_seconds": round(max(0, duration), 3), "active_duration_ms": run.get("active_duration_ms"),
             "tokens": token_metrics(run, events), **corrections,
             "coding_loop": coding_loop_metrics(events),
+            "phase_durations": phase_metrics(events),
+            "resolved_parameters": parameter_profile,
+            "resolved_parameter_fingerprint": parameter_fingerprint,
             "first_pass": _first_pass({"deliverable": deliverable, **corrections}),
             "delivery_contract": contract, "delivery_gate": gate, "gate_source": gate_source,
-            "difficulty": case.difficulty or None}
+            "difficulty": case.difficulty or None, "cohort": case.cohort}
 
 
 def coding_loop_metrics(events: list[dict[str, Any]]) -> dict[str, int]:
@@ -390,6 +492,71 @@ def coding_loop_metrics(events: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def phase_metrics(events: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    """Collect measured Agent and deterministic-validation durations from events."""
+    steps: dict[str, dict[str, int]] = {}
+    validation: dict[str, dict[str, int]] = {}
+    seen = set()
+    for event in events:
+        if event.get("id") is not None:
+            if event["id"] in seen:
+                continue
+            seen.add(event["id"])
+        kind = str(event.get("type") or "")
+        payload = _dict(event.get("payload"))
+        duration = _number(payload.get("durationMs"))
+        if kind in {"step.completed", "step.failed"} and payload.get("stepId"):
+            name = str(payload["stepId"])
+            current = steps.setdefault(name, {"attempts": 0, "total_ms": 0})
+            current["attempts"] += 1
+            current["total_ms"] += duration
+        elif kind == "step.validation_stage_completed" and payload.get("stage"):
+            name = str(payload["stage"])
+            current = validation.setdefault(name, {"attempts": 0, "total_ms": 0})
+            current["attempts"] += 1
+            current["total_ms"] += duration
+    return {"agents": steps, "validation_stages": validation}
+
+
+def resolved_parameter_profile(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    """Fingerprint actual non-secret per-step settings, including retry attempts."""
+    rows = []
+    safe_request_keys = {
+        "provider", "transport", "model", "execution", "sandbox", "ephemeral",
+        "requested_max_tokens", "max_tokens", "token_control", "structured_output",
+        "enable_thinking", "reasoning_effort", "thinking", "temperature", "top_p",
+        "response_format",
+    }
+    seen = set()
+    for event in events:
+        if event.get("id") is not None:
+            if event["id"] in seen:
+                continue
+            seen.add(event["id"])
+        if str(event.get("type") or "") not in {"step.completed", "step.failed"}:
+            continue
+        payload = _dict(event.get("payload"))
+        runtime = _dict(payload.get("runtime"))
+        provider = _dict(payload.get("provider"))
+        request = _dict(provider.get("request_parameters"))
+        request_parameters = {key: request[key] for key in sorted(safe_request_keys) if key in request}
+        rows.append({
+            "step_id": str(payload.get("stepId") or "unknown"),
+            "budget": {
+                key: runtime[key]
+                for key in ("configuredMaxTokens", "recommendedMaxTokens", "maxTokens", "retry", "budgetMode",
+                            "requestedThinking", "effectiveThinking", "generationMode")
+                if key in runtime
+            },
+            "provider": {key: provider[key] for key in ("provider", "transport", "model") if key in provider},
+            "request_parameters": request_parameters,
+        })
+    if not rows:
+        return [], None
+    serialized = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return rows, hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     def totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         count = len(rows)
@@ -409,8 +576,52 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "coding_loop_iterations": sum(_number(_dict(row.get("coding_loop")).get("iterations")) for row in rows),
                 "coding_loop_actions": sum(_number(_dict(row.get("coding_loop")).get("actions")) for row in rows),
                 "coding_loop_repair_candidates": sum(_number(_dict(row.get("coding_loop")).get("repair_candidates")) for row in rows)}
-    return {**totals(results), "by_case": {case_id: totals([row for row in results if row["case_id"] == case_id])
-                                          for case_id in sorted({row["case_id"] for row in results})}}
+    def grouped_phase_durations(rows: list[dict[str, Any]], group: str) -> dict[str, dict[str, int]]:
+        values: dict[str, list[int]] = {}
+        for row in rows:
+            phases = _dict(row.get("phase_durations"))
+            for name, item in _dict(phases.get(group)).items():
+                attempts = _number(_dict(item).get("attempts"))
+                if attempts:
+                    values.setdefault(str(name), []).append(_number(_dict(item).get("total_ms")) // attempts)
+        return {
+            name: {
+                "samples": len(samples),
+                "mean_ms": round(statistics.fmean(samples)),
+                "median_ms": round(statistics.median(samples)),
+                "p95_ms": sorted(samples)[max(0, math.ceil(len(samples) * 0.95) - 1)],
+            }
+            for name, samples in sorted(values.items())
+        }
+
+    def consistency(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        def unique(field: str) -> set[str]:
+            return {str(row[field]) for row in rows if row.get(field)}
+        provider = unique("provider_fingerprint")
+        config = unique("configuration_fingerprint")
+        parameters = unique("resolved_parameter_fingerprint")
+        return {
+            "repetitions": len(rows),
+            "provider_consistent": len(provider) == 1 if rows and all(row.get("provider_fingerprint") for row in rows) else None,
+            "configuration_consistent": len(config) == 1 if rows and all(row.get("configuration_fingerprint") for row in rows) else None,
+            "resolved_parameters_consistent": len(parameters) == 1 if rows and all(row.get("resolved_parameter_fingerprint") for row in rows) else None,
+        }
+
+    def totals_with_phases(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            **totals(rows),
+            "agent_phase_duration_ms": grouped_phase_durations(rows, "agents"),
+            "validation_phase_duration_ms": grouped_phase_durations(rows, "validation_stages"),
+            **consistency(rows),
+        }
+
+    return {
+        **totals_with_phases(results),
+        "by_case": {case_id: totals_with_phases([row for row in results if row["case_id"] == case_id])
+                    for case_id in sorted({row["case_id"] for row in results})},
+        "by_cohort": {cohort: totals_with_phases([row for row in results if row.get("cohort", "known") == cohort])
+                      for cohort in sorted({str(row.get("cohort", "known")) for row in results})},
+    }
 
 
 def render_markdown_report(report: dict[str, Any]) -> str:
@@ -420,14 +631,17 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         f"- 模式：{report.get('mode', 'unknown')}",
         f"- 工作流 SHA-256：{report.get('workflow_sha256', 'unknown')}",
+        f"- Provider / 模型：{_dict(report.get('provider')).get('provider', 'unknown')} / {_dict(report.get('provider')).get('model', 'unknown')}",
+        f"- Provider 指纹：{_dict(report.get('provider')).get('fingerprint', 'unknown')}",
+        f"- 运行配置指纹：{_dict(report.get('configuration')).get('fingerprint', 'unknown')}",
         f"- 完成数：{summary.get('runs', 0)}",
         f"- 可交付：{summary.get('deliverables', 0)}/{summary.get('runs', 0)} ({_decimal(summary.get('deliverable_rate')):.1%})",
         f"- 首轮可交付：{summary.get('first_passes', 0)}/{summary.get('runs', 0)} ({_decimal(summary.get('first_pass_rate')):.1%})",
         f"- 总耗时：{_decimal(summary.get('duration_seconds')):.1f} 秒；总 Token：{_number(summary.get('total_tokens'))}",
         f"- 编码循环：{_number(summary.get('coding_loop_iterations'))} 轮、{_number(summary.get('coding_loop_actions'))} 个工具动作、{_number(summary.get('coding_loop_repair_candidates'))} 个修复候选",
         "",
-        "| 难度 | 场景 | 状态 | 可交付 | 首轮通过 | 修复/重试 | 耗时 | Token | 主要失败原因 |",
-        "|---|---|---|---:|---:|---:|---:|---:|---|",
+        "| 测试集 | 难度 | 场景 | 轮次 | 状态 | 可交付 | 首轮通过 | 修复/重试 | 耗时 | Token | 主要失败原因 |",
+        "|---|---|---|---:|---|---:|---:|---:|---:|---:|---|",
     ]
     for row in report.get("results", []):
         if not isinstance(row, dict):
@@ -441,14 +655,34 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         first_pass = "是" if first_value is True else "否" if first_value is False else "未知"
         delivered = "是" if row.get("deliverable") else "否"
         lines.append(
-            f"| {row.get('difficulty') or '—'} | {row.get('case_id', '')} | {row.get('status', '')} "
+            f"| {row.get('cohort', 'known')} | {row.get('difficulty') or '—'} | {row.get('case_id', '')} "
+            f"| {_number(row.get('repetition'))} | {row.get('status', '')} "
             f"| {delivered} | {first_pass} | {repairs} | {_decimal(row.get('duration_seconds')):.1f}s | {tokens} | {reason} |"
         )
+    summary = _dict(report.get("summary"))
+    lines.extend(["", "## 重复运行稳定性", "", "| 场景 | 轮数 | Provider 一致 | 配置一致 | 实际参数一致 | 可交付率 | 首轮通过率 |",
+                  "|---|---:|---|---|---|---:|---:|"])
+    for case_id, values in _dict(summary.get("by_case")).items():
+        def consistency_label(key: str) -> str:
+            return "是" if values.get(key) is True else "否" if values.get(key) is False else "证据不足"
+        lines.append(
+            f"| {case_id} | {_number(values.get('repetitions'))} | {consistency_label('provider_consistent')} "
+            f"| {consistency_label('configuration_consistent')} | {consistency_label('resolved_parameters_consistent')} "
+            f"| {_decimal(values.get('deliverable_rate')):.1%} | {_decimal(values.get('first_pass_rate')):.1%} |"
+        )
+    lines.extend(["", "## 阶段耗时（中位数 / P95）", "", "| 类别 | 阶段 | 中位数 | P95 | 样本数 |", "|---|---|---:|---:|---:|"])
+    for group_key, label in (("agent_phase_duration_ms", "Agent"), ("validation_phase_duration_ms", "验证")):
+        for phase, timing in _dict(summary.get(group_key)).items():
+            lines.append(
+                f"| {label} | {phase} | {_number(timing.get('median_ms'))}ms "
+                f"| {_number(timing.get('p95_ms'))}ms | {_number(timing.get('samples'))} |"
+            )
     lines.extend([
         "",
         "## 解释",
         "",
         "可交付要求工作流成功、技术栈匹配，并且适用的确定性成果物/集成 Gate 有通过证据；Agent 自报完成不计为通过。",
+        "重复测试的 Provider 与工作流/Agent/Skill 配置指纹必须一致；参数指纹用于揭示相同需求的运行时预算或思考强度是否漂移。每阶段耗时来自持久化终态事件，人工审批不计入 Agent 时长。",
         "",
     ])
     return "\n".join(lines)
@@ -617,6 +851,7 @@ class ProcessTree:
 
 def supervise(command: list[str], directory: Path, *, timeout: float, grace: float = 2,
               cancel_requested: Callable[[], bool] = lambda: False,
+              environment: Mapping[str, str] | None = None,
               process_factory: Callable[..., Any] = subprocess.Popen,
               tree_factory: Callable[..., Any] = ProcessTree) -> dict[str, Any]:
     start = time.monotonic()
@@ -626,7 +861,7 @@ def supervise(command: list[str], directory: Path, *, timeout: float, grace: flo
     with (directory / "worker.log").open("wb") as log:
         try:
             process = process_factory(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT,
-                                      start_new_session=os.name != "nt")
+                                      start_new_session=os.name != "nt", env=dict(environment) if environment else None)
             tree = tree_factory(process)
             (directory / "release").touch()  # no model work before containment
             while process.poll() is None:
@@ -673,13 +908,21 @@ def _imports() -> None:
         sys.path.insert(0, str(BACKEND))
 
 
-def real_provider() -> Any:
+def real_provider(environment: Mapping[str, str] | None = None) -> Any:
     from dotenv import load_dotenv
     from app.llm.factory import ProviderFactory
     from app.llm.mock import MockProvider
 
-    load_dotenv(BACKEND / ".env", override=False)
-    provider = ProviderFactory.create_from_env()
+    if environment is None:
+        load_dotenv(BACKEND / ".env", override=False)
+        provider = ProviderFactory.create_from_env()
+    else:
+        provider = ProviderFactory.create(
+            str(environment.get("MODEL_PROVIDER", "qwen")),
+            str(environment.get("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")),
+            str(environment.get("MODEL_API_KEY") or ""),
+            str(environment.get("MODEL_NAME", "qwen-plus")),
+        )
     if isinstance(provider, MockProvider):
         raise ValueError("--live requires a real Provider; MODEL_* configuration resolved to MockProvider")
     return provider
@@ -756,6 +999,16 @@ async def execute_worker(directory: Path, spec: dict[str, Any]) -> None:
     if spec.get("live") is not True:
         raise ValueError("Worker refuses model execution without explicit live flag")
     provider = real_provider()
+    expected_provider = _dict(spec.get("provider_snapshot"))
+    actual_provider = provider_snapshot(provider)
+    if expected_provider.get("fingerprint") and actual_provider["fingerprint"] != expected_provider["fingerprint"]:
+        raise RuntimeError("Resolved Provider/model/parameters differ from the frozen evaluation configuration")
+    expected_runtime_hash = str(_dict(spec.get("configuration")).get("runtime_code_sha256") or "")
+    if expected_runtime_hash and _hash_directory(BACKEND / "app") != expected_runtime_hash:
+        raise RuntimeError("Runtime source changed after the evaluation snapshot was frozen")
+    expected_harness_hash = str(_dict(spec.get("configuration")).get("harness_sha256") or "")
+    if expected_harness_hash and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != expected_harness_hash:
+        raise RuntimeError("Regression harness changed after the evaluation snapshot was frozen")
     # Local Provider must also stay within this Run's controlled workspace.
     if hasattr(provider, "working_directory"):
         provider.working_directory = str(directory / "workspace")
@@ -764,9 +1017,11 @@ async def execute_worker(directory: Path, spec: dict[str, Any]) -> None:
     repository = SQLiteRepository(directory / "run.sqlite3")
     artifacts = ArtifactService(repository, directory / "workspace")
     bus = WorkflowEventBus(repository)
-    executor = WorkflowExecutor(AgentRegistry.from_directory(BACKEND / "agents"), provider, bus, repository,
+    agent_directory = Path(str(spec.get("agent_directory") or BACKEND / "agents"))
+    skill_directory = Path(str(spec.get("skill_directory") or BACKEND / "skills"))
+    executor = WorkflowExecutor(AgentRegistry.from_directory(agent_directory), provider, bus, repository,
                                 artifact_service=artifacts,
-                                skill_registry=SkillRegistry.from_directories([BACKEND / "skills"]))
+                                skill_registry=SkillRegistry.from_directories([skill_directory]))
     run_id = spec["run_id"]
     inputs = {"requirement": spec["case"]["requirement"]}
     repository.create_run(run_id, workflow.id, inputs, "PENDING", utc_now())
@@ -848,6 +1103,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--auto-approve", action="store_true", help="approve only isolated test Runs")
     parser.add_argument("--cases", type=Path)
+    parser.add_argument("--unseen-cases", type=Path,
+                        help="separate holdout JSON list; these requirements are reported as the unseen cohort")
     parser.add_argument("--case-id", action="append", default=[], help="run only matching case ID; repeat to select several")
     parser.add_argument("--repeat", type=_bounded_int, default=1)
     parser.add_argument("--timeout", type=_positive, default=1800,
@@ -866,6 +1123,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.repeat < 1:
         parser.error("--repeat must be at least 1")
     cases = load_cases(args.cases)
+    if args.unseen_cases:
+        cases += load_cases(args.unseen_cases, cohort="unseen")
+    if len({case.id for case in cases}) != len(cases):
+        parser.error("known and unseen test case IDs must be unique")
     if args.case_id:
         selected = set(args.case_id)
         unknown = selected - {case.id for case in cases}
@@ -881,9 +1142,19 @@ def main(argv: list[str] | None = None) -> int:
     from app.workflow.parser import parse_workflow_yaml
     from dotenv import dotenv_values
 
-    for key, secret in dotenv_values(BACKEND / ".env").items():
+    dotenv_environment = dotenv_values(BACKEND / ".env")
+
+    for key, secret in dotenv_environment.items():
         if secret and len(secret) >= 6 and re.search(r"key|secret|password|token|cookie|authorization", key, re.I):
             _SECRET_VALUES.add(secret)
+
+    # Resolve the Provider once and pass this private in-memory environment to
+    # each worker. Credentials are never copied to spec/report files.
+    frozen_environment = dict(os.environ)
+    for key, value in dotenv_environment.items():
+        if key not in frozen_environment and value is not None:
+            frozen_environment[key] = value
+    provider_configuration = provider_snapshot(real_provider(frozen_environment), frozen_environment)
 
     # Read once. Every repeat uses the same current, validated snapshot.
     yaml_text = args.workflow.resolve().read_text(encoding="utf-8")
@@ -894,6 +1165,20 @@ def main(argv: list[str] | None = None) -> int:
     suite = args.output.resolve() / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
     suite.mkdir(parents=True, exist_ok=False)
     write_json(suite / "workflow-snapshot.json", snapshot)
+    runtime_configuration = freeze_runtime_configuration(suite, digest, provider_configuration)
+    report_configuration = {
+        key: value for key, value in runtime_configuration.items()
+        if key not in {"agent_directory", "skill_directory"}
+    }
+    write_json(suite / "experiment.json", {
+        "provider": provider_configuration,
+        "configuration": report_configuration,
+        "repeat": args.repeat,
+        "cohorts": sorted({case.cohort for case in cases}),
+        "cases": [{"id": case.id, "expected_stack": case.expected_stack, "difficulty": case.difficulty,
+                   "cohort": case.cohort} for case in cases],
+        "workflow_sha256": digest,
+    })
     results: list[dict[str, Any]] = []
     cancelled = False
     rtk = shutil.which("rtk")
@@ -907,7 +1192,12 @@ def main(argv: list[str] | None = None) -> int:
             (directory / "workflow.yaml").write_text(yaml_text, encoding="utf-8")
             spec = {"live": True, "case": asdict(case), "run_id": "regression-" + uuid.uuid4().hex,
                     "workflow_id": workflow.id, "workflow_snapshot": snapshot, "timeout": args.timeout,
-                    "auto_approve": args.auto_approve, "max_retries": args.max_retries}
+                    "auto_approve": args.auto_approve, "max_retries": args.max_retries,
+                    "provider_snapshot": provider_configuration,
+                    "configuration": report_configuration,
+                    "configuration_fingerprint": runtime_configuration["fingerprint"],
+                    "agent_directory": runtime_configuration["agent_directory"],
+                    "skill_directory": runtime_configuration["skill_directory"]}
             write_json(directory / "spec.json", spec)
             process_result = supervise([rtk, "proxy", sys.executable, str(Path(__file__).resolve()),
                                         "--worker", str(directory)],
@@ -917,6 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
                                        # persisting terminal evidence and cleanup.
                                        timeout=args.timeout + args.finalize_grace,
                                        grace=args.cancel_grace,
+                                       environment=frozen_environment,
                                        cancel_requested=lambda: (suite / "cancel").exists())
             evidence = salvage(directory, spec)
             if (directory / "result.json").exists() and not process_result["outcome"]:
@@ -948,6 +1239,9 @@ def main(argv: list[str] | None = None) -> int:
                                  "Run total timeout" if process_result["outcome"] == "TIMEOUT" else
                                  "Worker failed; inspect result.json, worker.log and supervisor-error.json")
             result.update({"repetition": repetition, "directory": str(directory), "workflow_sha256": digest,
+                           "cohort": case.cohort,
+                           "provider_fingerprint": provider_configuration["fingerprint"],
+                           "configuration_fingerprint": runtime_configuration["fingerprint"],
                            "workflow_duration_seconds": result.get("duration_seconds"),
                            "supervisor_duration_seconds": round(process_result["duration"], 3),
                            "duration_seconds": round(process_result["duration"], 3)})
@@ -955,6 +1249,8 @@ def main(argv: list[str] | None = None) -> int:
             write_json(directory / "result.json", result)
             results.append(result)
             report = {"mode": "live", "workflow_sha256": digest, "workflow_snapshot": snapshot,
+                      "provider": provider_configuration, "configuration": report_configuration,
+                      "repeat": args.repeat,
                       "execution_timeout_seconds": args.timeout,
                       "finalize_grace_seconds": args.finalize_grace,
                       "metric_definitions": {"first_pass": "deliverable with zero repairs, retries, continuations, fallback and Run recovery across all attempts; null if attempt evidence is unavailable",

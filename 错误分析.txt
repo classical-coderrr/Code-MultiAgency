@@ -1569,3 +1569,9 @@ Agent Team 错误分析记录（历史重总结版）
 2. 无 JSON 模式的 Provider 不再收到 `response_schema`；仍由编码循环解析单个 JSON 对象、校验动作类型/参数、限制每轮一个工具动作并熔断重复无效响应。原候选隔离、责任 Agent 路由、SHA-256 精确补丁、目标 Gate、完整回归和晋升/撤回边界保持不变；验证器或合同缺陷仍归平台/架构处理，不派给代码 Agent。
 3. 增加 Candidate Workspace + CodingAgentLoop + RepairCoordinator 集成测试：Agent 读取错误文件后精确修补；验证目标 Gate 和完整回归前稳定成果不变，仅两道 Gate 通过后晋升候选。前端日志同步显示选择的协议模式和受控工具动作计数。
 验证结果：`backend/tests/test_repair_coordinator.py`、`test_coding_loop.py`、`test_provider_factory.py` 聚焦回归 37 项通过；后端全量测试 824 通过、0 失败、1 跳过；前端 `npm run build` 和 `git diff --check` 通过。未调用真实云端模型重跑历史 L5/L8/L9，真实 Provider 实际工具修复效果仍需回归 Run 验证。本功能在 `codex/tool-based-repair` 分支实现，尚未提交，等待用户确认。
+
+【2026-09-25】回归评测框架测试替身签名与 Checkpoint 测试超时不稳
+错误要点：新增“冻结 Provider 环境并在重复 Run 间复用”的回归覆盖后，测试替身仍声明 `real_provider()` 无参数，无法接收生产代码传入的环境快照；全量测试中另一个 Checkpoint 用例偶发在 180ms 截止时间前未完成首次图状态持久化。
+根因分析：测试替身接口没有随 Provider 初始化接口演进；Checkpoint 用例将流程超时设得过短，把机器负载/测试调度时间误当成稳定的落盘保证。此问题发生在测试夹具，不是线上 Run 或 Checkpoint 逻辑失败。
+解决步骤：1. 将 Provider 测试替身改为兼容可选环境参数；2. 将未自动审批的 Checkpoint 用例窗口调整为 1 秒，仍验证审批等待超时，同时给初始状态写入留出合理余量；3. 重跑回归脚本测试及后端完整测试。
+验证结果：`tests/test_regression_suite.py` 65 项通过；后端全量测试 829 项通过、1 项跳过、0 项失败；`compileall`、`git diff --check` 通过。未执行真实 LLM 评测，不产生模型调用费用。无密钥写入记录。

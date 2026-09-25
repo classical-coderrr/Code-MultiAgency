@@ -43,6 +43,60 @@ def test_custom_cases(tmp_path):
     assert suite.load_cases(path) == (suite.Case("custom", "生成静态 HTML 源码", "static_html"),)
 
 
+def test_unseen_cases_are_loaded_as_a_separate_holdout_cohort(tmp_path, capsys):
+    unseen_path = Path(__file__).parents[1] / "scripts" / "regression_cases_holdout.json"
+    cases = suite.load_cases(unseen_path, cohort="unseen")
+    assert len(cases) == 3
+    assert {case.cohort for case in cases} == {"unseen"}
+    assert {case.expected_stack for case in cases} == suite.STACKS
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps([{
+        "id": "known-case", "requirement": "生成一页纯 HTML 页面", "expected_stack": "static_html",
+    }]), encoding="utf-8")
+    assert suite.main(["--cases", str(known_path), "--unseen-cases", str(unseen_path), "--repeat", "2"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["repeat"] == 2
+    assert [row["cohort"] for row in plan["cases"]] == ["known", "unseen", "unseen", "unseen"]
+
+
+def test_provider_snapshot_redacts_url_credentials_and_excludes_api_key():
+    provider = SimpleNamespace(
+        base_url="https://user:password@api.example.test/v1?token=secret",
+        api_key="must-not-appear",
+        capabilities=lambda: {
+            "provider": "example", "transport": "openai_compatible", "model": "example-coder",
+            "modelFamily": "example", "supportsThinking": False, "supportsJsonMode": True,
+            "supportedLevels": ["off"], "defaultLevel": "off", "maxTokens": {"max": 4096},
+        },
+    )
+    snapshot = suite.provider_snapshot(provider, {
+        "MODEL_PROVIDER": "example", "MODEL_NAME": "example-coder",
+        "MODEL_BASE_URL": "https://user:password@api.example.test/v1?token=secret",
+        "MODEL_API_KEY": "must-not-appear",
+    })
+    serialized = json.dumps(snapshot)
+    assert snapshot["baseUrl"] == "https://api.example.test/v1"
+    assert snapshot["credentialConfigured"] is True
+    assert "must-not-appear" not in serialized and "password" not in serialized and "secret" not in serialized
+
+
+def test_runtime_config_snapshot_is_immutable_and_fingerprinted(tmp_path, monkeypatch):
+    backend = tmp_path / "backend"
+    (backend / "agents").mkdir(parents=True)
+    (backend / "skills" / "sample").mkdir(parents=True)
+    agent = backend / "agents" / "agent.yaml"
+    skill = backend / "skills" / "sample" / "SKILL.md"
+    agent.write_text("prompt: v1\n", encoding="utf-8")
+    skill.write_text("# v1\n", encoding="utf-8")
+    monkeypatch.setattr(suite, "BACKEND", backend)
+    frozen = suite.freeze_runtime_configuration(tmp_path / "run", "workflow-hash", {"fingerprint": "provider-hash"})
+    agent.write_text("prompt: v2\n", encoding="utf-8")
+    skill.write_text("# v2\n", encoding="utf-8")
+    assert Path(frozen["agent_directory"], "agent.yaml").read_text(encoding="utf-8") == "prompt: v1\n"
+    assert Path(frozen["skill_directory"], "sample", "SKILL.md").read_text(encoding="utf-8") == "# v1\n"
+    assert frozen["agents_sha256"] and frozen["skills_sha256"] and frozen["fingerprint"]
+
+
 def test_case_id_limits_targeted_regression_without_model_call(tmp_path, capsys):
     path = tmp_path / "cases.json"
     path.write_text(json.dumps([
@@ -223,6 +277,46 @@ def test_markdown_report_preserves_fractional_rates_and_durations():
     assert "50.0%" in markdown
     assert "12.3 秒" in markdown
     assert "12.3s" in markdown
+
+
+def test_phase_and_parameter_metrics_use_terminal_evidence_and_ignore_duplicates():
+    events = [
+        event("step.completed", {
+            "stepId": "frontend", "durationMs": 1200,
+            "runtime": {"maxTokens": 3000, "effectiveThinking": "off", "retry": 2},
+            "provider": {"provider": "deepseek", "model": "deepseek-v4", "request_parameters": {
+                "model": "deepseek-v4", "max_tokens": 3000, "enable_thinking": False,
+                "api_key": "never-capture-this",
+            }},
+        }, 1),
+        event("step.validation_stage_completed", {"stepId": "tester", "stage": "build", "durationMs": 800}, 2),
+    ]
+    phases = suite.phase_metrics(events + events)
+    parameters, fingerprint = suite.resolved_parameter_profile(events + events)
+    assert phases["agents"] == {"frontend": {"attempts": 1, "total_ms": 1200}}
+    assert phases["validation_stages"] == {"build": {"attempts": 1, "total_ms": 800}}
+    assert parameters[0]["request_parameters"]["max_tokens"] == 3000
+    assert "api_key" not in json.dumps(parameters) and fingerprint
+
+
+def test_aggregate_reports_repeat_consistency_and_cohort_rates():
+    base = {
+        "case_id": "known-one", "cohort": "known", "success": True, "deliverable": True,
+        "first_pass": True, "attempt_metrics_available": True, "duration_seconds": 2,
+        "provider_fingerprint": "p", "configuration_fingerprint": "c",
+        "resolved_parameter_fingerprint": "r", "phase_durations": {
+            "agents": {"frontend": {"attempts": 1, "total_ms": 1200}},
+            "validation_stages": {"build": {"attempts": 1, "total_ms": 800}},
+        },
+    }
+    unseen = {**base, "case_id": "unseen-one", "cohort": "unseen", "deliverable": False,
+              "resolved_parameter_fingerprint": "r2"}
+    totals = suite.aggregate([base, {**base}, unseen])
+    assert totals["provider_consistent"] is True and totals["configuration_consistent"] is True
+    assert totals["by_case"]["known-one"]["resolved_parameters_consistent"] is True
+    assert totals["by_case"]["known-one"]["agent_phase_duration_ms"]["frontend"]["median_ms"] == 1200
+    assert totals["by_cohort"]["unseen"]["deliverable_rate"] == 0
+    assert totals["by_cohort"]["known"]["first_pass_rate"] == 1
 
 
 def test_aggregate_sums_corrective_counts_for_failed_and_successful_runs():
@@ -534,13 +628,29 @@ def test_repeats_keep_independent_databases_and_one_frozen_workflow(tmp_path, mo
     original = "name: software-development\nsteps:\n  - id: requirement\n    agent: requirement_agent\n    task: '{{requirement}}'\n"
     source.write_text(original, encoding="utf-8")
     specs = []
+    worker_environments = []
+
+    class FrozenProvider:
+        api_key = "test-only-credential"
+        base_url = "https://model.example.test/v1"
+
+        def capabilities(self):
+            return {
+                "provider": "test-cloud", "transport": "openai_compatible", "model": "fixed-model",
+                "modelFamily": "test", "supportsThinking": False, "supportsJsonMode": False,
+                "supportedLevels": ["off"], "defaultLevel": "off", "maxTokens": {"max": 4096},
+            }
+
     def local_worker(command, directory, **kwargs):
         from app.repositories.sqlite import SQLiteRepository
 
         spec = json.loads((directory / "spec.json").read_text(encoding="utf-8"))
         specs.append(spec)
+        worker_environments.append(kwargs["environment"])
         assert (directory / "workflow.yaml").read_text(encoding="utf-8") == original
         assert spec["auto_approve"] is True and spec["live"] is True
+        assert Path(spec["agent_directory"]).is_dir() and Path(spec["skill_directory"]).is_dir()
+        assert spec["provider_snapshot"]["model"] == "fixed-model"
         source.write_text(original.replace("requirement_agent", "other_agent"), encoding="utf-8")
         run = html_run()
         run["id"] = spec["run_id"]
@@ -555,7 +665,8 @@ def test_repeats_keep_independent_databases_and_one_frozen_workflow(tmp_path, mo
         suite.write_json(directory / "result.json", result)
         return {"outcome": None, "returncode": 0, "duration": 1}
     monkeypatch.setattr(suite, "supervise", local_worker)
-    monkeypatch.setattr(suite, "real_provider", lambda: pytest.fail("test must not call live Provider"))
+    monkeypatch.setattr(suite, "real_provider", lambda environment=None: FrozenProvider())
+    monkeypatch.setenv("MODEL_API_KEY", "test-secret-never-written")
     cases = tmp_path / "cases.json"
     cases.write_text(json.dumps([{"id": "html", "requirement": "生成纯前端 HTML 源码", "expected_stack": "static_html"}]), encoding="utf-8")
     assert suite.main(["--live", "--auto-approve", "--repeat", "3", "--workflow", str(source),
@@ -568,6 +679,13 @@ def test_repeats_keep_independent_databases_and_one_frozen_workflow(tmp_path, mo
     assert len({spec["run_id"] for spec in specs}) == 3
     assert len({row["directory"] for row in report["results"]}) == 3
     assert len({row["workflow_sha256"] for row in report["results"]}) == 1
+    assert len({item["MODEL_API_KEY"] for item in worker_environments}) == 1
+    assert all(item["MODEL_API_KEY"] == "test-secret-never-written" for item in worker_environments)
+    assert len({spec["provider_snapshot"]["fingerprint"] for spec in specs}) == 1
+    assert len({spec["configuration_fingerprint"] for spec in specs}) == 1
+    assert report["provider"]["model"] == "fixed-model"
+    assert "test-secret-never-written" not in (report_path.parent / "report.json").read_text(encoding="utf-8")
+    assert report["summary"]["by_case"]["html"]["provider_consistent"] is True
     assert all(spec["workflow_snapshot"] == report["workflow_snapshot"] for spec in specs)
     assert not (tmp_path / "run.sqlite3").exists()
     for row in report["results"]:
@@ -666,7 +784,10 @@ async def test_worker_persists_real_langgraph_checkpoints_with_offline_provider(
     case = suite.DEFAULT_CASES[2]
     spec = {"live": True, "workflow_id": "durable-test", "workflow_snapshot": {}, "run_id": "durable-run",
             "case": {"id": case.id, "requirement": case.requirement, "expected_stack": case.expected_stack},
-            "timeout": 2 if auto_approve else 0.18, "auto_approve": auto_approve, "max_retries": 0}
+            # Leave enough time for the initial graph/checkpoint write even
+            # when the full suite is under load; the approval wait still
+            # exercises the timeout path for the non-auto-approved case.
+            "timeout": 2 if auto_approve else 1.0, "auto_approve": auto_approve, "max_retries": 0}
     await suite.execute_worker(tmp_path, spec)
     assert (tmp_path / "checkpoint.sqlite3").is_file()
     # Reopen the saver after the worker's AsyncExitStack has closed its connection.

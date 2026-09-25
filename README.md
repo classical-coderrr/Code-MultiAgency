@@ -345,6 +345,14 @@ python backend/scripts/regression_suite.py --live --auto-approve --cases backend
 python backend/scripts/regression_suite.py --live --auto-approve --cases backend/scripts/regression_cases_swe_10.json --timeout 1800
 ```
 
+要验证重复运行的稳定性，并加入单独维护的未见需求集：
+
+```powershell
+python backend/scripts/regression_suite.py --live --auto-approve --cases backend/scripts/regression_cases_swe_10.json --unseen-cases backend/scripts/regression_cases_holdout.json --repeat 3 --timeout 1800
+```
+
+每次实测会在报告目录保留脱敏的 Provider/模型与配置指纹、每个 Run 的实际预算/思考参数指纹、Agent 与验证阶段耗时、首轮通过率和最终可交付率。重复测试使用同一份进程环境、Workflow、Agent YAML 和 Skill 快照；API Key 不写入用例、Run 规格或报告。云端模型实测会产生真实调用与费用。
+
 浏览器交付门禁需要 Playwright/Chromium：
 
 ```powershell
