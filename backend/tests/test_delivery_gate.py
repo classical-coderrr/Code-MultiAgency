@@ -266,6 +266,40 @@ def test_api_evidence_can_be_split_by_method_on_same_route(tmp_path):
     assert_status(evaluate_delivery(context, report, archive(tmp_path, context)), "passed")
 
 
+def test_stateless_api_gate_distinguishes_passed_failed_and_missing_probes(tmp_path):
+    api = {
+        "path": "/api/convert",
+        "methods": ["POST"],
+        "fields": ["id", "amount", "fromCurrency", "toCurrency", "rate", "convertedAmount"],
+        "payload": {"amount": 100, "fromCurrency": "USD", "toCurrency": "CNY"},
+    }
+    context = static_context(api_contract=[api])
+    rows = [
+        ("passed", ["amount", "fromCurrency", "toCurrency", "rate", "convertedAmount"], "passed"),
+        ("failed", ["amount", "fromCurrency", "toCurrency"], "failed"),
+        ("blocked", [], "blocked"),
+        ("missing", [], "blocked"),
+    ]
+    for probe_status, fields, expected_gate_status in rows:
+        report = validation(context)
+        if probe_status != "missing":
+            report["checks"].append(check(
+                "spring-api-contract-1-post", probe_status,
+                message="实际请求 POST /api/convert 返回 HTTP 404" if probe_status == "failed"
+                else "冻结合同没有 POST 请求样例" if probe_status == "blocked" else "接口探测通过",
+                evidence={"path": "/api/convert", "methods": ["POST"], "fields": fields},
+            ))
+        result = evaluate_delivery(context, report, archive(tmp_path, context))
+        gate_check = next(item for item in result["checks"] if item["id"] == "delivery-api:POST:/api/convert")
+        assert gate_check["status"] == expected_gate_status
+        if probe_status == "failed":
+            assert "实际探测但未通过" in gate_check["message"]
+        elif probe_status == "blocked":
+            assert "缺少验证证据" in gate_check["message"]
+        elif probe_status == "missing":
+            assert "未发现该方法的实际探测记录" in gate_check["message"]
+
+
 @pytest.mark.parametrize("failed", ["summary", "mandatory", "additional"])
 def test_failed_evidence_cannot_be_hidden_by_aggregate_passed(tmp_path, failed):
     context = static_context()

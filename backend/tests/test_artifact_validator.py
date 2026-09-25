@@ -342,6 +342,69 @@ def test_crud_update_changes_only_safe_booking_field():
     }
 
 
+def test_non_crud_api_probe_persists_response_and_separates_failure_from_missing_evidence():
+    validator = ArtifactValidator()
+    outcomes = {
+        "success": ("passed", 200),
+        "http_404": ("failed", 404),
+        "missing_sample": ("blocked", None),
+    }
+
+    for scenario, (expected_status, expected_code) in outcomes.items():
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if scenario == "http_404":
+                return httpx.Response(404, json={"detail": "Not Found"})
+            payload = json.loads(request.content)
+            assert payload == {"amount": 100, "fromCurrency": "USD", "toCurrency": "CNY"}
+            return httpx.Response(200, json={"rate": 7.2, "convertedAmount": 720})
+
+        api = {
+            "path": "/api/convert",
+            "methods": ["POST"],
+            "fields": ["id", "amount", "fromCurrency", "toCurrency", "rate", "convertedAmount"],
+            "payload": {} if scenario == "missing_sample" else {
+                "amount": 100, "fromCurrency": "USD", "toCurrency": "CNY",
+            },
+            "record_response": "json_object",
+            "response_schema": {
+                "type": "object",
+                "properties": {"rate": {"type": "number"}, "convertedAmount": {"type": "number"}},
+                "required": ["rate", "convertedAmount"],
+            },
+        }
+
+        async def exercise():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                return await validator._probe_non_crud_apis(
+                    client, "http://test", {"crud_required": False, "api_contract": [api]},
+                )
+
+        checks = asyncio.run(exercise())
+        assert len(checks) == 1
+        check = checks[0]
+        assert check.status == expected_status
+        assert check.evidence["probeAttempted"] is (expected_code is not None)
+        if expected_code is None:
+            assert not requests
+            assert "缺少接口验证证据" in check.message
+            continue
+
+        assert len(requests) == 1
+        assert requests[0].method == "POST"
+        assert requests[0].url.path == "/api/convert"
+        assert check.evidence["statusCode"] == expected_code
+        assert "fieldChecks" in check.evidence
+        assert "responseBody" in check.evidence
+        if expected_status == "passed":
+            assert check.evidence["fields"] == ["amount", "convertedAmount", "fromCurrency", "rate", "toCurrency"]
+            assert '"convertedAmount": 720' in check.evidence["responseBody"]
+        else:
+            assert "HTTP 404" in check.message
+
+
 def test_maven_test_sources_are_valid_standard_java_layout():
     validator = ArtifactValidator()
     files = [

@@ -1537,3 +1537,14 @@ Agent Team 错误分析记录（历史重总结版）
 2. 继续观察各 Run 的有界修复过程：后续调用生成候选，目标 Gate 通过、完整回归无回退，候选被提升；没有将中断的请求或未验证候选记作成功。
 3. 本轮未修改 Provider 适配代码。后续应在 Provider 边界统一规范并验证所有 response schema，保证对象属性定义兼容本地 Codex 和云端 OpenAI-compatible Provider；同时保留修复调用失败分类及重试上限。
 验证结果：三个受影响 Run 最终均交付成功；本轮十条统计为 9/10 可交付、6/10 首轮通过、3 次验证修复，耗时 4,491.8 秒，累计 2,690,616 Token。该 Schema 拒绝在三条 Run 中复现，虽有后续恢复仍属未修复风险。无密钥写入记录。
+
+【2026-09-25】* L4 非 CRUD API 未执行真实请求，交付门禁混淆接口失败与缺少证据
+错误要点：L4 汇率应用的 POST /api/convert 没有真实请求证据，Delivery Gate 只报告“缺少验证证据”，无法判断后端是否实现该接口；核查本次产物时发现 Spring 源码没有对应路由，前端却会调用该接口。
+关键证据：回归 Run `swe-l4-converter` 的冻结合同含 POST /api/convert 及请求样例；旧启动验证仅轮询 GET 页面/路径，浏览器验证未提交该非 CRUD 表单；该产物仅有 Spring Boot 启动类，没有 Controller 或 RequestMapping。
+根因分析：API 实际行为验证只覆盖 CRUD 专用探针；普通 GET/POST 没有合同驱动的请求步骤。Delivery Gate 又只收集通过证据，因而把“探测失败”和“从未探测”都降成 blocked。静态源码核查确认缺少路由，但本次未启动历史产物，HTTP 实际状态待新 Run 通过探针确认。
+解决步骤：
+1. 对照回归报告、冻结 API 合同和产物源码，确认缺少实际 POST 探测，并确认生成的后端源码未定义 /api/convert 路由。
+2. 为非 CRUD 的安全 GET/POST 增加合同探针；只使用明确的静态路径、请求样例，不猜测动态 ID 或查询值。记录 HTTP 状态、脱敏且有大小上限的响应正文、请求/响应字段检查和类型检查。
+3. 后端只要已有 HTTP 响应即可进入独立 API 探测；API 可用性仍由真实方法请求决定，不把首页或启动检查当成接口成功。
+4. Delivery Gate 按路径与方法关联探测结果：实际请求失败时标记 failed 并归属 Backend；未执行或无法安全构造请求时保持 blocked 并明确缺少证据。静态操作的输入字段与输出字段分开核验，不要求模型规范化默认添加的 id。
+验证结果：新增的三种 API 场景（合法 200 与响应字段、真实 HTTP 404、无请求样例未探测）及交付门禁状态区分用例通过；`tests/test_artifact_validator.py` 与 `tests/test_delivery_gate.py` 共 282 项通过，三个修改的 Python 文件通过 `py_compile`，`git diff --check` 通过。未重新运行历史 L4 产物，因此真实 HTTP 响应、修复 Agent 是否能补齐路由及端到端回归仍待验证。当前改动保留在 `codex/api-verification-evidence` 分支，尚未提交。

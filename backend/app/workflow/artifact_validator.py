@@ -28,6 +28,7 @@ import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from ..services.artifact_paths import normalize_artifact_path
+from .delivery_contract import api_response_fields
 from .integration_gate import IntegrationGate
 
 
@@ -1013,6 +1014,7 @@ class ArtifactValidator:
                 crud_specs=tuple(crud_specs),
                 page_paths=tuple(contract.get("entrypoints", [])) if contract and contract.get("page_mode") != "spa" else (),
                 browser_contract=contract,
+                api_contract=contract,
                 companion_files=files if contract and contract.get("page_mode") == "spa" else None,
             )
             return
@@ -1220,6 +1222,7 @@ class ArtifactValidator:
         crud_specs: tuple[_SpringCrudSpec, ...] = (),
         page_paths: tuple[str, ...] = (),
         browser_contract: dict[str, Any] | None = None,
+        api_contract: dict[str, Any] | None = None,
         companion_files: dict[str, str] | None = None,
     ) -> None:
         # Pick an OS-assigned port by binding a short-lived socket in the
@@ -1271,12 +1274,17 @@ class ArtifactValidator:
                             continue
                         observed_responses[path] = response.status_code
                         # A 404 proves that a process is listening, not that
-                        # the generated application exposes the requested
-                        # entry point. Delivery validation must require an
-                        # actually usable endpoint.
+                        # the requested page/API is usable. For a backend with
+                        # a declared API contract, any HTTP response is enough
+                        # to begin the separate method-specific probe below;
+                        # only that probe can prove API delivery.
                         if 200 <= response.status_code < 400:
                             status = "passed"
                             message = f"服务已启动，{path} 返回 HTTP {response.status_code}。"
+                            break
+                        if target == "backend" and api_contract and response.status_code < 600:
+                            status = "passed"
+                            message = f"后端服务已响应 HTTP {response.status_code}；API 是否可用将由冻结合同探测单独判定。"
                             break
                     if status == "passed":
                         break
@@ -1289,6 +1297,10 @@ class ArtifactValidator:
                     for spec in (*crud_specs, *((crud_spec,) if crud_spec is not None else ())):
                         integration_checks.append(await self._probe_spring_crud_with_fixtures(
                             client, f"http://127.0.0.1:{port}", spec, crud_specs,
+                        ))
+                    if target == "backend" and api_contract:
+                        integration_checks.extend(await self._probe_non_crud_apis(
+                            client, f"http://127.0.0.1:{port}", api_contract,
                         ))
                 if status == "passed" and page_paths:
                     integration_checks.extend(await self._probe_pages(client, f"http://127.0.0.1:{port}", page_paths, target))
@@ -1337,6 +1349,238 @@ class ArtifactValidator:
         await record(ValidationCheck(f"{result_target}-startup", result_target, label, status, message, command, duration_ms, output))
         for check in integration_checks:
             await record(check)
+
+    async def _probe_non_crud_apis(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        contract: dict[str, Any],
+    ) -> list[ValidationCheck]:
+        """Exercise safe, non-CRUD API operations from the frozen contract.
+
+        CRUD mutations stay with the fixture-aware lifecycle probe. A generic
+        operation is only invoked when the contract provides a concrete path
+        and an explicit request example; the validator never invents IDs or
+        query values for unsafe/ambiguous calls.
+        """
+        checks: list[ValidationCheck] = []
+        apis = contract.get("api_contract")
+        if not isinstance(apis, list):
+            return checks
+        for api_index, api in enumerate(apis, start=1):
+            if not isinstance(api, dict):
+                continue
+            path = str(api.get("path") or "").strip()
+            methods = api.get("methods")
+            if not path or not isinstance(methods, list):
+                continue
+            declared_methods = {str(item).upper() for item in methods if isinstance(item, str)}
+            is_crud_api = bool(api.get("entity_id")) or (
+                contract.get("crud_required") is True
+                and bool(declared_methods & {"PUT", "PATCH", "DELETE"})
+            )
+            if is_crud_api:
+                continue
+            for method in sorted(declared_methods):
+                check_id = f"spring-api-contract-{api_index}-{method.lower()}"
+                evidence: dict[str, Any] = {
+                    "path": path,
+                    "methods": [method],
+                    "fields": [],
+                    "probeAttempted": False,
+                }
+                if "{" in path or "}" in path:
+                    reason = "路径包含未绑定的动态参数，冻结合同未提供可安全使用的具体值。"
+                    checks.append(ValidationCheck(check_id, "backend", "API 合同探测", "blocked", reason, evidence=evidence))
+                    continue
+                if method not in {"GET", "POST"}:
+                    reason = f"未对 {method} 执行自动探测：非 CRUD 操作缺少可确认安全的目标或请求样例。"
+                    checks.append(ValidationCheck(check_id, "backend", "API 合同探测", "blocked", reason, evidence=evidence))
+                    continue
+                query_names = api.get("query_parameters")
+                if isinstance(query_names, list) and query_names:
+                    reason = "冻结合同只声明了查询参数名称，没有提供可执行的参数样例；未猜测参数值。"
+                    checks.append(ValidationCheck(check_id, "backend", "API 合同探测", "blocked", reason, evidence=evidence))
+                    continue
+                payload: dict[str, Any] | None = None
+                if method == "POST":
+                    raw_payload = api.get("payload")
+                    if isinstance(raw_payload, dict) and raw_payload:
+                        payload = self._unique_probe_payload(raw_payload)
+                    else:
+                        reason = "冻结合同没有 POST 请求样例；未猜测请求数据，因此缺少接口验证证据。"
+                        checks.append(ValidationCheck(check_id, "backend", "API 合同探测", "blocked", reason, evidence=evidence))
+                        continue
+                request_fields = sorted(payload) if isinstance(payload, dict) else []
+                evidence["requestFields"] = request_fields
+                evidence["requestBody"] = self._safe_api_evidence(payload) if payload is not None else None
+                request_url = f"{base_url}{path}"
+                try:
+                    response = await client.request(method, request_url, json=payload if method == "POST" else None)
+                except httpx.RequestError as exc:
+                    evidence.update({"probeAttempted": True, "requestError": type(exc).__name__})
+                    checks.append(ValidationCheck(
+                        check_id, "backend", "API 合同探测", "failed",
+                        f"实际请求 {method} {path} 失败：{type(exc).__name__}。",
+                        command=f"HTTP {method} {path}", output=str(exc)[:1200], evidence=evidence,
+                    ))
+                    continue
+
+                response_json: Any = None
+                try:
+                    response_json = response.json()
+                except (ValueError, json.JSONDecodeError):
+                    pass
+                response_fields = sorted(response_json) if isinstance(response_json, dict) else []
+                expected_response_fields = api_response_fields(api)
+                missing_fields = sorted(expected_response_fields - set(response_fields))
+                record_shape = str(api.get("record_response") or "json_object").lower()
+                shape_ok = (
+                    isinstance(response_json, dict) if record_shape == "json_object"
+                    else isinstance(response_json, list) if record_shape == "array"
+                    else response_json is not None
+                )
+                response_schema = api.get("response_schema")
+                schema_properties = (
+                    response_schema.get("properties")
+                    if isinstance(response_schema, dict) and isinstance(response_schema.get("properties"), dict)
+                    else response_schema if isinstance(response_schema, dict) else {}
+                )
+                field_checks = [
+                    {"field": name, "direction": "request", "expected": "sent", "actual": "present", "passed": True}
+                    for name in request_fields
+                ]
+                verified_response_fields: set[str] = set()
+                type_errors: list[str] = []
+                for name in sorted(expected_response_fields):
+                    present = isinstance(response_json, dict) and name in response_json
+                    declaration = schema_properties.get(name) if isinstance(schema_properties, dict) else None
+                    expected_type = self._api_expected_json_type(declaration)
+                    type_ok = present and self._api_value_matches_type(response_json[name], expected_type)
+                    passed = bool(present and type_ok)
+                    field_checks.append({
+                        "field": name,
+                        "direction": "response",
+                        "expected": expected_type or "present",
+                        "actual": self._api_actual_json_type(response_json[name]) if present else "missing",
+                        "passed": passed,
+                    })
+                    if passed:
+                        verified_response_fields.add(name)
+                    elif present:
+                        type_errors.append(f"{name} 类型应为 {expected_type}")
+                fields = sorted(set(request_fields) | verified_response_fields)
+                safe_response = self._safe_api_evidence(response_json if response_json is not None else response.text)
+                serialized_response = (
+                    json.dumps(safe_response, ensure_ascii=False)
+                    if not isinstance(safe_response, str) else safe_response
+                )
+                response_truncated = len(serialized_response) > 5000
+                response_body = serialized_response[:5000] + ("…[响应已截断]" if response_truncated else "")
+                evidence.update({
+                    "probeAttempted": True,
+                    "statusCode": response.status_code,
+                    "contentType": response.headers.get("content-type", ""),
+                    "responseFields": response_fields,
+                    "fields": fields,
+                    "fieldChecks": field_checks,
+                    "expectedResponseFields": sorted(expected_response_fields),
+                    "missingResponseFields": missing_fields,
+                    "responseShapePassed": shape_ok,
+                    "responseBody": response_body,
+                    "responseBodyTruncated": response_truncated,
+                })
+                errors = []
+                if not 200 <= response.status_code < 300:
+                    errors.append(f"HTTP {response.status_code}")
+                if not shape_ok:
+                    errors.append("响应不是合同要求的 JSON 对象")
+                if missing_fields:
+                    errors.append("响应缺少合同字段：" + ", ".join(missing_fields))
+                if type_errors:
+                    errors.append("响应字段类型不符：" + ", ".join(type_errors))
+                status = "failed" if errors else "passed"
+                message = (
+                    f"实际请求 {method} {path} 返回 HTTP {response.status_code}，字段检查通过。"
+                    if not errors else f"实际请求 {method} {path} 未通过：" + "；".join(errors)
+                )
+                checks.append(ValidationCheck(
+                    check_id, "backend", "API 合同探测", status, message,
+                    command=f"HTTP {method} {path}",
+                    output=self._clip_output(json.dumps({"status": response.status_code, "body": response_body}, ensure_ascii=False)),
+                    evidence=evidence,
+                ))
+        return checks
+
+    @staticmethod
+    def _api_expected_json_type(declaration: Any) -> str:
+        if isinstance(declaration, dict):
+            declaration = (
+                declaration.get("json_type") or declaration.get("type")
+                or declaration.get("java_type") or declaration.get("sql_type") or ""
+            )
+        normalized = str(declaration or "").strip().lower()
+        if any(token in normalized for token in ("integer", "long", "short", "int", "bigint")):
+            return "integer"
+        if any(token in normalized for token in ("decimal", "bigdecimal", "double", "float", "number", "numeric")):
+            return "number"
+        if any(token in normalized for token in ("bool",)):
+            return "boolean"
+        if any(token in normalized for token in ("array", "list")):
+            return "array"
+        if any(token in normalized for token in ("object", "map")):
+            return "object"
+        if any(token in normalized for token in ("string", "str", "date", "time", "uuid")):
+            return "string"
+        return ""
+
+    @staticmethod
+    def _api_actual_json_type(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "null"
+
+    @staticmethod
+    def _api_value_matches_type(value: Any, expected: str) -> bool:
+        if not expected:
+            return True
+        actual = ArtifactValidator._api_actual_json_type(value)
+        if expected == "number":
+            return actual in {"integer", "number"}
+        return actual == expected
+
+    @staticmethod
+    def _safe_api_evidence(value: Any, depth: int = 0) -> Any:
+        """Redact credential-like fields before persisting request/response data."""
+        if depth >= 6:
+            return "[嵌套内容已截断]"
+        sensitive = ("api_key", "apikey", "authorization", "cookie", "password", "secret", "token")
+        if isinstance(value, dict):
+            return {
+                str(key): "[已脱敏]" if any(marker in str(key).lower().replace("-", "_") for marker in sensitive)
+                else ArtifactValidator._safe_api_evidence(item, depth + 1)
+                for key, item in list(value.items())[:100]
+            }
+        if isinstance(value, list):
+            return [ArtifactValidator._safe_api_evidence(item, depth + 1) for item in value[:100]]
+        if isinstance(value, str):
+            redacted = re.sub(
+                r"(?i)(api[_-]?key|authorization|cookie|password|secret|token)(\s*[:=]\s*)([^,\s\"}]+)",
+                r"\1\2[已脱敏]",
+                value,
+            )
+            return redacted[:2400]
+        return value
 
     async def _probe_browser(self, root: Path, base: str, contract: dict[str, Any]) -> list[ValidationCheck]:
         node = self._executable("node.exe", "node")

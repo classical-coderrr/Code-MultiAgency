@@ -88,6 +88,7 @@ class ApiContract(BaseModel):
             raise ValueError("Unsupported HTTP method")
         return result
 
+
     @field_validator("fields", mode="before")
     @classmethod
     def normalize_field_schema(cls, value: Any) -> Any:
@@ -130,6 +131,61 @@ class ApiContract(BaseModel):
             if text and text not in result:
                 result.append(text[:120])
         return result[:16]
+
+
+_JSON_SCHEMA_META_FIELDS = {
+    "additionalProperties", "description", "required", "title", "type",
+}
+
+
+def _schema_fields(schema: Any) -> set[str]:
+    if not isinstance(schema, dict):
+        return set()
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return {str(name) for name in properties if isinstance(name, str) and name}
+    return {
+        str(name) for name in schema
+        if isinstance(name, str) and name not in _JSON_SCHEMA_META_FIELDS
+    }
+
+
+def api_response_fields(api: dict[str, Any], *, crud_required: bool = False) -> set[str]:
+    """Return output fields that a live API probe must observe.
+
+    For stateless operations, fields can contain both request and response
+    fields. Split those by the frozen request sample/schema and do not require
+    the model-normalizer's default id unless the response schema explicitly
+    declares it. Entity CRUD keeps its existing full-field requirement.
+    """
+    response_schema = api.get("response_schema")
+    explicit = _schema_fields(response_schema)
+    if explicit:
+        required = response_schema.get("required") if isinstance(response_schema, dict) else None
+        if isinstance(required, list):
+            return explicit & {str(item) for item in required if isinstance(item, str)}
+        return explicit
+    fields = {str(item) for item in api.get("fields", []) if isinstance(item, str) and item}
+    payload = api.get("payload") if isinstance(api.get("payload"), dict) else {}
+    if crud_required or api.get("entity_id"):
+        return fields
+    request_schema = api.get("request_schema")
+    request_fields = set(payload) or _schema_fields(request_schema)
+    identity = str(api.get("identity_field") or "id")
+    response = fields - request_fields
+    if identity:
+        response.discard(identity)
+    return response
+
+
+def api_required_fields(api: dict[str, Any], *, crud_required: bool = False) -> set[str]:
+    """Return API fields required in the persisted request/response evidence."""
+    payload = api.get("payload") if isinstance(api.get("payload"), dict) else {}
+    request_schema = api.get("request_schema")
+    request_fields = set(payload) or _schema_fields(request_schema)
+    if crud_required or api.get("entity_id"):
+        return {str(item) for item in api.get("fields", []) if isinstance(item, str) and item} | set(payload)
+    return request_fields | api_response_fields(api)
 
 
 class DeliveryContract(BaseModel):

@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from ..services.artifact_paths import normalize_artifact_path
+from .delivery_contract import api_required_fields
 
 
 _NONE = {"", "none", "disabled", "not_required", "no", "off"}
@@ -517,15 +518,45 @@ def evaluate_delivery(context: dict, validation: dict | None,
                     "合同验收项已由对应的真实 CRUD/数据库验证证据覆盖。" if candidates
                     else "缺少该实体与 API 路径对应的通过证据；不得以其他实体的验收结果替代。",
                 )
-    api_rows = [row for item in evidence if item["status"] == "passed" for row in _api_rows(item)]
     for api in api_contract:
         path = _path(api["path"])
-        fields = _strings(api["fields"]) | set(api.get("payload", {}))
-        for method in sorted(_strings(api["methods"], upper=True)):
-            covered = any(_path(row.get("path")) == path and method in _strings(row.get("methods"), upper=True)
-                          and fields <= _strings(row.get("fields")) for row in api_rows)
-            record(f"delivery-api:{method}:{path}", "passed" if covered else "blocked",
-                   "冻结 API 合同的方法及字段验证通过。" if covered else "缺少覆盖冻结 API 方法及字段的明确验证证据。")
+        methods = _strings(api["methods"], upper=True)
+        api_is_crud = bool(api.get("entity_id")) or (
+            contract.get("crud_required") is True
+            and bool(methods & {"PUT", "PATCH", "DELETE"})
+        )
+        fields = api_required_fields(api, crud_required=api_is_crud)
+        for method in sorted(methods):
+            matching = [
+                (item, row)
+                for item in evidence
+                for row in _api_rows(item)
+                if _path(row.get("path")) == path
+                and method in _strings(row.get("methods"), upper=True)
+            ]
+            passed = any(
+                item["status"] == "passed" and fields <= _strings(row.get("fields"))
+                for item, row in matching
+            )
+            failed = next((item for item, _ in matching if item["status"] == "failed"), None)
+            blocked = next((item for item, _ in matching if item["status"] == "blocked"), None)
+            if passed:
+                record(f"delivery-api:{method}:{path}", "passed", "冻结 API 合同的方法及字段验证通过。")
+            elif failed:
+                record(
+                    f"delivery-api:{method}:{path}", "failed",
+                    f"接口已实际探测但未通过：{str(failed.get('message') or '响应或字段不符合冻结合同。')[:400]}",
+                )
+            elif blocked:
+                record(
+                    f"delivery-api:{method}:{path}", "blocked",
+                    f"接口未能安全执行，缺少验证证据：{str(blocked.get('message') or '未完成实际探测。')[:400]}",
+                )
+            else:
+                record(
+                    f"delivery-api:{method}:{path}", "blocked",
+                    "未发现该方法的实际探测记录，属于缺少验证证据；不能据此判定接口本身失败。",
+                )
     if contract.get("database_audit_required") is True:
         audit_paths = sorted({_path(api["path"]) for api in api_contract
                               if _strings(api["methods"], upper=True) & {"POST", "PUT", "PATCH", "DELETE"}})
