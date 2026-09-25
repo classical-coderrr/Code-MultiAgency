@@ -1548,3 +1548,14 @@ Agent Team 错误分析记录（历史重总结版）
 3. 后端只要已有 HTTP 响应即可进入独立 API 探测；API 可用性仍由真实方法请求决定，不把首页或启动检查当成接口成功。
 4. Delivery Gate 按路径与方法关联探测结果：实际请求失败时标记 failed 并归属 Backend；未执行或无法安全构造请求时保持 blocked 并明确缺少证据。静态操作的输入字段与输出字段分开核验，不要求模型规范化默认添加的 id。
 验证结果：新增的三种 API 场景（合法 200 与响应字段、真实 HTTP 404、无请求样例未探测）及交付门禁状态区分用例通过；`tests/test_artifact_validator.py` 与 `tests/test_delivery_gate.py` 共 282 项通过，三个修改的 Python 文件通过 `py_compile`，`git diff --check` 通过。未重新运行历史 L4 产物，因此真实 HTTP 响应、修复 Agent 是否能补齐路由及端到端回归仍待验证。当前改动保留在 `codex/api-verification-evidence` 分支，尚未提交。
+
+【2026-09-25】* 性能计时接入曾导致验证修复链路引用局部函数失败
+错误要点：阶段二接入模型请求计时时，初次将 `_execute_step` 内的局部计时函数复用于类中另一个方法 `_repair_failed_artifacts`。验证器触发源码定点修复时，该函数不在当前作用域，修复请求报错并使候选修复测试失败。
+关键证据：`test_tester_can_repair_a_located_file_and_revalidate` 首次失败；检查调用位置后确认验证修复方法位于 `_execute_step` 外。另发现这段计时代码使 `WorkflowExecutor` 超过项目 3,200 行结构保护线。
+根因分析：计时逻辑被错误地绑定为单个执行方法的局部闭包，调用方跨方法复用；同时继续把通用计时和交付证据持久化逻辑留在 Executor 会扩大 God Object。全量测试还暴露两项图往返断言已落后于现行工作流：预算评估已移到 Requirement 之后，Backend 依赖包含 Database。
+解决步骤：
+1. 将模型调用耗时、Token、finish reason 与失败状态事件提取到共享 `model_timing.py`，普通 Agent 和验证修复分别传入所属步骤、阶段与修复轮次。
+2. 将交付证据及 FailureFact 落库逻辑提取到 `delivery_evidence.py`，Executor 仅负责调用，保持兼容现有交付流程。
+3. 保留原始验证失败、候选隔离和回归逻辑；没有改 Gate 或伪造修复成功。
+4. 更新过时的图往返测试，使其断言依赖关系与原始 Workflow 一致，并断言 Architecture 在 Requirement 之后执行。
+验证结果：定位修复用例通过；阶段二相关回归 378 项通过；更新后全量后端测试 822 通过、0 失败、1 跳过。Python compileall、前端 `npm run build` 和 `git diff --check` 通过；Executor 为 3,159 行。改动留在 `codex/latency-optimization`，尚未提交。

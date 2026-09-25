@@ -220,6 +220,44 @@ def test_run_metrics_report_repair_quality_and_validation_stages() -> None:
     )
 
 
+def test_run_performance_metrics_include_model_build_file_parallel_and_repair_time() -> None:
+    repository = SQLiteRepository(":memory:")
+    repository.create_run("run-performance-metrics", "software-development", {}, "RUNNING", "2026-09-14T00:00:00+00:00")
+    repository.append_event("run-performance-metrics", "step.model_request_completed", "2026-09-14T00:00:01+00:00", {
+        "stepId": "frontend", "phase": "artifact_file", "fileName": "src/App.vue", "durationMs": 900,
+        "status": "completed", "inputTokens": 200, "outputTokens": 500,
+    })
+    repository.append_event("run-performance-metrics", "step.artifact_file_completed", "2026-09-14T00:00:02+00:00", {
+        "stepId": "frontend", "fileName": "src/App.vue", "status": "completed", "durationMs": 1200,
+        "modelWaitMs": 900, "repairMs": 0, "modelRequestCount": 1, "parallel": True,
+    })
+    repository.append_event("run-performance-metrics", "step.artifact_parallel_batch_completed", "2026-09-14T00:00:03+00:00", {
+        "stepId": "frontend", "fileCount": 2, "completedCount": 2, "maxParallelFiles": 2, "durationMs": 1300,
+    })
+    repository.append_event("run-performance-metrics", "step.validation_check", "2026-09-14T00:00:04+00:00", {
+        "stepId": "tester", "check": {"id": "frontend-build", "status": "passed", "durationMs": 700},
+    })
+    repository.append_event("run-performance-metrics", "repair.round_started", "2026-09-14T00:00:05+00:00", {
+        "stepId": "tester", "repairAttempt": 1,
+    })
+    repository.append_event("run-performance-metrics", "repair.completed", "2026-09-14T00:00:08+00:00", {
+        "stepId": "tester", "attempts": 1, "passed": True,
+    })
+
+    metrics = repository.get_run("run-performance-metrics")["performance_metrics"]
+
+    assert metrics["model_wait_ms"] == 900
+    assert metrics["build_ms"] == 700
+    assert metrics["repair_ms"] == 3000
+    assert metrics["artifact_file_generation_ms"] == 1200
+    assert metrics["artifact_files"] == [{
+        "step_id": "frontend", "file_name": "src/App.vue", "status": "completed", "duration_ms": 1200,
+        "model_wait_ms": 900, "repair_ms": 0, "model_request_count": 1, "parallel": True,
+    }]
+    assert metrics["parallel_file_batches"][0]["max_parallel_files"] == 2
+    assert metrics["build_checks"][0]["check_id"] == "frontend-build"
+
+
 def test_architecture_backedge_contributes_to_repair_metrics() -> None:
     repository = SQLiteRepository(":memory:")
     repository.create_run("architecture-metrics", "software-development", {"requirement": "build"},

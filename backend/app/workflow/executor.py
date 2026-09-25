@@ -7,6 +7,7 @@ import posixpath
 import re
 import time
 import uuid
+from functools import partial
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from .adaptive import (
 from .artifact_generation import ARTIFACT_FILE_MIN_TOKENS, ArtifactGenerationResult, generate_artifacts
 from .artifact_validator import ArtifactValidationResult, ArtifactValidator
 from .artifact_delivery import ArtifactDeliveryService
+from .delivery_evidence import record_delivery_gate_evidence
 from .architecture_contract import ArchitectureContractService
 from .architecture_validator import ArchitectureValidator
 from .architecture_repair import ArchitectureContractError, ArchitectureRepairCoordinator, architecture_patch_issue
@@ -51,6 +53,7 @@ from .capability_router import CapabilityRouter
 from .langgraph_runtime import LangGraphState, LangGraphWorkflow
 from .models import RunStatus, StepDefinition, StepStatus, StepType, WorkflowDefinition, utc_now
 from .model_invocation import ModelInvocationService
+from .model_timing import generate_with_timing
 from .failure_recording import FailureFactRecorder
 from .output_inspector import inspect_response
 from .requirements import RequirementSpec
@@ -59,8 +62,6 @@ from .collaboration import CollaborationCoordinator
 from .platform_contracts import (
     ClarificationRequest,
     build_project_blueprint,
-    evidence_from_check,
-    failure_fact_from_check,
 )
 from .integration_gate import IntegrationGate
 from .platform_runtime import PlatformRuntime
@@ -1061,7 +1062,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                 state.context.set("delivery_gate", gate)
             if not gate["deliverable"]:
                 gate = await self._attempt_delivery_gate_repair(state, gate, str(final_report or ""))
-            await self._record_delivery_gate_evidence(state, gate)
+            await record_delivery_gate_evidence(state, gate, self.repository, self.event_bus)
             await self.event_bus.emit("workflow.delivery_checked", state.run_id, gate)
             if not gate["deliverable"]:
                 await self._finish(state, RunStatus.FAILED, "交付门禁未通过：" + "；".join(gate["missing"]))
@@ -1216,65 +1217,6 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
             previous_missing = repaired_missing
         return gate
 
-    async def _record_delivery_gate_evidence(
-        self,
-        state: RunState,
-        gate: dict[str, Any],
-    ) -> None:
-        delivery_checks = gate.get("checks") if isinstance(gate, dict) else []
-        if not isinstance(delivery_checks, list):
-            return
-        delivery_evidence = [
-            evidence_from_check(item, gate="delivery", index=index)
-            for index, item in enumerate(delivery_checks)
-            if isinstance(item, dict)
-        ]
-        delivery_failures = [
-            failure_fact_from_check(
-                item,
-                gate="delivery",
-                owner="platform" if str(item.get("id") or "") == "delivery-archive" else "integration_gate",
-                index=index,
-            )
-            for index, item in enumerate(delivery_checks)
-            if isinstance(item, dict) and str(item.get("status")) != "passed"
-        ]
-        snapshot = state.context.snapshot()
-        current_evidence = snapshot.get("evidence")
-        non_delivery_evidence = [
-            item
-            for item in (current_evidence if isinstance(current_evidence, list) else [])
-            if not isinstance(item, dict) or str(item.get("gate") or "") != "delivery"
-        ]
-        all_evidence = [*non_delivery_evidence, *delivery_evidence]
-        state.context.set("delivery_evidence", delivery_evidence)
-        state.context.set("evidence", all_evidence)
-
-        current_failures = snapshot.get("failure_facts")
-        historical_failures = [
-            item for item in (current_failures if isinstance(current_failures, list) else [])
-            if isinstance(item, dict)
-        ]
-        current_failure_ids = {str(item.get("failure_id") or "") for item in delivery_failures}
-        retained_failures: list[dict[str, Any]] = []
-        for item in historical_failures:
-            if str(item.get("gate") or "") != "delivery":
-                retained_failures.append(item)
-            elif str(item.get("failure_id") or "") not in current_failure_ids:
-                retained_failures.append({**item, "resolved": True})
-        all_failures = [*retained_failures, *delivery_failures]
-        state.context.set("failure_facts", all_failures)
-        self.repository.update_run(
-            state.run_id,
-            evidence_json=json.dumps(all_evidence, ensure_ascii=False),
-            failure_facts_json=json.dumps(all_failures, ensure_ascii=False),
-        )
-        await self.event_bus.emit(
-            "integration.evidence",
-            state.run_id,
-            {"evidence": delivery_evidence, "failureFacts": delivery_failures},
-        )
-
     @provider_run_scope
     async def _resume_graph(self, state: RunState, decision: Any) -> None:
         try:
@@ -1389,6 +1331,14 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
             last_provider_record = item.provider_record()
             provider_attempts.append(last_provider_record)
             self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
+
+        timed_model_generate = partial(
+            generate_with_timing,
+            self.model_invocation,
+            self.event_bus,
+            state.run_id,
+            step.id,
+        )
 
         try:
             if state.workflow.meta.get("delivery_contract") and step.id in {"database", "backend", "frontend", "tester", "reviewer"}:
@@ -1506,7 +1456,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
 
                     async def generate_consultation(owner: str, prompt: str) -> LLMResponse:
                         agent_definition = self.registry.get(owner_steps[owner].agent_id or "")
-                        return await self.model_invocation.generate(
+                        return await timed_model_generate(
                             agent_definition.system_prompt + "\n当前只进行跨 Agent 故障协商；不要生成代码或改变冻结合同。",
                             prompt,
                             {
@@ -2253,6 +2203,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                                 "effective_thinking": effective_thinking,
                                 "thinking_type": "disabled" if effective_thinking == "off" else "enabled",
                                 "reasoning_effort": effective_thinking,
+                                "model_timing_observed": True,
                                 "enforce_artifact_contract": step.enforce_artifact_contract,
                                 "delivery_contract": state.context.snapshot().get("delivery_contract"),
                                 "compiled_contract": state.context.snapshot().get("compiled_contract"),
@@ -2260,7 +2211,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                             request_timeout=bounded_request_timeout,
                             max_tokens=int(runtime["max_tokens"]),
                             provider_max_tokens=self.token_budget_manager.provider_max_tokens(capabilities),
-                            request=self.model_invocation.generate,
+                            request=timed_model_generate,
                             record_response=record_artifact_response,
                             emit=emit_artifact_event,
                             target_artifacts=artifact_target_paths,
@@ -2268,6 +2219,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                             resume_files=resume_files,
                             on_file=checkpoint_artifact_file,
                             total_timeout_seconds=remaining_stage_time,
+                            max_parallel_files=max(1, min(4, int(state.workflow.concurrency or 1))),
                         )
                         if step.enforce_artifact_contract and step.id in {"database", "backend", "frontend"}:
                             artifact_result.files, early_responses = await self._owner_preflight_repair(
@@ -2348,7 +2300,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
 
                     attempt_thinking = _thinking_for_attempt(effective_thinking, retry_count)
                     attempt_thinking, _ = provider.resolve_thinking(attempt_thinking)
-                    response = await self.model_invocation.generate(
+                    response = await timed_model_generate(
                         effective_system_prompt,
                         attempt_prompt,
                         {
@@ -2817,6 +2769,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
             return [], []
         repaired: list[str] = []
         responses: list[LLMResponse] = []
+
         failed_targets = self.repair_engine.targets(validation)
         for target in sorted(failed_targets):
             target_checks = self.repair_engine.checks_for_owner(validation, target)
@@ -3078,7 +3031,11 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                         + guidance[target][:600]
                     )
                 try:
-                    response = await self.model_invocation.generate(
+                    response = await generate_with_timing(
+                        self.model_invocation,
+                        self.event_bus,
+                        state.run_id,
+                        validation_step_id,
                         agent.system_prompt,
                         prompt,
                         {
@@ -3097,6 +3054,7 @@ class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSup
                             "pool_timeout": 10,
                         },
                         timeout_seconds,
+                        attempt=repair_attempt,
                     )
                 except Exception as exc:
                     await self.event_bus.emit(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, replace
 from math import ceil
 from pathlib import PurePath
@@ -134,6 +135,7 @@ async def generate_artifacts(
     resume_files: list[dict[str, Any]] | None = None,
     on_file: FileCheckpoint | None = None,
     total_timeout_seconds: float | None = None,
+    max_parallel_files: int = 3,
 ) -> ArtifactGenerationResult:
     """Plan and generate independent files without replaying a whole response.
 
@@ -146,6 +148,9 @@ async def generate_artifacts(
     raw_request = request
     stage_timeout = max(0.1, float(total_timeout_seconds or request_timeout))
     stage_deadline = asyncio.get_running_loop().time() + stage_timeout
+    model_wait_by_file: dict[str, int] = {}
+    artifact_repair_wait_by_file: dict[str, int] = {}
+    model_request_count_by_file: dict[str, int] = {}
 
     async def request_with_stage_deadline(
         system: str, user: str, config: dict[str, Any], timeout: float,
@@ -163,9 +168,28 @@ async def generate_artifacts(
         # files. The provider call has returned/raised before another starts;
         # the executor waits for cancellation cleanup on its timeout path.
         for attempt in range(2):
+            started = time.perf_counter()
+            file_name = str(config.get("artifact_name") or "")
+            phase = str(config.get("generation_phase") or "unknown")
             try:
-                return await request_with_stage_deadline(system, user, config, timeout)
+                response = await request_with_stage_deadline(system, user, config, timeout)
             except LLMError as exc:
+                duration_ms = max(0, int((time.perf_counter() - started) * 1000))
+                if file_name:
+                    key = file_name.casefold()
+                    model_wait_by_file[key] = model_wait_by_file.get(key, 0) + duration_ms
+                    model_request_count_by_file[key] = model_request_count_by_file.get(key, 0) + 1
+                    if "repair" in phase or phase == "artifact_continuation":
+                        artifact_repair_wait_by_file[key] = artifact_repair_wait_by_file.get(key, 0) + duration_ms
+                if not config.get("model_timing_observed"):
+                    await emit("step.model_request_completed", {
+                        "phase": phase,
+                        "fileName": file_name,
+                        "attempt": attempt + 1,
+                        "status": "failed",
+                        "durationMs": duration_ms,
+                        "errorType": type(exc).__name__,
+                    })
                 reason = str(exc).lower()
                 transport = any(marker in reason for marker in (
                     "timeout", "timed out", "network error", "connection", "rate limit", "429", "502", "503", "504",
@@ -179,6 +203,44 @@ async def generate_artifacts(
                     "reason": str(exc)[:300],
                 })
                 await asyncio.sleep(0.5)
+            except Exception as exc:
+                duration_ms = max(0, int((time.perf_counter() - started) * 1000))
+                if file_name:
+                    key = file_name.casefold()
+                    model_wait_by_file[key] = model_wait_by_file.get(key, 0) + duration_ms
+                    model_request_count_by_file[key] = model_request_count_by_file.get(key, 0) + 1
+                    if "repair" in phase or phase == "artifact_continuation":
+                        artifact_repair_wait_by_file[key] = artifact_repair_wait_by_file.get(key, 0) + duration_ms
+                if not config.get("model_timing_observed"):
+                    await emit("step.model_request_completed", {
+                        "phase": phase,
+                        "fileName": file_name,
+                        "attempt": attempt + 1,
+                        "status": "failed",
+                        "durationMs": duration_ms,
+                        "errorType": type(exc).__name__,
+                    })
+                raise
+            else:
+                duration_ms = max(0, int((time.perf_counter() - started) * 1000))
+                if file_name:
+                    key = file_name.casefold()
+                    model_wait_by_file[key] = model_wait_by_file.get(key, 0) + duration_ms
+                    model_request_count_by_file[key] = model_request_count_by_file.get(key, 0) + 1
+                    if "repair" in phase or phase == "artifact_continuation":
+                        artifact_repair_wait_by_file[key] = artifact_repair_wait_by_file.get(key, 0) + duration_ms
+                if not config.get("model_timing_observed"):
+                    await emit("step.model_request_completed", {
+                        "phase": phase,
+                        "fileName": file_name,
+                        "attempt": attempt + 1,
+                        "status": "completed",
+                        "durationMs": duration_ms,
+                        "inputTokens": max(0, int(response.input_tokens or 0)),
+                        "outputTokens": max(0, int(response.output_tokens or 0)),
+                        "finishReason": str(response.finish_reason or ""),
+                    })
+                return response
         raise AssertionError("unreachable transport retry state")
 
     request = request_with_transport_retry
@@ -384,13 +446,204 @@ async def generate_artifacts(
             + "\n".join(f"- {name}" for name in target_names)
             + "\n其他已生成文件仅供依赖参考，必须保持不变。"
         )
+    parallel_limit = max(1, min(4, int(max_parallel_files or 1)))
+    parallel_completed: set[str] = set()
+    prefetched: dict[str, dict[str, Any]] = {}
+    checkpoint_lock = asyncio.Lock()
+    parallel_candidates = [
+        (index, spec)
+        for index, spec in enumerate(plan, start=1)
+        if spec.name.casefold() not in resumed_names
+        and not spec.depends_on_files
+        and not spec.parts
+        and not _should_pre_split(spec, provider_max_tokens)
+        and (
+            _has_hidden_reasoning(all_responses)
+            or _file_budget(spec, safe_max_tokens, provider_max_tokens) >= provider_max_tokens
+        )
+        and render_managed_artifact(
+            spec.name,
+            (base_config.get("compiled_contract") or {}).get("dependency_manifest") or {},
+        ) is None
+    ]
+    if parallel_limit > 1 and len(parallel_candidates) > 1:
+        hidden_reasoning_observed = _has_hidden_reasoning(all_responses)
+        base_config["hidden_reasoning_observed"] = hidden_reasoning_observed
+        batch_started = time.perf_counter()
+        effective_parallelism = min(parallel_limit, len(parallel_candidates))
+        await emit("step.artifact_parallel_batch_started", {
+            "fileNames": [spec.name for _, spec in parallel_candidates],
+            "fileCount": len(parallel_candidates),
+            "maxParallelFiles": effective_parallelism,
+            "reason": "仅并行生成无文件依赖、无需预拆分的文件；有依赖或需分块的文件保留原顺序。",
+        })
+        semaphore = asyncio.Semaphore(effective_parallelism)
+
+        async def generate_independent_file(index: int, spec: ArtifactFileSpec) -> dict[str, Any]:
+            file_started = time.perf_counter()
+            key = spec.name.casefold()
+            allocation = provider_max_tokens if hidden_reasoning_observed else _file_budget(
+                spec, safe_max_tokens, provider_max_tokens,
+            )
+            await emit("step.artifact_file_started", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "parallel": True,
+            })
+            await emit("step.artifact_generating", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "maxTokens": allocation,
+                "agentMaxTokens": safe_max_tokens,
+                "budgetSource": "file_estimate",
+                "budgetRaised": allocation > safe_max_tokens,
+                "parallel": True,
+            })
+            prompt = generation_original_prompt + _frozen_file_constraints(
+                spec, base_config.get("compiled_contract"),
+            )
+            try:
+                async with semaphore:
+                    response = await request(
+                        system_prompt,
+                        _file_prompt(prompt, plan, spec),
+                        {
+                            **base_config,
+                            "generation_phase": "artifact_file",
+                            "artifact_name": spec.name,
+                            "artifact_index": index,
+                            "artifact_total": len(plan),
+                            "continuation": False,
+                            "max_tokens": allocation,
+                        },
+                        request_timeout,
+                    )
+            except Exception as exc:
+                return {
+                    "index": index,
+                    "spec": spec,
+                    "started": file_started,
+                    "error": exc,
+                }
+            record_response(response)
+            content, reason = _validated_file_content(response, spec)
+            item: dict[str, Any] = {
+                "index": index,
+                "spec": spec,
+                "started": file_started,
+                "response": response,
+                "content": content,
+                "reason": reason,
+            }
+            if reason:
+                return item
+            if spec.name == "pom.xml":
+                content, normalized = normalize_h2_flyway_dependency(content)
+                if normalized:
+                    await emit("step.artifact_dependency_normalized", {
+                        "fileName": spec.name,
+                        "reason": "已将错误的 flyway-database-h2 声明纠正为 flyway-core，保留其他依赖。",
+                    })
+            if PurePath(spec.name).suffix.lower() == ".java":
+                content = _complete_spring_web_annotation_imports(content)
+            file_record = _artifact_file_record(spec, content)
+            item["content"] = content
+            item["fileRecord"] = file_record
+            if on_file:
+                async with checkpoint_lock:
+                    await on_file(file_record)
+            await emit("step.artifact_validated", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "parallel": True,
+            })
+            await emit("step.artifact_file_completed", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "status": "completed",
+                "durationMs": max(0, int((time.perf_counter() - file_started) * 1000)),
+                "modelWaitMs": model_wait_by_file.get(key, 0),
+                "repairMs": artifact_repair_wait_by_file.get(key, 0),
+                "modelRequestCount": model_request_count_by_file.get(key, 0),
+                "parallel": True,
+            })
+            return item
+
+        async def guarded_independent_file(index: int, spec: ArtifactFileSpec) -> dict[str, Any]:
+            try:
+                return await generate_independent_file(index, spec)
+            except Exception as exc:
+                return {
+                    "index": index,
+                    "spec": spec,
+                    "started": time.perf_counter(),
+                    "error": exc,
+                }
+
+        parallel_results = await asyncio.gather(
+            *(guarded_independent_file(index, spec) for index, spec in parallel_candidates),
+        )
+        for item in sorted(parallel_results, key=lambda row: row["index"]):
+            spec = item["spec"]
+            key = spec.name.casefold()
+            response = item.get("response")
+            if isinstance(response, LLMResponse):
+                all_responses.append(response)
+            if item.get("error") is not None:
+                prefetched[key] = item
+                continue
+            if item.get("reason"):
+                prefetched[key] = item
+                continue
+            file_record = item["fileRecord"]
+            files[:] = [row for row in files if row["name"].casefold() != key]
+            files.append(file_record)
+            parallel_completed.add(key)
+        await emit("step.artifact_parallel_batch_completed", {
+            "fileNames": [spec.name for _, spec in parallel_candidates],
+            "fileCount": len(parallel_candidates),
+            "completedCount": len(parallel_completed.intersection(spec.name.casefold() for _, spec in parallel_candidates)),
+            "durationMs": max(0, int((time.perf_counter() - batch_started) * 1000)),
+            "maxParallelFiles": effective_parallelism,
+        })
     for index, spec in enumerate(plan, start=1):
-        if spec.name.casefold() in resumed_names:
+        file_key = spec.name.casefold()
+        if file_key in resumed_names:
             await emit("step.artifact_reused", {"fileName": spec.name, "fileIndex": index, "fileCount": len(plan)})
             continue
+        if file_key in parallel_completed:
+            continue
+        prefetched_file = prefetched.pop(file_key, None)
+        file_started = float(prefetched_file.get("started") or time.perf_counter()) if prefetched_file else time.perf_counter()
+        if not prefetched_file:
+            await emit("step.artifact_file_started", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "parallel": False,
+            })
         hidden_reasoning_observed = _has_hidden_reasoning(all_responses)
         base_config["hidden_reasoning_observed"] = hidden_reasoning_observed
         file_budget = provider_max_tokens if hidden_reasoning_observed else _file_budget(spec, safe_max_tokens, provider_max_tokens)
+        if prefetched_file and prefetched_file.get("error") is not None:
+            exc = prefetched_file["error"]
+            await emit("step.artifact_file_completed", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "status": "failed",
+                "durationMs": max(0, int((time.perf_counter() - file_started) * 1000)),
+                "modelWaitMs": model_wait_by_file.get(file_key, 0),
+                "repairMs": artifact_repair_wait_by_file.get(file_key, 0),
+                "modelRequestCount": model_request_count_by_file.get(file_key, 0),
+                "parallel": True,
+                "errorType": type(exc).__name__,
+            })
+            raise exc
         managed_content = render_managed_artifact(
             spec.name,
             (base_config.get("compiled_contract") or {}).get("dependency_manifest") or {},
@@ -406,6 +659,17 @@ async def generate_artifacts(
                 "fileIndex": index,
                 "fileCount": len(plan),
                 "source": "dependency_manifest_compiler",
+            })
+            await emit("step.artifact_file_completed", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "status": "completed",
+                "durationMs": max(0, int((time.perf_counter() - file_started) * 1000)),
+                "modelWaitMs": model_wait_by_file.get(file_key, 0),
+                "repairMs": artifact_repair_wait_by_file.get(file_key, 0),
+                "modelRequestCount": model_request_count_by_file.get(file_key, 0),
+                "parallel": False,
             })
             continue
         completed_source = _relevant_completed_source(
@@ -473,37 +737,42 @@ async def generate_artifacts(
             content, reason = part_result.content, part_result.reason
             response_for_error = part_result.responses[-1] if part_result.responses else plan_response
         else:
-            allocation = file_budget
-            await emit(
-                "step.artifact_generating",
-                {
-                    "fileName": spec.name,
-                    "fileIndex": index,
-                    "fileCount": len(plan),
-                    "maxTokens": allocation,
-                    "agentMaxTokens": safe_max_tokens,
-                    "budgetSource": "file_estimate",
-                    "budgetRaised": allocation > safe_max_tokens,
-                },
-            )
-            response = await request(
-                system_prompt,
-                _file_prompt(original_prompt, plan, spec),
-                {
-                    **base_config,
-                    "generation_phase": "artifact_file",
-                    "artifact_name": spec.name,
-                    "artifact_index": index,
-                    "artifact_total": len(plan),
-                    "continuation": False,
-                    "max_tokens": allocation,
-                },
-                request_timeout,
-            )
-            record_response(response)
-            all_responses.append(response)
-            base_config["hidden_reasoning_observed"] = _has_hidden_reasoning(all_responses)
-            content, reason = _validated_file_content(response, spec)
+            if prefetched_file:
+                response = prefetched_file["response"]
+                content = str(prefetched_file.get("content") or "")
+                reason = prefetched_file.get("reason")
+            else:
+                allocation = file_budget
+                await emit(
+                    "step.artifact_generating",
+                    {
+                        "fileName": spec.name,
+                        "fileIndex": index,
+                        "fileCount": len(plan),
+                        "maxTokens": allocation,
+                        "agentMaxTokens": safe_max_tokens,
+                        "budgetSource": "file_estimate",
+                        "budgetRaised": allocation > safe_max_tokens,
+                    },
+                )
+                response = await request(
+                    system_prompt,
+                    _file_prompt(original_prompt, plan, spec),
+                    {
+                        **base_config,
+                        "generation_phase": "artifact_file",
+                        "artifact_name": spec.name,
+                        "artifact_index": index,
+                        "artifact_total": len(plan),
+                        "continuation": False,
+                        "max_tokens": allocation,
+                    },
+                    request_timeout,
+                )
+                record_response(response)
+                all_responses.append(response)
+                base_config["hidden_reasoning_observed"] = _has_hidden_reasoning(all_responses)
+                content, reason = _validated_file_content(response, spec)
             response_for_error = response
 
         if reason and not split_attempted:
@@ -620,6 +889,17 @@ async def generate_artifacts(
             response_for_error = continuation_result.responses[-1] if continuation_result.responses else response_for_error
 
         if reason:
+            await emit("step.artifact_file_completed", {
+                "fileName": spec.name,
+                "fileIndex": index,
+                "fileCount": len(plan),
+                "status": "failed",
+                "durationMs": max(0, int((time.perf_counter() - file_started) * 1000)),
+                "modelWaitMs": model_wait_by_file.get(file_key, 0),
+                "repairMs": artifact_repair_wait_by_file.get(file_key, 0),
+                "modelRequestCount": model_request_count_by_file.get(file_key, 0),
+                "parallel": bool(prefetched_file),
+            })
             raise LLMError(
                 f"成果物 {spec.name} 定点修复和分块后仍不完整：{reason}",
                 retryable=False,
@@ -640,6 +920,17 @@ async def generate_artifacts(
         if on_file:
             await on_file(file_record)
         await emit("step.artifact_validated", {"fileName": spec.name, "fileIndex": index, "fileCount": len(plan)})
+        await emit("step.artifact_file_completed", {
+            "fileName": spec.name,
+            "fileIndex": index,
+            "fileCount": len(plan),
+            "status": "completed",
+            "durationMs": max(0, int((time.perf_counter() - file_started) * 1000)),
+            "modelWaitMs": model_wait_by_file.get(file_key, 0),
+            "repairMs": artifact_repair_wait_by_file.get(file_key, 0),
+            "modelRequestCount": model_request_count_by_file.get(file_key, 0),
+            "parallel": False,
+        })
 
     if "frontend" in str(base_config.get("agent_id") or "").lower():
         compiled = base_config.get("compiled_contract") or {}

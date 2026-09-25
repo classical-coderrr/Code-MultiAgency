@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -324,28 +325,78 @@ class ArtifactValidator:
             execution_started = time.perf_counter()
             if emit:
                 await emit("step.validation_stage_started", {"stage": "execution", "scope": profile.get("validation_scope", "full")})
+            validation_jobs: list[tuple[str, Callable[[Callable[[ValidationCheck], Awaitable[None]]], Awaitable[None]]]] = []
             if run_build and structural_ok.get("frontend"):
-                await self._validate_frontend_build(
-                    root,
-                    files,
-                    install_dependencies,
-                    command_timeout,
-                    run_startup,
-                    startup_timeout,
-                    record,
-                    contract=contract,
-                )
+                validation_jobs.append((
+                    "frontend",
+                    lambda target_record: self._validate_frontend_build(
+                        root,
+                        files,
+                        install_dependencies,
+                        command_timeout,
+                        run_startup,
+                        startup_timeout,
+                        target_record,
+                        contract=contract,
+                    ),
+                ))
             if run_build and structural_ok.get("backend"):
-                await self._validate_backend_build(
-                    root,
-                    files,
-                    command_timeout,
-                    run_startup,
-                    startup_timeout,
-                    record,
-                    contract=contract,
-                    database_probe_path=database_probe_path,
-                )
+                validation_jobs.append((
+                    "backend",
+                    lambda target_record: self._validate_backend_build(
+                        root,
+                        files,
+                        command_timeout,
+                        run_startup,
+                        startup_timeout,
+                        target_record,
+                        contract=contract,
+                        database_probe_path=database_probe_path,
+                    ),
+                ))
+
+            async def run_validation_job(
+                target: str,
+                validate_target: Callable[[Callable[[ValidationCheck], Awaitable[None]]], Awaitable[None]],
+            ) -> tuple[str, list[ValidationCheck]]:
+                target_started = time.perf_counter()
+                target_checks: list[ValidationCheck] = []
+
+                async def record_target(check: ValidationCheck) -> None:
+                    target_checks.append(check)
+
+                if emit:
+                    await emit("step.validation_target_started", {"target": target, "scope": profile.get("validation_scope", "full")})
+                try:
+                    await validate_target(record_target)
+                except Exception as exc:
+                    target_checks.append(ValidationCheck(
+                        f"{target}-validator",
+                        target,
+                        f"{target} 验证器执行",
+                        "blocked",
+                        f"验证器内部异常：{type(exc).__name__}: {str(exc)[:300]}",
+                    ))
+                if emit:
+                    await emit("step.validation_target_completed", {
+                        "target": target,
+                        "scope": profile.get("validation_scope", "full"),
+                        "durationMs": max(0, int((time.perf_counter() - target_started) * 1000)),
+                        "checkCount": len(target_checks),
+                        "failedCheckIds": [check.id for check in target_checks if check.status == "failed"],
+                        "blockedCheckIds": [check.id for check in target_checks if check.status == "blocked"],
+                    })
+                return target, target_checks
+
+            validation_results = await asyncio.gather(
+                *(run_validation_job(target, job) for target, job in validation_jobs),
+            )
+            for target, _ in validation_jobs:
+                for result_target, target_checks in validation_results:
+                    if result_target == target:
+                        for check in target_checks:
+                            await record(check)
+                        break
             if emit:
                 execution_failures = [check for check in checks if check.status == "failed" and validation_stage(check.id) != "preflight"]
                 await emit(
@@ -968,10 +1019,13 @@ class ArtifactValidator:
             if not executable:
                 await record(ValidationCheck("backend-toolchain", "backend", "Java 工具链", "blocked", "找不到 Maven，无法执行后端编译。"))
                 return
-            compile_args = ["-B", "-Dstyle.color=never", "test"]
+            # Maven's package phase includes compilation and the test phase.
+            # Starting the resulting Boot JAR below avoids invoking a second
+            # compile lifecycle through spring-boot:run.
+            compile_args = ["-B", "-Dstyle.color=never", "package"]
             command = self._display_command(executable, compile_args)
             outcome = await self._run_command(executable, compile_args, root, timeout)
-            await record(self._command_check("backend-test", "backend", "后端 Maven 测试", command, outcome))
+            await record(self._command_check("backend-test", "backend", "后端 Maven 测试与打包", command, outcome))
             if outcome.returncode != 0 or not run_startup:
                 return
             spring_arguments = ["--server.port={port}", *self._spring_h2_test_arguments(files)]
@@ -996,15 +1050,23 @@ class ArtifactValidator:
                         database_probe_path, str(api.get("entity_id") or ""),
                     ))
                 crud_spec = None
-            await self._validate_startup(
-                root,
-                executable,
-                [
+            boot_jar = self._spring_boot_executable_jar(root)
+            java_executable = self._java_executable() if boot_jar else None
+            if boot_jar and java_executable:
+                startup_executable = java_executable
+                startup_args = ["-jar", str(boot_jar.relative_to(root)), *spring_arguments]
+            else:
+                startup_executable = executable
+                startup_args = [
                     "-B",
                     "-Dstyle.color=never",
                     "spring-boot:run",
                     f"-Dspring-boot.run.arguments={' '.join(spring_arguments)}",
-                ],
+                ]
+            await self._validate_startup(
+                root,
+                startup_executable,
+                startup_args,
                 "backend",
                 "后端启动检查",
                 probe_paths,
@@ -1028,6 +1090,40 @@ class ArtifactValidator:
             await record(self._command_check("backend-build", "backend", "后端 Gradle 构建", self._display_command(executable, args), outcome))
             return
         await record(ValidationCheck("backend-build", "backend", "后端构建", "blocked", "当前后端技术栈暂无受控构建适配器。"))
+
+    @staticmethod
+    def _spring_boot_executable_jar(root: Path) -> Path | None:
+        target = root / "target"
+        if not target.is_dir():
+            return None
+        jars = sorted(
+            (path for path in target.glob("*.jar") if not path.name.lower().startswith("original-")),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for jar in jars:
+            try:
+                with zipfile.ZipFile(jar) as archive:
+                    names = archive.namelist()
+            except (OSError, zipfile.BadZipFile):
+                continue
+            has_application = any(name.startswith("BOOT-INF/classes/") for name in names)
+            has_boot_loader = any(name.startswith("org/springframework/boot/loader/") for name in names)
+            if has_application and has_boot_loader:
+                return jar
+        return None
+
+    @staticmethod
+    def _java_executable() -> str | None:
+        executable = ArtifactValidator._executable("java.exe", "java")
+        if executable:
+            return executable
+        java_home = os.environ.get("JAVA_HOME")
+        if java_home:
+            candidate = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
+            if candidate.is_file():
+                return str(candidate)
+        return None
 
     @staticmethod
     def _spring_h2_test_arguments(files: dict[str, str]) -> list[str]:

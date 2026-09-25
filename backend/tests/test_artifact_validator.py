@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import zipfile
 from unittest.mock import AsyncMock
 
 import httpx
@@ -14,6 +15,85 @@ from app.workflow.dag import build_dag
 from app.workflow.events import WorkflowEventBus
 from app.workflow.executor import RunState, WorkflowExecutor
 from app.workflow.models import RunStatus, StepDefinition, StepStatus, WorkflowDefinition
+
+
+def test_frontend_and_backend_validation_jobs_run_concurrently(monkeypatch):
+    validator = ArtifactValidator()
+    active_jobs = 0
+    maximum_active_jobs = 0
+
+    async def run_job(target, record):
+        nonlocal active_jobs, maximum_active_jobs
+        active_jobs += 1
+        maximum_active_jobs = max(maximum_active_jobs, active_jobs)
+        await asyncio.sleep(0.02)
+        await record(ValidationCheck(f"{target}-build", target, "build", "passed", "ok", duration_ms=20))
+        active_jobs -= 1
+
+    monkeypatch.setattr(validator, "_frontend_structure", lambda *_: [ValidationCheck("front-structure", "frontend", "front", "passed", "ok")])
+    monkeypatch.setattr(validator, "_backend_structure", lambda *_: [ValidationCheck("back-structure", "backend", "back", "passed", "ok")])
+    monkeypatch.setattr(validator, "_spring_template_contract", lambda *_: [])
+    monkeypatch.setattr(validator, "_integration_contract", lambda *_: [])
+    monkeypatch.setattr(validator, "_delivery_contract_structure", lambda *_: [])
+    monkeypatch.setattr(validator, "_validate_frontend_build", lambda *args, **kwargs: run_job("frontend", args[6]))
+    monkeypatch.setattr(validator, "_validate_backend_build", lambda *args, **kwargs: run_job("backend", args[5]))
+
+    files = [
+        {"name": "package.json", "content": json.dumps({"scripts": {"build": "vite build"}})},
+        {"name": "index.html", "content": "<!doctype html><html><body>ok</body></html>"},
+        {"name": "src/main.js", "content": "console.log('ready')"},
+        {"name": "pom.xml", "content": "<project/>"},
+        {"name": "src/main/java/app/App.java", "content": "package app; class App {}"},
+    ]
+    result = asyncio.run(validator.validate({"__artifact_files__": files}, {"startup": False, "install_dependencies": False}))
+
+    assert result.status == "passed", [(check.id, check.status, check.message) for check in result.checks]
+    assert maximum_active_jobs == 2
+    assert {check.id for check in result.checks} >= {"frontend-build", "backend-build"}
+
+
+def test_maven_package_result_is_started_as_jar_without_second_maven_lifecycle(tmp_path, monkeypatch):
+    validator = ArtifactValidator()
+    commands: list[list[str]] = []
+    startups: list[tuple[str, list[str]]] = []
+    root = tmp_path
+
+    async def fake_command(executable, args, cwd, timeout, **kwargs):
+        commands.append(list(args))
+        target = root / "target"
+        target.mkdir(exist_ok=True)
+        with zipfile.ZipFile(target / "student.jar", "w") as archive:
+            archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+            archive.writestr("org/springframework/boot/loader/launch/JarLauncher.class", b"loader")
+        return _CommandOutcome(0, "ok", 20)
+
+    async def fake_startup(root_arg, executable, args, *positional, **kwargs):
+        startups.append((executable, list(args)))
+
+    monkeypatch.setattr(validator, "_executable", lambda *names: "mvn")
+    monkeypatch.setattr(validator, "_run_command", fake_command)
+    monkeypatch.setattr(validator, "_validate_startup", fake_startup)
+    monkeypatch.setattr(ArtifactValidator, "_java_executable", staticmethod(lambda: "java"))
+    checks: list[ValidationCheck] = []
+
+    async def record(check):
+        checks.append(check)
+
+    asyncio.run(validator._validate_backend_build(
+        root,
+        {"pom.xml": "<project/>", "src/main/java/app/App.java": "package app; class App {}"},
+        60,
+        True,
+        20,
+        record,
+    ))
+
+    assert commands == [["-B", "-Dstyle.color=never", "package"]]
+    assert startups and startups[0][0] == "java"
+    assert startups[0][1][0] == "-jar"
+    assert startups[0][1][1].replace("\\", "/") == "target/student.jar"
+    assert not any("spring-boot:run" in command for command in commands)
+    assert checks[0].id == "backend-test" and checks[0].status == "passed"
 
 
 def test_owner_preflight_does_not_require_other_parallel_branch():

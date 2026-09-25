@@ -50,7 +50,11 @@ type AgentTokenUsage = { stepId: string; agentId: string; status: string; inputT
 type RepairMetrics = { firstPass: boolean; repairRounds: number; successfulRepairs: number; automaticRepairRate: number; averageRepairRounds: number; circuitBreaks: number }
 type StageMetric = { stage: string; durationMs: number; inputTokens: number; outputTokens: number; totalTokens: number }
 type RepairTrace = { key: string; stepId: string; attempt: number; location: string; owners: string[]; status: string; result: string; files: string[] }
-type RunStats = { activeDurationMs: number; approvalDurationMs: number; inputTokens: number; outputTokens: number; totalTokens: number; byAgent: AgentTokenUsage[]; repair: RepairMetrics; stages: StageMetric[]; repairTrace: RepairTrace[] }
+type ArtifactFileMetric = { stepId: string; fileName: string; status: string; durationMs: number; modelWaitMs: number; repairMs: number; modelRequestCount: number; parallel: boolean }
+type BuildMetric = { stepId: string; checkId: string; status: string; durationMs: number }
+type ParallelBatchMetric = { stepId: string; fileCount: number; completedCount: number; maxParallelFiles: number; durationMs: number }
+type PerformanceMetrics = { modelWaitMs: number; buildMs: number; repairMs: number; artifactRepairModelWaitMs: number; artifactFileGenerationMs: number; artifactFiles: ArtifactFileMetric[]; buildChecks: BuildMetric[]; parallelFileBatches: ParallelBatchMetric[] }
+type RunStats = { activeDurationMs: number; approvalDurationMs: number; inputTokens: number; outputTokens: number; totalTokens: number; byAgent: AgentTokenUsage[]; repair: RepairMetrics; stages: StageMetric[]; repairTrace: RepairTrace[]; performance: PerformanceMetrics }
 type ErrorSummary = { title: string; reason: string; suggestion: string }
 type RunHistoryItem = { id: string; workflow_id: string; status: string; execution_status?: string; delivery_status?: string; requirement?: string; started_at?: string; finished_at?: string; duration_ms?: number; recovery_count?: number; error_message?: string }
 
@@ -162,6 +166,13 @@ translations.en.repairRounds = 'Repair rounds'
 translations.en.averageRepairRounds = 'Average rounds'
 translations.en.stageMetrics = 'Stage cost'
 translations.en.repairTrace = 'Failure and repair trace'
+translations.en.performanceMetrics = 'Performance breakdown'
+translations.en.modelWait = 'Model wait'
+translations.en.buildTime = 'Build time'
+translations.en.repairTime = 'Repair time'
+translations.en.artifactFiles = 'Artifact file timing'
+translations.en.parallelFiles = 'Parallel file batches'
+translations.en.buildChecks = 'Build checks'
 translations.zh.runStats = '运行统计'
 translations.zh.activeDuration = '有效运行耗时'
 translations.zh.approvalWait = '已排除架构确认时间'
@@ -178,6 +189,13 @@ translations.zh.repairRounds = '修复轮次'
 translations.zh.averageRepairRounds = '平均修复轮数'
 translations.zh.stageMetrics = '阶段耗时与 Token'
 translations.zh.repairTrace = '失败与修复链路'
+translations.zh.performanceMetrics = '耗时分布'
+translations.zh.modelWait = '模型等待'
+translations.zh.buildTime = '构建耗时'
+translations.zh.repairTime = '修复耗时'
+translations.zh.artifactFiles = '成果物文件耗时'
+translations.zh.parallelFiles = '并行文件批次'
+translations.zh.buildChecks = '构建检查'
 translations.en.mainError = 'Main error'
 translations.en.errorReason = 'Reason'
 translations.en.errorSuggestion = 'Suggested action'
@@ -413,6 +431,7 @@ const runStats = reactive<RunStats>({
   repair: { firstPass: false, repairRounds: 0, successfulRepairs: 0, automaticRepairRate: 0, averageRepairRounds: 0, circuitBreaks: 0 },
   stages: [],
   repairTrace: [],
+  performance: { modelWaitMs: 0, buildMs: 0, repairMs: 0, artifactRepairModelWaitMs: 0, artifactFileGenerationMs: 0, artifactFiles: [], buildChecks: [], parallelFileBatches: [] },
 })
 let durationTimer: number | null = null
 const activeRunStorageKey = 'orbit.activeRun'
@@ -540,6 +559,7 @@ function resetRunStats() {
   runStats.repair = { firstPass: false, repairRounds: 0, successfulRepairs: 0, automaticRepairRate: 0, averageRepairRounds: 0, circuitBreaks: 0 }
   runStats.stages = []
   runStats.repairTrace = []
+  runStats.performance = { modelWaitMs: 0, buildMs: 0, repairMs: 0, artifactRepairModelWaitMs: 0, artifactFileGenerationMs: 0, artifactFiles: [], buildChecks: [], parallelFileBatches: [] }
   showRunStats.value = false
 }
 
@@ -620,6 +640,40 @@ function applyRunStats(data: Record<string, any>) {
     outputTokens: numericValue(item.outputTokens ?? item.output_tokens),
     totalTokens: numericValue(item.totalTokens ?? item.total_tokens),
   })).filter((item: StageMetric) => item.stage)
+  const performance = (data.performanceMetrics ?? data.performance_metrics ?? {}) as Record<string, any>
+  const fileRows = Array.isArray(performance.artifactFiles) ? performance.artifactFiles : Array.isArray(performance.artifact_files) ? performance.artifact_files : []
+  const buildRows = Array.isArray(performance.buildChecks) ? performance.buildChecks : Array.isArray(performance.build_checks) ? performance.build_checks : []
+  const batchRows = Array.isArray(performance.parallelFileBatches) ? performance.parallelFileBatches : Array.isArray(performance.parallel_file_batches) ? performance.parallel_file_batches : []
+  runStats.performance = {
+    modelWaitMs: numericValue(performance.modelWaitMs ?? performance.model_wait_ms),
+    buildMs: numericValue(performance.buildMs ?? performance.build_ms),
+    repairMs: numericValue(performance.repairMs ?? performance.repair_ms),
+    artifactRepairModelWaitMs: numericValue(performance.artifactRepairModelWaitMs ?? performance.artifact_repair_model_wait_ms),
+    artifactFileGenerationMs: numericValue(performance.artifactFileGenerationMs ?? performance.artifact_file_generation_ms),
+    artifactFiles: fileRows.map((item: Record<string, any>) => ({
+      stepId: String(item.stepId ?? item.step_id ?? ''),
+      fileName: String(item.fileName ?? item.file_name ?? ''),
+      status: String(item.status ?? ''),
+      durationMs: numericValue(item.durationMs ?? item.duration_ms),
+      modelWaitMs: numericValue(item.modelWaitMs ?? item.model_wait_ms),
+      repairMs: numericValue(item.repairMs ?? item.repair_ms),
+      modelRequestCount: numericValue(item.modelRequestCount ?? item.model_request_count),
+      parallel: Boolean(item.parallel),
+    })).filter((item: ArtifactFileMetric) => item.fileName),
+    buildChecks: buildRows.map((item: Record<string, any>) => ({
+      stepId: String(item.stepId ?? item.step_id ?? ''),
+      checkId: String(item.checkId ?? item.check_id ?? ''),
+      status: String(item.status ?? ''),
+      durationMs: numericValue(item.durationMs ?? item.duration_ms),
+    })).filter((item: BuildMetric) => item.checkId),
+    parallelFileBatches: batchRows.map((item: Record<string, any>) => ({
+      stepId: String(item.stepId ?? item.step_id ?? ''),
+      fileCount: numericValue(item.fileCount ?? item.file_count),
+      completedCount: numericValue(item.completedCount ?? item.completed_count),
+      maxParallelFiles: numericValue(item.maxParallelFiles ?? item.max_parallel_files),
+      durationMs: numericValue(item.durationMs ?? item.duration_ms),
+    })),
+  }
   const traceRows = Array.isArray(data.repairTrace) ? data.repairTrace : Array.isArray(data.repair_trace) ? data.repair_trace : []
   runStats.repairTrace = traceRows.map((item: Record<string, any>) => ({
     key: String(item.key ?? ''),
@@ -1115,6 +1169,47 @@ function handleEvent(event: Record<string, any>) {
   const type = event.type as string
   const payload = event.payload ?? {}
   const stepId = payload.stepId as string | undefined
+  if (type === 'step.model_request_completed') {
+    const durationMs = numericValue(payload.durationMs ?? payload.duration_ms)
+    runStats.performance.modelWaitMs += durationMs
+    if (String(payload.phase ?? '').includes('repair') || payload.phase === 'artifact_continuation') {
+      runStats.performance.artifactRepairModelWaitMs += durationMs
+    }
+  } else if (type === 'step.artifact_file_completed') {
+    const fileMetric: ArtifactFileMetric = {
+      stepId: String(stepId ?? ''),
+      fileName: String(payload.fileName ?? ''),
+      status: String(payload.status ?? ''),
+      durationMs: numericValue(payload.durationMs ?? payload.duration_ms),
+      modelWaitMs: numericValue(payload.modelWaitMs ?? payload.model_wait_ms),
+      repairMs: numericValue(payload.repairMs ?? payload.repair_ms),
+      modelRequestCount: numericValue(payload.modelRequestCount ?? payload.model_request_count),
+      parallel: Boolean(payload.parallel),
+    }
+    runStats.performance.artifactFiles.push(fileMetric)
+    runStats.performance.artifactFileGenerationMs += fileMetric.durationMs
+  } else if (type === 'step.artifact_parallel_batch_completed') {
+    runStats.performance.parallelFileBatches.push({
+      stepId: String(stepId ?? ''),
+      fileCount: numericValue(payload.fileCount ?? payload.file_count),
+      completedCount: numericValue(payload.completedCount ?? payload.completed_count),
+      maxParallelFiles: numericValue(payload.maxParallelFiles ?? payload.max_parallel_files),
+      durationMs: numericValue(payload.durationMs ?? payload.duration_ms),
+    })
+  } else if (type === 'step.validation_check') {
+    const check = payload.check ?? {}
+    const checkId = String(check.id ?? '')
+    if (['frontend-build', 'backend-test', 'backend-build', 'gradle-build'].includes(checkId)) {
+      const build: BuildMetric = {
+        stepId: String(stepId ?? ''),
+        checkId,
+        status: String(check.status ?? ''),
+        durationMs: numericValue(check.durationMs ?? check.duration_ms),
+      }
+      runStats.performance.buildChecks.push(build)
+      runStats.performance.buildMs += build.durationMs
+    }
+  }
   if (type.startsWith('coding_loop.')) {
     const toolLabels: Record<string, string> = {
       'repo.tree': '查看目录', 'repo.search': '搜索代码', 'repo.read': '读取文件',
@@ -1551,7 +1646,7 @@ async function connectToRun(id: string) {
     }
   }
   source.onmessage = parseEventMessage
-  const eventTypes = ['workflow.started', 'workflow.queued', 'workflow.recovered', 'workflow.recovery_exhausted', 'workflow.requirement_routed', 'workflow.budget_planned', 'workflow.policy_decided', 'step.started', 'step.completed', 'step.failed', 'step.retrying', 'step.continuing', 'step.repairing', 'step.repaired', 'step.coding_loop_completed', 'coding_loop.iteration_started', 'coding_loop.iteration_completed', 'coding_loop.tool_result', 'step.artifact_plan_recovering', 'step.artifact_plan_fallback', 'step.artifact_planned', 'step.artifact_split_planned', 'step.artifact_generating', 'step.artifact_repairing', 'step.artifact_continuing', 'step.artifact_validated', 'step.artifact_dependency_normalized', 'step.validation_started', 'step.validation_check', 'step.validation_repairing', 'step.validation_repair_dispatched', 'step.validation_repaired', 'step.validation_owner_reexecuting', 'step.validation_candidate_rejected', 'step.validation_no_progress', 'step.validation_repair_failed', 'step.validation_repair_skipped', 'step.validation_succeeded', 'step.validation_failed', 'step.budget_planned', 'step.context_packed', 'step.budget_adjusted', 'step.runtime_adjusted', 'step.skills_resolved', 'step.skipped', 'step.waiting_approval', 'step.waiting_clarification', 'workflow.waiting_approval', 'artifact.created', 'artifact.failed', 'workflow.completed', 'workflow.failed', 'workflow.cancelling', 'workflow.stopped']
+  const eventTypes = ['workflow.started', 'workflow.queued', 'workflow.recovered', 'workflow.recovery_exhausted', 'workflow.requirement_routed', 'workflow.budget_planned', 'workflow.policy_decided', 'step.started', 'step.completed', 'step.failed', 'step.retrying', 'step.continuing', 'step.repairing', 'step.repaired', 'step.coding_loop_completed', 'coding_loop.iteration_started', 'coding_loop.iteration_completed', 'coding_loop.tool_result', 'step.artifact_plan_recovering', 'step.artifact_plan_fallback', 'step.artifact_planned', 'step.artifact_split_planned', 'step.artifact_generating', 'step.artifact_repairing', 'step.artifact_continuing', 'step.artifact_validated', 'step.artifact_dependency_normalized', 'step.artifact_file_started', 'step.artifact_file_completed', 'step.artifact_parallel_batch_started', 'step.artifact_parallel_batch_completed', 'step.model_request_completed', 'step.validation_target_started', 'step.validation_target_completed', 'step.validation_started', 'step.validation_check', 'step.validation_repairing', 'step.validation_repair_dispatched', 'step.validation_repaired', 'step.validation_owner_reexecuting', 'step.validation_candidate_rejected', 'step.validation_no_progress', 'step.validation_repair_failed', 'step.validation_repair_skipped', 'step.validation_succeeded', 'step.validation_failed', 'step.budget_planned', 'step.context_packed', 'step.budget_adjusted', 'step.runtime_adjusted', 'step.skills_resolved', 'step.skipped', 'step.waiting_approval', 'step.waiting_clarification', 'workflow.waiting_approval', 'artifact.created', 'artifact.failed', 'workflow.completed', 'workflow.failed', 'workflow.cancelling', 'workflow.stopped']
   eventTypes.push('workflow.contract_validated', 'workflow.contract_frozen', 'workflow.contract_reopened', 'workflow.delivery_checked', 'workflow.clarification_required', 'workflow.clarification_answered', 'workflow.blueprint_created', 'workflow.blueprint_frozen', 'validation.evidence', 'integration.evidence')
   eventTypes.push('repair.routed', 'repair.round_started', 'repair.target_gate_completed', 'repair.full_regression_completed', 'repair.completed', 'repair.candidate_created', 'repair.candidate_promoted', 'repair.candidate_discarded', 'repair.circuit_open', 'repair.escalated', 'step.validation_stage_started', 'step.validation_stage_completed', 'step.validation_short_circuited', 'step.validation_missing_declaration')
   eventTypes.push('architecture.contract_failed', 'architecture.repair_started', 'architecture.repair_rejected', 'architecture.target_gate_completed', 'architecture.repair_circuit_open')
@@ -2330,6 +2425,38 @@ onBeforeUnmount(() => {
                   <div v-for="trace in runStats.repairTrace" :key="trace.key" class="stats-repair-row">
                     <div class="stats-repair-index">{{ trace.attempt || '·' }}</div>
                     <div><strong>{{ trace.location }} → {{ trace.owners.join('、') || '平台' }}</strong><span>{{ trace.status }}</span><small v-if="trace.result">{{ trace.result }}</small></div>
+                  </div>
+                </template>
+                <div class="stats-section-title">{{ t('performanceMetrics') }}</div>
+                <div class="stats-quality-grid">
+                  <div><span>{{ t('modelWait') }}</span><strong>{{ formatDuration(runStats.performance.modelWaitMs) }}</strong></div>
+                  <div><span>{{ t('buildTime') }}</span><strong>{{ formatDuration(runStats.performance.buildMs) }}</strong></div>
+                  <div><span>{{ t('repairTime') }}</span><strong>{{ formatDuration(runStats.performance.repairMs) }}</strong></div>
+                  <div><span>修复模型等待</span><strong>{{ formatDuration(runStats.performance.artifactRepairModelWaitMs) }}</strong></div>
+                  <div><span>文件生成累计</span><strong>{{ formatDuration(runStats.performance.artifactFileGenerationMs) }}</strong></div>
+                </div>
+                <template v-if="runStats.performance.artifactFiles.length">
+                  <div class="stats-section-title">{{ t('artifactFiles') }}</div>
+                  <div v-for="(fileMetric, index) in runStats.performance.artifactFiles.slice(-12)" :key="`${fileMetric.stepId}:${fileMetric.fileName}:${index}`" class="stats-stage-row">
+                    <strong>{{ fileMetric.fileName }}</strong>
+                    <span>{{ formatDuration(fileMetric.durationMs) }}</span>
+                    <small>模型 {{ formatDuration(fileMetric.modelWaitMs) }} · 修复 {{ formatDuration(fileMetric.repairMs) }} · {{ fileMetric.parallel ? '并行' : '串行' }} · {{ fileMetric.status === 'completed' ? '完成' : '失败' }}</small>
+                  </div>
+                </template>
+                <template v-if="runStats.performance.parallelFileBatches.length">
+                  <div class="stats-section-title">{{ t('parallelFiles') }}</div>
+                  <div v-for="(batch, index) in runStats.performance.parallelFileBatches" :key="`${batch.stepId}:${index}`" class="stats-stage-row">
+                    <strong>{{ localizedNodeLabel(batch.stepId, batch.stepId) }} · {{ batch.completedCount }}/{{ batch.fileCount }} 个文件</strong>
+                    <span>{{ formatDuration(batch.durationMs) }}</span>
+                    <small>最多并行 {{ batch.maxParallelFiles }} 个文件</small>
+                  </div>
+                </template>
+                <template v-if="runStats.performance.buildChecks.length">
+                  <div class="stats-section-title">{{ t('buildChecks') }}</div>
+                  <div v-for="(build, index) in runStats.performance.buildChecks" :key="`${build.stepId}:${build.checkId}:${index}`" class="stats-stage-row">
+                    <strong>{{ localizedNodeLabel(build.stepId, build.stepId) }} · {{ build.checkId }}</strong>
+                    <span>{{ formatDuration(build.durationMs) }}</span>
+                    <small>{{ build.status === 'passed' ? '通过' : build.status === 'blocked' ? '受阻' : '失败' }}</small>
                   </div>
                 </template>
                 <template v-if="runStats.stages.length">

@@ -903,6 +903,101 @@ def _run_metrics(
             previous_output + _non_negative_int(tokens.get("output")),
         )
 
+    performance = {
+        "model_wait_ms": 0,
+        "build_ms": 0,
+        "repair_ms": 0,
+        "artifact_repair_model_wait_ms": 0,
+        "artifact_file_generation_ms": 0,
+        "parallel_file_batches": [],
+        "artifact_files": [],
+        "build_checks": [],
+    }
+    build_check_ids = {"frontend-build", "backend-test", "backend-build", "gradle-build"}
+    repair_starts: dict[tuple[str, str, int], datetime] = {}
+    repair_start_types = {
+        "repair.round_started": "repair",
+        "architecture.repair_started": "architecture",
+        "delivery.repair_started": "delivery",
+        "delivery.archive_rebuild_started": "archive",
+    }
+    repair_end_types = {
+        "repair.completed": {"repair"},
+        "architecture.target_gate_completed": {"architecture"},
+        "architecture.repair_circuit_open": {"architecture"},
+        "delivery.repair_completed": {"delivery"},
+        "delivery.archive_rebuild_completed": {"archive"},
+    }
+    for row in metric_events or []:
+        event_type = str(row["event_type"] or "")
+        payload = _decode_json(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "step.model_request_completed":
+            duration = _non_negative_int(payload.get("durationMs") or payload.get("duration_ms"))
+            performance["model_wait_ms"] += duration
+            if "repair" in str(payload.get("phase") or "") or payload.get("phase") == "artifact_continuation":
+                performance["artifact_repair_model_wait_ms"] += duration
+        elif event_type == "step.artifact_file_completed":
+            row_data = {
+                "step_id": str(payload.get("stepId") or ""),
+                "file_name": str(payload.get("fileName") or ""),
+                "status": str(payload.get("status") or ""),
+                "duration_ms": _non_negative_int(payload.get("durationMs") or payload.get("duration_ms")),
+                "model_wait_ms": _non_negative_int(payload.get("modelWaitMs") or payload.get("model_wait_ms")),
+                "repair_ms": _non_negative_int(payload.get("repairMs") or payload.get("repair_ms")),
+                "model_request_count": _non_negative_int(payload.get("modelRequestCount") or payload.get("model_request_count")),
+                "parallel": bool(payload.get("parallel")),
+            }
+            performance["artifact_files"].append(row_data)
+            performance["artifact_file_generation_ms"] += row_data["duration_ms"]
+        elif event_type == "step.artifact_parallel_batch_completed":
+            batch = {
+                "step_id": str(payload.get("stepId") or ""),
+                "file_count": _non_negative_int(payload.get("fileCount") or payload.get("file_count")),
+                "completed_count": _non_negative_int(payload.get("completedCount") or payload.get("completed_count")),
+                "max_parallel_files": _non_negative_int(payload.get("maxParallelFiles") or payload.get("max_parallel_files")),
+                "duration_ms": _non_negative_int(payload.get("durationMs") or payload.get("duration_ms")),
+            }
+            performance["parallel_file_batches"].append(batch)
+        elif event_type == "step.validation_check":
+            check = payload.get("check") if isinstance(payload.get("check"), dict) else {}
+            check_id = str(check.get("id") or "")
+            if check_id in build_check_ids:
+                build = {
+                    "step_id": str(payload.get("stepId") or ""),
+                    "check_id": check_id,
+                    "status": str(check.get("status") or ""),
+                    "duration_ms": _non_negative_int(check.get("durationMs") or check.get("duration_ms")),
+                }
+                performance["build_checks"].append(build)
+                performance["build_ms"] += build["duration_ms"]
+
+        category = repair_start_types.get(event_type)
+        if category:
+            timestamp = _parse_timestamp(row["timestamp"])
+            attempt = _non_negative_int(payload.get("repairAttempt") or payload.get("attempt") or payload.get("attempts"))
+            repair_starts.setdefault(
+                (category, str(payload.get("stepId") or category), attempt),
+                timestamp or now,
+            )
+        else:
+            for category in repair_end_types.get(event_type, set()):
+                timestamp = _parse_timestamp(row["timestamp"])
+                attempt = _non_negative_int(payload.get("repairAttempt") or payload.get("attempt") or payload.get("attempts"))
+                step_id = str(payload.get("stepId") or category)
+                key = (category, step_id, attempt)
+                started = repair_starts.pop(key, None)
+                if started is None:
+                    matching = sorted(
+                        (candidate for candidate in repair_starts if candidate[:2] == (category, step_id)),
+                        key=lambda candidate: candidate[2],
+                    )
+                    if matching:
+                        started = repair_starts.pop(matching[0])
+                if started and timestamp:
+                    performance["repair_ms"] += max(0, int((timestamp - started).total_seconds() * 1000))
+
     by_agent: list[dict[str, Any]] = []
     step_durations: dict[str, int] = {}
     total_input_tokens = 0
@@ -1062,5 +1157,6 @@ def _run_metrics(
             "circuit_breaks": sum(1 for event_type, _ in decoded_events if event_type in {"repair.circuit_open", "architecture.repair_circuit_open"}),
         },
         "stage_metrics": list(stages.values()),
+        "performance_metrics": performance,
         "repair_trace": list(repair_trace.values()),
     }

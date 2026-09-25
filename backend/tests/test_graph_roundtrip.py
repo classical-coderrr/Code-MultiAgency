@@ -5,17 +5,14 @@ from app.agents.registry import AgentRegistry
 def test_graph_to_workflow_preserves_layout_and_dependencies():
     service = WorkflowService("app/workflows")
     workflow = service.get_workflow("software-development")
+    original_dependencies = {step.id: list(step.depends_on) for step in workflow.steps}
     graph = service.graph_dto(workflow)
     requirement_node = next(node for node in graph["nodes"] if node["id"] == "requirement")
     requirement_node["position"] = {"x": 123, "y": 456}
     roundtrip = service.graph_to_workflow(workflow, graph)
     assert roundtrip.meta["layout"]["requirement"] == {"x": 123, "y": 456}
-    assert next(step for step in roundtrip.steps if step.id == "tester").depends_on == ["database", "backend", "frontend"]
+    assert {step.id: list(step.depends_on) for step in roundtrip.steps} == original_dependencies
     assert next(step for step in roundtrip.steps if step.id == "database").agent_id == "database_agent"
-    # Frozen contracts remove the need for implementation Agents to wait for
-    # Database prose/files; all three owners can work in parallel.
-    assert next(step for step in roundtrip.steps if step.id == "backend").depends_on == ["architecture_approval"]
-    assert next(step for step in roundtrip.steps if step.id == "frontend").depends_on == ["architecture_approval"]
     original_modes = {step.id: step.generation_mode for step in workflow.steps}
     assert {step.id: step.generation_mode for step in roundtrip.steps} == original_modes
     assert all(original_modes[step_id] == "artifacts" for step_id in ("database", "backend", "frontend"))
@@ -42,7 +39,7 @@ def test_software_workflow_preserves_original_scope_for_downstream_agents():
     assert steps["token_estimator"].thinking == "off"
     assert steps["requirement"].depends_on == []
     assert steps["token_estimator"].depends_on == ["requirement"]
-    assert steps["architecture"].depends_on == ["token_estimator"]
+    assert steps["architecture"].depends_on == ["requirement"]
     assert "{{requirement_doc}}" in steps["token_estimator"].task_template
     assert "{{requirement_spec}}" in steps["token_estimator"].task_template
     for step_id in ("architecture", "backend", "frontend"):

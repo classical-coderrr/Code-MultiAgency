@@ -61,6 +61,65 @@ def test_artifact_transport_retry_keeps_plan_and_retries_only_current_file():
     assert "step.artifact_request_retrying" in events
 
 
+def test_independent_files_generate_in_parallel_and_repair_cached_response_once():
+    events: list[tuple[str, dict]] = []
+    phases: list[tuple[str, str]] = []
+    active_requests = 0
+    maximum_active_requests = 0
+
+    async def request(system, user, config, timeout):
+        nonlocal active_requests, maximum_active_requests
+        phase = config["generation_phase"]
+        name = str(config.get("artifact_name") or "")
+        phases.append((phase, name))
+        if phase == "artifact_plan":
+            text = json.dumps({"files": [
+                {"name": "index.html", "language": "html", "estimated_tokens": 500},
+                {"name": "style.css", "language": "css", "estimated_tokens": 500},
+            ]})
+            return LLMResponse(text=text, finish_reason="stop", message_content=text)
+        if phase == "artifact_file":
+            active_requests += 1
+            maximum_active_requests = max(maximum_active_requests, active_requests)
+            await asyncio.sleep(0.02)
+            active_requests -= 1
+            text = "" if name == "style.css" else "<!doctype html><html><body>ok</body></html>"
+            return LLMResponse(text=text, finish_reason="stop", message_content=text)
+        if phase == "artifact_split_plan":
+            text = json.dumps({"parts": []})
+            return LLMResponse(text=text, finish_reason="stop", message_content=text)
+        if phase == "artifact_repair":
+            text = "body { color: teal; }"
+            return LLMResponse(text=text, finish_reason="stop", message_content=text)
+        raise AssertionError(f"unexpected generation phase: {phase}")
+
+    async def emit(name, payload):
+        events.append((name, dict(payload)))
+
+    result = asyncio.run(generate_artifacts(
+        system_prompt="test",
+        original_prompt="create page",
+        base_config={"agent_id": "frontend_agent"},
+        request_timeout=30,
+        max_tokens=1000,
+        provider_max_tokens=2000,
+        request=request,
+        record_response=lambda _: None,
+        emit=emit,
+        max_parallel_files=2,
+    ))
+
+    assert maximum_active_requests == 2
+    assert [item["name"] for item in result.files] == ["index.html", "style.css"]
+    assert phases.count(("artifact_file", "index.html")) == 1
+    assert phases.count(("artifact_file", "style.css")) == 1
+    assert phases.count(("artifact_repair", "style.css")) == 1
+    completed = [payload for name, payload in events if name == "step.artifact_file_completed"]
+    assert len(completed) == 2
+    assert all(item["durationMs"] >= item["modelWaitMs"] >= 0 for item in completed)
+    assert any(name == "step.artifact_parallel_batch_completed" for name, _ in events)
+
+
 def test_completed_file_checkpoint_is_reused_after_later_file_fails():
     saved: list[dict[str, str]] = []
     generated: list[str] = []
