@@ -33,6 +33,11 @@ class OpenAICompatibleProvider(LLMProvider):
         max_tokens = _positive_int(settings.get("max_tokens"), 6000)
         payload["max_tokens"] = max_tokens
         profile = resolve_model_profile(self.provider_name, self.base_url, self.model_name)
+        if isinstance(settings.get("response_schema"), dict) and profile.supports_json_mode:
+            # JSON mode is enabled only for model families with a verified
+            # compatible API contract. Unknown vendors keep the prompt-only
+            # fallback instead of receiving a potentially unsupported field.
+            payload["response_format"] = {"type": "json_object"}
         if profile.protocol == "deepseek":
             effective_thinking = str(settings.get("effective_thinking", "auto")).strip().lower()
             thinking_type = str(settings.get("thinking_type", "enabled")).strip().lower()
@@ -159,7 +164,7 @@ def _positive_float(value: Any, default: float) -> float:
 
 def _request_diagnostics(payload: dict[str, Any], provider_name: str) -> dict[str, Any]:
     """Return the exact non-secret controls sent to the cloud endpoint."""
-    safe_keys = ("model", "max_tokens", "enable_thinking", "reasoning_effort", "thinking")
+    safe_keys = ("model", "max_tokens", "enable_thinking", "reasoning_effort", "thinking", "response_format")
     result = {key: payload[key] for key in safe_keys if key in payload}
     result["provider"] = provider_name
     return result

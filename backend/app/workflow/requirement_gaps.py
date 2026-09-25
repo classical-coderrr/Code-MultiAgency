@@ -85,8 +85,11 @@ class RequirementGapAnalyzer:
             defaults.setdefault("validation_database", "h2")
 
         requested_stacks = self._stacks(lower)
+        explicit_fields = self._explicit_entity_fields(text, entities)
         if entities:
             defaults["entity_fields"] = {name: self._default_fields(name) for name in entities}
+            for name, fields in explicit_fields.items():
+                defaults["entity_fields"].setdefault(name, {}).update(fields)
             defaults["api_style"] = "rest_collection_and_detail"
         capability_profile = {
             "ui": bool("frontend" in inferred.get("required_capabilities", []) or not backend_required),
@@ -104,11 +107,93 @@ class RequirementGapAnalyzer:
             "gaps": [item.as_dict() for item in gaps],
             "safe_defaults": defaults,
             "primary_entities": entities,
+            "entity_evidence": self._entity_evidence(text, entities),
+            "explicit_entity_fields": explicit_fields,
+            "explicit_constraints": self._explicit_constraints(text),
+            "explicit_api_paths": self._explicit_api_paths(text),
             "requested_stacks": requested_stacks,
             "capability_profile": capability_profile,
             "impactful_gaps": [item.field for item in high],
             "support_status": support,
         }
+
+    def _entity_evidence(self, text: str, entities: list[str]) -> list[dict[str, str]]:
+        """Attach auditable raw-request evidence to each routed entity."""
+        evidence: list[dict[str, str]] = []
+        for entity in entities:
+            aliases = [alias for alias, canonical in self._entity_aliases.items() if canonical == entity]
+            aliases.append(entity)
+            matched: str | None = None
+            for alias in aliases:
+                if alias.isascii():
+                    match = re.search(rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?:s|es)?(?![A-Za-z0-9_])", text, re.IGNORECASE)
+                    if match:
+                        matched = match.group(0)
+                        break
+                else:
+                    offset = text.find(alias)
+                    if offset >= 0:
+                        matched = alias
+                        break
+            evidence.append({
+                "entity": entity,
+                "source": "raw_requirement",
+                "text": matched or entity,
+            })
+        return evidence
+
+    @staticmethod
+    def _explicit_entity_fields(text: str, entities: list[str]) -> dict[str, dict[str, str]]:
+        """Extract only field/type pairs explicitly declared beside an entity."""
+        type_map = {
+            "string": "string", "str": "string", "varchar": "string",
+            "long": "long", "bigint": "long", "int": "integer", "integer": "integer",
+            "bigdecimal": "decimal", "decimal": "decimal", "double": "number", "float": "number",
+            "boolean": "boolean", "bool": "boolean", "localdate": "date", "date": "date",
+            "localdatetime": "datetime", "datetime": "datetime", "timestamp": "datetime",
+            "uuid": "uuid",
+        }
+        result: dict[str, dict[str, str]] = {}
+        for entity in entities:
+            # Match either “Room 实体字段 id(Long), name(String)” or a
+            # compact declaration such as “Room(id: Long, name: String)”.
+            escaped = re.escape(entity)
+            patterns = (
+                rf"(?<![A-Za-z0-9_]){escaped}\s*(?:实体字段|fields?)\s*[:：]?\s*([^。；;\n]+)",
+                rf"(?<![A-Za-z0-9_]){escaped}\s*\(([^()]{{1,1200}})\)",
+            )
+            declaration = ""
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    declaration = match.group(1)
+                    break
+            fields: dict[str, str] = {}
+            for match in re.finditer(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*([A-Za-z][A-Za-z0-9_.]*)\s*\)|:\s*([A-Za-z][A-Za-z0-9_.]*))",
+                declaration,
+            ):
+                field_name = match.group(1)
+                raw_type = (match.group(2) or match.group(3) or "").rsplit(".", 1)[-1].lower()
+                field_type = type_map.get(raw_type)
+                if field_type:
+                    fields[field_name] = field_type
+            if fields:
+                result[entity] = fields
+        return result
+
+    @staticmethod
+    def _explicit_constraints(text: str) -> list[str]:
+        """Retain explicit must/only/forbidden clauses for downstream review."""
+        required = re.compile(
+            r"必须|不得|不允许|不能|只能|仅限|唯一|至少|最多|must(?: not)?|should(?: not)?|cannot|only|unique|at least|at most",
+            re.IGNORECASE,
+        )
+        fragments = re.split(r"(?<=[。！？!?；;])\s*|[\r\n]+", text)
+        return list(dict.fromkeys(
+            fragment.strip()[:1000] for fragment in fragments
+            if fragment.strip() and required.search(fragment)
+        ))[:32]
 
     @staticmethod
     def _default_fields(entity: str) -> dict[str, str]:
@@ -135,12 +220,37 @@ class RequirementGapAnalyzer:
         lower = text.lower()
         result: list[str] = []
         for alias, canonical in self._entity_aliases.items():
-            matched = (
-                re.search(rf"(?<![A-Za-z]){re.escape(alias)}(?:s|es)?(?![A-Za-z])", lower) is not None
-                if alias.isascii() else alias in text
-            )
+            if canonical == "User":
+                matched = self._user_entity_is_explicit(text, alias)
+            elif canonical == "Inventory":
+                matched = self._inventory_entity_is_explicit(text, alias)
+            else:
+                matched = (
+                    re.search(rf"(?<![A-Za-z]){re.escape(alias)}(?:s|es)?(?![A-Za-z])", lower) is not None
+                    if alias.isascii() else alias in text
+                )
             if matched and canonical not in result:
                 result.append(canonical)
+        # Explicit entity declarations are stronger evidence than the
+        # built-in domain aliases. They must survive unchanged so a second
+        # entity such as Booking is not discarded from the frozen contract.
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_]{1,63})\s*(?:实体(?:字段)?|[Ee]ntity\s+[Ff]ields?)",
+            text,
+        ):
+            entity = match.group(1)
+            if entity not in result:
+                result.append(entity)
+        for match in re.finditer(r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_]*)\s*\(([^()]{1,800})\)", text):
+            declarations = match.group(2)
+            if re.search(
+                r"\b[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*|=\s*|\(\s*)(?:String|Long|Integer|Int|BigDecimal|Decimal|Boolean|LocalDate|LocalDateTime|UUID)",
+                declarations,
+                re.IGNORECASE,
+            ):
+                entity = match.group(1)
+                if entity not in result:
+                    result.append(entity)
         # Generic Chinese management-domain extraction keeps the router
         # extensible without hard-coding every future business noun.
         for match in re.finditer(r"([\u4e00-\u9fff]{1,8})(?:信息)?管理(?:系统|平台|网站)?", text):
@@ -151,6 +261,40 @@ class RequirementGapAnalyzer:
                 if canonical and canonical not in result:
                     result.append(canonical)
         return result[:32]
+
+    @staticmethod
+    def _user_entity_is_explicit(text: str, alias: str) -> bool:
+        """Do not turn generic prose (e.g. a user entering an amount) into a DB entity."""
+        if alias.isascii():
+            return any(re.search(pattern, text, re.IGNORECASE) for pattern in (
+                r"\busers?\s+(?:management|profiles?|records?|entities|tables|accounts?|crud|lists?|data)\b",
+                r"\b(?:manage|create|update|delete|edit|query|list|crud)\s+(?:the\s+)?users?\b",
+                r"\bcrud\s+(?:for|of)\s+users?\b",
+            ))
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in (
+            r"用户(?:管理|信息|资料|数据|列表|表|实体|档案|账户|帐号|账号|CRUD|增删改查|注册)",
+            r"(?:管理|维护|新增|创建|编辑|修改|删除|查询|检索|增删改查|CRUD)(?:\s*的)?用户",
+            r"用户的(?:姓名|邮箱|账号|帐号|角色|权限|资料|档案)",
+        ))
+
+    @staticmethod
+    def _inventory_entity_is_explicit(text: str, alias: str) -> bool:
+        if alias.isascii():
+            return any(re.search(pattern, text, re.IGNORECASE) for pattern in (
+                r"\binventory\s+(?:management|records?|tables?|entities|crud|lists?|data)\b",
+                r"\b(?:manage|create|update|delete|edit|query|list|crud)\s+(?:the\s+)?inventory\b",
+                r"\bcrud\s+(?:for|of)\s+inventory\b",
+            ))
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in (
+            r"库存(?:管理|记录|列表|信息|数据|CRUD|增删改查|表|实体|模块)",
+            r"(?:管理|维护|增删改查|CRUD)(?:库存)",
+        ))
+
+    @staticmethod
+    def _explicit_api_paths(text: str) -> list[str]:
+        """Preserve exact API paths explicitly named by the user; never infer routes."""
+        paths = re.findall(r"(?<![\w.-])(/api/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_{}-]+)*)", text, re.IGNORECASE)
+        return list(dict.fromkeys(paths))[:32]
 
     @staticmethod
     def _stacks(lower: str) -> dict[str, str]:

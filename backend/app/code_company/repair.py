@@ -57,6 +57,12 @@ class RepairEngine:
             owners = list(classification.owners)
             item = check.as_dict()
             item["owner"] = owners[0] if owners else "platform"
+            evidence = check.evidence if isinstance(check.evidence, dict) else {}
+            related_files = evidence.get("relatedFiles") or evidence.get("files") or []
+            if isinstance(related_files, list):
+                item["relatedFiles"] = [str(path) for path in related_files if str(path).strip()]
+            item["expected"] = str(evidence.get("expected") or "")
+            item["actual"] = str(evidence.get("actual") or check.message or "")
             summary = str(check.message)[:240]
             if classification.category == "missing_declaration":
                 symbols = re.findall(
@@ -122,6 +128,13 @@ class RepairEngine:
 
     def owners_for_check(self, check: ValidationCheck) -> list[str]:
         return self.classifier.owners_for_check(check)
+
+    def checks_for_owner(self, validation: ArtifactValidationResult, owner: str) -> list[ValidationCheck]:
+        """Give every routed owner the evidence that caused its assignment."""
+        return [
+            check for check in validation.checks
+            if check.status == "failed" and owner in self.classifier.classify_check(check).owners
+        ]
 
     @staticmethod
     def category_for_check(check: ValidationCheck) -> str:
@@ -224,10 +237,30 @@ class RepairEngine:
     @classmethod
     def made_progress(cls, before: ArtifactValidationResult, after: ArtifactValidationResult) -> bool:
         previous = {check.id: check.status for check in before.checks}
+        current = {check.id: check.status for check in after.checks}
         if any(
             previous.get(check.id) == "passed" and check.status == "failed"
             for check in after.checks
         ):
+            return False
+        # A fail-fast run can expose a different owner's earlier build Gate
+        # only after the original UI/contract failure is fixed.  This is real
+        # progress if the old failed Gate explicitly passed on the candidate;
+        # absence/skipping is not proof, and passed Gates remain protected.
+        if any(
+            previous.get(check.id) == "failed" and check.status == "passed"
+            for check in after.checks
+        ):
+            return True
+        unresolved_old = [
+            check for check in before.checks
+            if check.status == "failed" and check.id not in current
+        ]
+        new_failed_targets = {check.target for check in after.checks if check.status == "failed"}
+        if (not after.passed and unresolved_old
+                and new_failed_targets.isdisjoint({check.target for check in unresolved_old})):
+            # A changed failure owner with no explicit old-Gate result may be
+            # a partial/targeted run, not proof that the old defect was fixed.
             return False
         old_compiler = cls.compiler_failure_keys(before)
         new_compiler = cls.compiler_failure_keys(after)

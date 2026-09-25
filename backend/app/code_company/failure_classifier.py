@@ -184,12 +184,21 @@ class FailureClassifier:
         related_values = evidence.get("relatedFiles") or evidence.get("files") or []
         related = " ".join(str(item) for item in related_values)
 
+        # The validator target is where a defect was observed. These contract
+        # checks have a single source owner even when another layer depends on
+        # their result. Avoid asking an unrelated Agent to rewrite its files.
+        if check_id in {"backend-table-contract", "backend-api-contract"}:
+            return ["backend"]
+        if check_id == "database-entity-contract":
+            return ["database"]
+        if check_id in {"frontend-api-contract", "frontend-proxy-contract", "frontend-field-contract"}:
+            return ["frontend"]
+
         # Cross-layer Gates are deliberately resolved before the legacy target
         # field.  The target says where the validator observed the symptom; it
         # does not always identify every source owner needed for a coherent fix.
         if check_id in {
             "frontend-backend-route-contract", "integration-api-contract",
-            "frontend-api-contract", "backend-api-contract",
         }:
             return ["backend", "frontend"]
         if (
@@ -204,10 +213,20 @@ class FailureClassifier:
         # missing REST endpoint. Keep Frontend involved for path/proxy checks,
         # but also route the failure to Backend instead of repeatedly rewriting
         # an otherwise working form.
-        if check.id in {"browser-render", "browser-crud"} and re.search(
-            r"/api/[a-z0-9_/{}/.-]+\s*=\s*http\s+(?:404|405|5\d\d)",
-            diagnostic,
-            re.IGNORECASE,
+        network_events = evidence.get("networkEvents")
+        network_failure = any(
+            isinstance(event, dict)
+            and str(event.get("resourceType") or "").lower() in {"fetch", "xhr"}
+            and "/api/" in str(event.get("url") or "").lower()
+            and str(event.get("status") or "") in {"404", "405", "500", "501", "502", "503", "504"}
+            for event in network_events if isinstance(event, dict)
+        ) if isinstance(network_events, list) else False
+        if check_id in {"browser-render", "browser-crud"} and (
+            network_failure or re.search(
+                r"/api/[a-z0-9_/{}/.-]+\s*=\s*http\s+(?:404|405|5\d\d)",
+                diagnostic,
+                re.IGNORECASE,
+            )
         ):
             return ["backend", "frontend"]
         if check_id in {"browser-render", "browser-crud", "browser-local-crud"}:

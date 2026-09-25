@@ -41,22 +41,30 @@ def _merge_dicts(left: dict[str, Any] | None, right: dict[str, Any] | None) -> d
 
 
 def _merge_artifact_files(left: Any, right: Any, revisions: dict[str, int] | None = None) -> list[dict[str, Any]]:
-    """Merge sibling files while letting a later repair replace its own path."""
+    """Merge same-owner revisions but preserve cross-owner conflicts for the Gate.
+
+    Raising inside a LangGraph reducer would bypass the repair coordinator.
+    Keeping conflicting rows lets the deterministic Artifact Gate report the
+    collision as structured evidence and route it to the platform/owner.
+    """
     result: list[dict[str, Any]] = []
     positions: dict[tuple[str, str], int] = {}
     for value in [*(left if isinstance(left, list) else []), *(right if isinstance(right, list) else [])]:
         if not isinstance(value, dict):
             continue
         item = dict(value)
-        identity = (
-            str(item.get("step_id") or item.get("owner_step") or ""),
-            str(item.get("name") or item.get("path") or ""),
-        )
-        if int(item.get("owner_revision", 0)) < (revisions or {}).get(identity[0], 0):
+        owner = str(item.get("step_id") or item.get("owner_step") or "").strip().casefold()
+        path = str(item.get("name") or item.get("path") or "").replace("\\", "/").strip("/")
+        if not path:
+            continue
+        identity = (path.casefold(), owner)
+        if int(item.get("owner_revision", 0)) < (revisions or {}).get(owner, 0):
             continue
         if identity in positions:
-            if int(item.get("owner_revision", 0)) >= int(result[positions[identity]].get("owner_revision", 0)):
-                result[positions[identity]] = item
+            position = positions[identity]
+            previous = result[position]
+            if int(item.get("owner_revision", 0)) >= int(previous.get("owner_revision", 0)):
+                result[position] = item
         else:
             positions[identity] = len(result)
             result.append(item)

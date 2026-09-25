@@ -16,6 +16,9 @@ def test_graph_to_workflow_preserves_layout_and_dependencies():
     # Database prose/files; all three owners can work in parallel.
     assert next(step for step in roundtrip.steps if step.id == "backend").depends_on == ["architecture_approval"]
     assert next(step for step in roundtrip.steps if step.id == "frontend").depends_on == ["architecture_approval"]
+    original_modes = {step.id: step.generation_mode for step in workflow.steps}
+    assert {step.id: step.generation_mode for step in roundtrip.steps} == original_modes
+    assert all(original_modes[step_id] == "artifacts" for step_id in ("database", "backend", "frontend"))
 
 
 def test_independent_workflow_yaml_files_are_discoverable():

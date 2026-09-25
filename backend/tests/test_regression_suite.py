@@ -204,6 +204,27 @@ def test_first_pass_rates_use_all_runs_and_do_not_trust_stale_flags():
     assert suite.aggregate([])["first_pass_rate"] == 0
 
 
+def test_markdown_report_preserves_fractional_rates_and_durations():
+    markdown = suite.render_markdown_report({
+        "mode": "live",
+        "workflow_sha256": "abc",
+        "summary": {
+            "runs": 2, "successes": 1, "deliverables": 1,
+            "deliverable_rate": 0.5, "first_passes": 1, "first_pass_rate": 0.5,
+            "duration_seconds": 12.345, "total_tokens": 900,
+        },
+        "results": [{
+            "case_id": "sample", "difficulty": "L1", "status": "SUCCESS",
+            "deliverable": True, "first_pass": True, "duration_seconds": 12.345,
+            "tokens": {"total_tokens": 900},
+        }],
+    })
+
+    assert "50.0%" in markdown
+    assert "12.3 秒" in markdown
+    assert "12.3s" in markdown
+
+
 def test_aggregate_sums_corrective_counts_for_failed_and_successful_runs():
     rows = [{"case_id": "html", "success": True, "deliverable": True, "attempt_metrics_available": True,
              "repair_count": 3, "generation_repair_count": 2, "validation_repair_count": 1,
@@ -354,7 +375,7 @@ async def test_auto_approval_is_explicit_and_retry_is_bounded():
 
 
 @pytest.mark.asyncio
-async def test_synthetic_case_clarification_uses_only_explicit_answers():
+async def test_synthetic_case_clarification_uses_explicit_answers_and_request_id():
     class ClarifyingExecutor(FakeExecutor):
         def __init__(self, repository):
             super().__init__(repository)
@@ -376,7 +397,7 @@ async def test_synthetic_case_clarification_uses_only_explicit_answers():
         executor, repository, "r", None, {}, timeout=1,
         clarification_answers={"primary_entity": "Task"}, poll=0.002,
     ) == "SUCCESS"
-    assert executor.answers == [{"primary_entity": "Task"}]
+    assert executor.answers == [{"primary_entity": "Task", "request_id": "request-1"}]
 
     repository = FakeRepository()
     executor = ClarifyingExecutor(repository)
@@ -429,6 +450,27 @@ def test_json_reports_redact_credentials_but_keep_token_metrics(monkeypatch, tmp
     assert "secret-example-value" not in content and "abc.def" not in content
     assert json.loads(content)["tokens"]["total_tokens"] == 123
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_json_snapshot_retries_transient_windows_reader_lock(monkeypatch, tmp_path):
+    path = tmp_path / "evidence.json"
+    path.write_text('{"old": true}', encoding="utf-8")
+    original_replace = Path.replace
+    attempts = []
+
+    def replace_with_reader_lock(source, target):
+        attempts.append(source)
+        if len(attempts) < 3:
+            error = PermissionError("transient sharing violation")
+            error.winerror = 5
+            raise error
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", replace_with_reader_lock)
+    suite.write_json(path, {"new": True})
+    assert len(attempts) == 3
+    assert json.loads(path.read_text(encoding="utf-8")) == {"new": True}
+    assert not list(tmp_path.glob("evidence.json.*.tmp"))
 
 
 def test_supervisor_hard_timeout_cleans_a_real_local_process(tmp_path):

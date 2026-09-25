@@ -98,6 +98,7 @@ def merge_scoped_architecture_patch(
     incoming = patch.get("delivery_contract") if isinstance(patch.get("delivery_contract"), dict) else patch
     updated = deepcopy(candidate)
     proposal = dict(updated.get("delivery_contract") or {})
+    error_folded = error.casefold()
     for section in scope:
         if section not in {"entities", "api_contract"} or not isinstance(incoming.get(section), list):
             continue
@@ -109,36 +110,43 @@ def merge_scoped_architecture_patch(
 
         def implicated(row: dict[str, Any]) -> bool:
             identifier = key(row)
-            mentioned = bool(identifier and identifier in error)
+            mentioned = bool(identifier and identifier.casefold() in error_folded)
             if section == "entities":
-                return mentioned or not isinstance(row.get("fields"), dict) or not row.get("fields")
+                return mentioned or ("fields" in error_folded or "字段" in error) and (
+                    not isinstance(row.get("fields"), dict) or not row.get("fields")
+                )
             named_paths = re.findall(r"/api/[A-Za-z][\w-]*", error)
             return (mentioned or (not named_paths and "entity_id" in error and not row.get("entity_id"))
                     or any(not isinstance(row.get(field), list) for field in ("methods", "fields", "query_parameters") if field in row))
 
-        fixed_keys = {key(row) for row in originals if not implicated(row)}
-        available = [row for row in suggested if key(row) not in fixed_keys]
+        fixed_keys = {key(row).casefold() for row in originals if not implicated(row)}
+        available = [row for row in suggested if key(row).casefold() not in fixed_keys]
         merged: list[dict[str, Any]] = []
         for index, row in enumerate(originals):
             if not implicated(row):
                 merged.append(row)
                 continue
-            replacement = next((item for item in available if key(item) == key(row)), None)
-            if replacement is None and index < len(suggested) and suggested[index] in available:
+            replacement = next((item for item in available if key(item).casefold() == key(row).casefold()), None)
+            if (replacement is None and section == "api_contract" and not row.get("entity_id")
+                    and index < len(suggested) and suggested[index] in available
+                    and suggested[index].get("entity_id")):
+                # The model supplied an explicit entity link and a replacement
+                # route for an unbound row. The complete contract gate still
+                # checks the proposed mapping against the original request.
                 replacement = suggested[index]
-            if replacement is None and available:
-                replacement = available[0]
             if replacement is not None:
                 available.remove(replacement)
             merged.append(replacement or row)
-        known = {key(row) for row in merged}
+        known = {key(row).casefold() for row in merged}
         for row in available:
             identifier = key(row)
-            if identifier and identifier not in known and (
-                identifier in error or (section == "api_contract" and str(row.get("entity_id") or "") in error)
+            if identifier and identifier.casefold() not in known and (
+                identifier.casefold() in error_folded
+                or (section == "api_contract" and bool(row.get("entity_id"))
+                    and str(row["entity_id"]).casefold() in error_folded)
             ):
                 merged.append(row)
-                known.add(identifier)
+                known.add(identifier.casefold())
         proposal[section] = merged
     contract_fields = {
         "backend_stack", "frontend_stack", "page_mode", "database_mode",
@@ -181,6 +189,30 @@ def architecture_patch_issue(candidate: dict[str, Any], patch: dict[str, Any], f
             return "修复结果缺少 page_mode，无法确定前端成果物目录。"
         if "entrypoints" in fact.get("repair_scope", []) and not isinstance(incoming.get("entrypoints"), list):
             return "修复结果缺少 entrypoints 数组，无法冻结页面入口。"
+        return None
+    if fact.get("code") == "ARCH_ENTITY_FIELDS_INVALID":
+        missing = re.search(r"实体合同缺少原始需求实体：(.+)", str(fact.get("message") or ""))
+        if missing:
+            required = {name.strip().casefold() for name in re.split(r"[、,，]", missing.group(1)) if name.strip()}
+            proposed = incoming.get("entities")
+            supplied = {
+                str(row.get("name") or row.get("id") or "").strip().casefold()
+                for row in proposed if isinstance(row, dict)
+            } if isinstance(proposed, list) else set()
+            if not required <= supplied:
+                return "修复结果仍缺少原始需求实体：" + "、".join(sorted(required - supplied))
+        return None
+    if fact.get("code") == "ARCH_API_CONTRACT_INVALID":
+        missing = re.search(r"缺少原始需求明确指定的路由：(.+)", str(fact.get("message") or ""))
+        if missing:
+            required = {path.strip().casefold() for path in re.split(r"[、,，]", missing.group(1)) if path.strip()}
+            proposed = incoming.get("api_contract")
+            supplied = {
+                str(row.get("collection_path") or row.get("path") or "").strip().casefold()
+                for row in proposed if isinstance(row, dict)
+            } if isinstance(proposed, list) else set()
+            if not required <= supplied:
+                return "修复结果仍缺少用户指定路由：" + "、".join(sorted(required - supplied))
         return None
     if fact.get("code") != "ARCH_API_ENTITY_ID_REQUIRED":
         return None

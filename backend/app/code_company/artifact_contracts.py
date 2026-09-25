@@ -71,6 +71,11 @@ def enforce_artifact_plan(
                 provides=provides,
                 requires=requires,
                 depends_on_files=dependencies,
+                estimated_tokens=(
+                    min(getattr(current, "estimated_tokens", 1024), 1000)
+                    if path == "src/App.vue" and any(dep.startswith("src/components/") for dep in dependencies)
+                    else getattr(current, "estimated_tokens", 1024)
+                ),
             )
             accepted[accepted.index(current)] = updated
             by_name[actual_path] = updated
@@ -94,7 +99,7 @@ def enforce_artifact_plan(
                 name=target_path,
                 language=_LANGUAGES.get(PurePath(target_path).suffix.lower(), "text"),
                 purpose=f"冻结文件计划要求的 {', '.join(row.get('provides') or [path])}",
-                estimated_tokens=1024,
+                estimated_tokens=2400 if target_path.endswith("Manager.vue") else 1024,
                 parts=(),
                 owner=owner,
                 provides=provides,

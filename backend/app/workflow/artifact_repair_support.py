@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import posixpath
 import re
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +15,179 @@ from ..code_company.artifact_contracts import path_allowed
 from ..code_company.repair import RepairEngine
 from ..llm.base import LLMResponse
 from .artifact_validator import ArtifactValidationResult
+from .context import WorkflowContext
 from .models import StepStatus
 from .run_state import RunState
 
 
+def has_missing_frozen_file_evidence(checks: list[Any]) -> bool:
+    marker = re.compile(r"(?:缺少冻结文件|missing frozen file)", re.IGNORECASE)
+    return any(
+        getattr(check, "status", "") == "failed"
+        and marker.search("\n".join((
+            str(getattr(check, "message", "") or ""),
+            str(getattr(check, "output", "") or ""),
+        )))
+        for check in checks
+    )
+
+
+def missing_frozen_file_candidates(
+    target: str,
+    checks: list[Any],
+    file_plan: list[Any],
+    ownership: dict[str, Any],
+    existing_names: set[str],
+) -> list[dict[str, Any]]:
+    """Create repair targets only for absent paths explicitly frozen to this owner."""
+    candidates: list[dict[str, Any]] = []
+    marker = re.compile(
+        r"(?:缺少冻结文件|missing frozen file)\s*[:：]?\s*([^\s，,；;]+)",
+        re.IGNORECASE,
+    )
+    for check in checks:
+        if getattr(check, "status", "") != "failed":
+            continue
+        evidence = "\n".join((
+            str(getattr(check, "message", "") or ""),
+            str(getattr(check, "output", "") or ""),
+        ))
+        for match in marker.finditer(evidence):
+            path = posixpath.normpath(match.group(1).replace("\\", "/"))
+            if not path or path in {".", ".."} or path.startswith("/") or ".." in path.split("/"):
+                continue
+            if path in existing_names:
+                continue
+            plan_row = next((
+                row for row in file_plan
+                if isinstance(row, dict)
+                and str(row.get("owner") or "").strip().lower() == target
+                and posixpath.normpath(str(row.get("path") or "").replace("\\", "/")) == path
+            ), None)
+            if plan_row is None or (ownership and not path_allowed(target, path, ownership)):
+                continue
+            if any(item["name"] == path for item in candidates):
+                continue
+            candidates.append({
+                "name": path,
+                "content": "",
+                "step_id": target,
+                "create": True,
+                "planned": True,
+                "purpose": str(plan_row.get("purpose") or ""),
+            })
+    return candidates
+
+
 class ArtifactRepairSupportMixin:
+    async def _owner_preflight_repair(
+        self,
+        state: RunState,
+        owner: str,
+        generated_files: list[dict[str, Any]],
+        *,
+        remaining_seconds: float,
+        provider_max_tokens: int,
+    ) -> tuple[list[dict[str, Any]], list[LLMResponse]]:
+        """Try one evidence-bound owner repair before the cross-agent Tester.
+
+        Candidate files remain isolated; only a passing owner preflight may
+        replace this branch's generated files. The final Gate is unchanged.
+        """
+        validation = self.artifact_validator.validate_owner_preflight(generated_files, owner)
+        await self.event_bus.emit("step.owner_preflight", state.run_id, {
+            "stepId": owner, "result": validation.as_dict(), "phase": "initial",
+        })
+        if validation.passed or owner not in self.repair_engine.targets(validation) or remaining_seconds < 15:
+            return generated_files, []
+        snapshot = state.context.snapshot()
+        existing = snapshot.get("__artifact_files__")
+        compiled = snapshot.get("compiled_contract")
+        file_plan = compiled.get("file_plan", []) if isinstance(compiled, dict) else []
+        candidate_files = self.workspace_artifacts.merge_owner_artifacts(
+            existing if isinstance(existing, list) else [],
+            [{"step_id": owner, **item} for item in generated_files],
+            owner, file_plan=file_plan if isinstance(file_plan, list) else [],
+        )
+        candidate_state = replace(state, context=WorkflowContext({**snapshot, "__artifact_files__": candidate_files}))
+        candidate = None
+        responses: list[LLMResponse] = []
+        try:
+            candidate = self.code_company_runtime.prepare_candidate(
+                state.workspace or {}, f"early-{owner}-{uuid.uuid4().hex[:10]}", [owner], candidate_files,
+            )
+            repaired, responses = await asyncio.wait_for(
+                self._repair_failed_artifacts(
+                    candidate_state, validation, 1, owner,
+                    min(90.0, remaining_seconds - 5), provider_max_tokens,
+                ),
+                timeout=min(95.0, remaining_seconds - 2),
+            )
+            if not repaired:
+                return generated_files, responses
+            current = candidate_state.context.snapshot().get("__artifact_files__")
+            owner_files = [
+                {key: value for key, value in item.items() if key != "step_id"}
+                for item in current if isinstance(item, dict) and str(item.get("step_id") or "") == owner
+            ] if isinstance(current, list) else []
+            followup = self.artifact_validator.validate_owner_preflight(owner_files, owner)
+            await self.event_bus.emit("step.owner_preflight", state.run_id, {
+                "stepId": owner, "result": followup.as_dict(), "phase": "after_repair",
+                "repairedFiles": repaired,
+            })
+            if followup.passed:
+                self.code_company_runtime.update_candidate(candidate, current)
+                return owner_files, responses
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.event_bus.emit("step.owner_preflight_repair_skipped", state.run_id, {
+                "stepId": owner, "reason": f"{type(exc).__name__}: {str(exc)[:300]}",
+            })
+        finally:
+            if candidate is not None:
+                self.code_company_runtime.discard_candidate(candidate)
+        return generated_files, responses
+
     """Narrow support layer used by the artifact repair coordinator path."""
+
+    @staticmethod
+    def _frozen_table_annotation_repair(
+        candidate: dict[str, Any],
+        checks: list[Any],
+        compiled: dict[str, Any],
+    ) -> str | None:
+        """Correct a reported @Table mismatch using the approved entity mapping."""
+        name = str(candidate.get("name") or "").replace("\\", "/")
+        source = str(candidate.get("content") or "")
+        if not name.endswith(".java") or not source:
+            return None
+        tables = (compiled.get("database_schema") or {}).get("tables") or {}
+        entity = Path(name).stem.removesuffix("Entity").casefold()
+        expected = next((
+            str(table) for table, definition in tables.items()
+            if isinstance(definition, dict)
+            and str(definition.get("entity_id") or "").casefold() == entity
+        ), None)
+        if not expected:
+            return None
+        annotation = re.search(r"@(?:[A-Za-z_]\w*\.)*Table\s*\(([^)]*)\)", source)
+        if not annotation:
+            return None
+        declared = re.search(r"\bname\s*=\s*(['\"])([^'\"]+)\1", annotation.group(1))
+        if not declared or declared.group(2).casefold() == expected.casefold():
+            return None
+        reported = any(
+            getattr(check, "id", "") == "backend-table-contract"
+            and name in str(getattr(check, "message", "")).replace("\\", "/")
+            and f"冻结表 {expected}" in str(getattr(check, "message", ""))
+            for check in checks
+        )
+        if not reported:
+            return None
+        start = annotation.start(1) + declared.start(2)
+        end = annotation.start(1) + declared.end(2)
+        return source[:start] + expected + source[end:]
     @staticmethod
     def _select_repair_context_files(
         files: list[dict[str, Any]],
@@ -109,11 +279,7 @@ class ArtifactRepairSupportMixin:
             bundle=True,
         )
         after = state.context.snapshot()
-        allowed_owners = {
-            str(check.target or "").lower()
-            for check in validation.checks
-            if check.status == "failed" and str(check.target or "").lower() in {"backend", "frontend", "database"}
-        }
+        allowed_owners = set(self.repair_engine.targets(validation))
         violations = self._owner_reexecution_violations(
             before,
             after,
@@ -388,6 +554,32 @@ class ArtifactRepairSupportMixin:
         )
         if evidence_candidates:
             return evidence_candidates
+        for check in checks or ():
+            if getattr(check, "id", "") not in {"browser-render", "browser-crud"}:
+                continue
+            evidence = getattr(check, "evidence", None)
+            phase = str(evidence.get("phase") or "") if isinstance(evidence, dict) else ""
+            match = re.match(r"^([A-Za-z][A-Za-z0-9_]*):(?:panel-visible|create-|update-|delete-)", phase)
+            if not match:
+                continue
+            manager_name = f"{match.group(1)}Manager.vue"
+            if phase.endswith(":panel-visible"):
+                app = [item for item in owned_files if str(item.get("name") or "") == "src/App.vue"]
+                if len(app) == 1 and manager_name.removesuffix(".vue") not in str(app[0].get("content") or ""):
+                    return app
+            manager = [
+                item for item in owned_files
+                if Path(str(item.get("name") or "")).name == manager_name
+            ]
+            if len(manager) == 1:
+                return manager
+        if checks and any(getattr(check, "id", "") == "database-entity-contract" for check in checks):
+            schemas = [
+                item for item in owned_files
+                if str(item.get("name") or "").replace("\\", "/") == "src/main/resources/schema.sql"
+            ]
+            if schemas:
+                return schemas
         # Maven output may mention dependency names while downloading them.
         # Explicit compiler locations are stronger evidence than those incidental
         # mentions and must be checked before dependency-based routing.
@@ -623,4 +815,3 @@ class ArtifactRepairSupportMixin:
         content = str(value or "").strip()
         match = re.fullmatch(r"```[^\r\n]*\r?\n(?P<body>.*?)\r?\n?```", content, flags=re.DOTALL)
         return match.group("body").strip() if match else content
-

@@ -23,7 +23,7 @@ from ..services.artifacts import ArtifactService
 from ..skills.registry import SkillRegistry
 from ..skills.resolver import SkillResolver
 from ..code_company.runtime import CodeCompanyRuntime
-from ..code_company.coding_loop import CodingAgentLoop, CodingLoopConfig
+from ..code_company.coding_loop import CodingAgentLoop, CodingLoopConfig, CodingLoopError, CodingLoopResult
 from ..code_company.verification import VerificationEngine
 from ..code_company.contract_compiler import ContractCompiler
 from ..code_company.artifact_contracts import path_allowed
@@ -66,16 +66,26 @@ from .integration_gate import IntegrationGate
 from .platform_runtime import PlatformRuntime
 from .run_state import RunState
 from .run_recovery import RunRecoveryMixin
-from .artifact_repair_support import ArtifactRepairSupportMixin
+from .artifact_repair_support import ArtifactRepairSupportMixin, has_missing_frozen_file_evidence, missing_frozen_file_candidates
 from .runtime_policy import RuntimePolicyResolver
 from .workspace_artifacts import WorkspaceArtifactCollector
+from .executor_support import (
+    ExecutorSupportMixin,
+    provider_run_scope,
+    _can_use_structured_fallback,
+    _continuation_prompt,
+    _merge_continuation,
+    _merge_usage,
+    _reasoning_budget_exhausted,
+    _thinking_for_attempt,
+)
 
 
 class WorkflowAlreadyRunningError(RuntimeError):
     pass
 
 
-class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
+class WorkflowExecutor(ExecutorSupportMixin, RunRecoveryMixin, ArtifactRepairSupportMixin):
     def __init__(
         self,
         registry: AgentRegistry,
@@ -137,10 +147,11 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         self._run_slots = asyncio.Semaphore(max(1, int(max_active_runs)))
         self._starting_workflows: set[str] = set()
 
-    def _platform_context(self, workflow: WorkflowDefinition) -> dict[str, Any]:
+    def _platform_context(self, workflow: WorkflowDefinition, run_id: str | None = None) -> dict[str, Any]:
         """Expose only non-secret runtime metadata to configurable planner Agents."""
+        provider = self.model_invocation.provider_for_run(run_id) if run_id else self.provider
         return {
-            "provider_capabilities": self.provider.capabilities(),
+            "provider_capabilities": provider.capabilities(),
             "workflow_steps": [
                 {
                     "id": step.id,
@@ -212,43 +223,6 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                 for step in workflow.steps
             ],
         }
-
-    @classmethod
-    def _safe_snapshot_value(cls, value: Any, key: str = "") -> Any:
-        """Keep recovery snapshots useful without persisting credential fields."""
-        sensitive = {"api_key", "apikey", "authorization", "cookie", "password", "secret", "token"}
-        if key.lower() in sensitive:
-            return "[REDACTED]"
-        if isinstance(value, dict):
-            return {str(item_key): cls._safe_snapshot_value(item_value, str(item_key)) for item_key, item_value in value.items()}
-        if isinstance(value, list):
-            return [cls._safe_snapshot_value(item) for item in value]
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-        return str(value)
-
-    def _persist_state(self, state: RunState) -> None:
-        snapshot = {
-            "version": 1,
-            "run_id": state.run_id,
-            "context": self._safe_snapshot_value(state.context.snapshot()),
-            "results": {key: value.value for key, value in state.results.items()},
-            "requirement_spec": state.requirement_spec.model_dump(mode="json") if state.requirement_spec else None,
-            "runtime": self._safe_snapshot_value(state.runtime),
-            "current_level": state.current_level,
-            "waiting_step_id": state.waiting_step_id,
-            "adaptive_policy": self._safe_snapshot_value(state.adaptive_policy),
-            "runtime_budget_plan": self._safe_snapshot_value(state.runtime_budget_plan),
-            "policy_skipped_steps": sorted(state.policy_skipped_steps),
-            "checkpoint_thread_id": state.checkpoint_thread_id or state.run_id,
-            "recovery_count": state.recovery_count,
-            "clarification_request": self._safe_snapshot_value(state.clarification_request),
-            "blueprint": self._safe_snapshot_value(state.blueprint),
-            "workspace": self._safe_snapshot_value(state.workspace),
-            "execution_status": state.execution_status,
-            "delivery_status": state.delivery_status,
-        }
-        self.repository.save_run_snapshot(state.run_id, snapshot, heartbeat_at=utc_now())
 
     def _state_from_run(
         self,
@@ -398,6 +372,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
             workspace=workspace,
             execution_status=str(snapshot.get("execution_status") or run.get("execution_status") or run.get("status") or RunStatus.PENDING.value),
             delivery_status=str(snapshot.get("delivery_status") or run.get("delivery_status") or "NOT_EVALUATED"),
+            snapshot_revision=max(0, int(snapshot.get("snapshot_revision") or 0)),
         )
         state.graph = self._build_graph(workflow)
         return state
@@ -518,6 +493,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
     async def start(self, run_id: str, workflow: WorkflowDefinition, inputs: dict[str, Any], runtime: dict[str, Any] | None = None) -> None:
         if run_id in self._active or run_id in self._queued_runs:
             raise WorkflowAlreadyRunningError(f"Run is already running: {run_id}")
+        self.model_invocation.capture_run(run_id)
         queued = self.is_active(workflow.id)
         self._queued_runs.add(run_id)
         self._queued_workflows[run_id] = workflow.id
@@ -529,9 +505,20 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                 self._queued_runs.discard(run_id)
                 self._queued_workflows.pop(run_id, None)
                 dag = build_dag(workflow)
-                initial_context = {**workflow.inputs, **inputs, **self._platform_context(workflow)}
+                initial_context = {**workflow.inputs, **inputs, **self._platform_context(workflow, run_id)}
                 workspace = self.code_company_runtime.prepare_run(run_id, runtime or {})
                 initial_context["workspace"] = workspace.as_dict()
+                if workspace.workspace_warning:
+                    await self.event_bus.emit(
+                        "workspace.snapshot_fallback",
+                        run_id,
+                        {
+                            "reason": workspace.workspace_warning,
+                            "sourcePath": workspace.source_path,
+                            "backendKind": workspace.backend_kind,
+                            "sourceBranchModified": False,
+                        },
+                    )
                 parallel_owners = [
                     step.id for step in workflow.steps
                     if step.id in {"database", "backend", "frontend"} and step.type == StepType.AGENT
@@ -573,73 +560,69 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         finally:
             self._queued_runs.discard(run_id)
             self._queued_workflows.pop(run_id, None)
+            self.model_invocation.release_run(run_id, keep=run_id in self._active)
 
     async def approve(self, run_id: str, decision: str) -> None:
         state = self._active.get(run_id)
-        if not state or not state.waiting_step_id:
-            raise ValueError("Run is not waiting for approval")
         if decision not in {"approve", "reject"}:
             raise ValueError("Approval decision must be approve or reject")
+        if not state:
+            raise ValueError("Run is not waiting for approval")
         if state.resume_task and not state.resume_task.done():
+            current_control_key = (
+                f"approval:{state.waiting_step_id}:{decision}"
+                if state.waiting_step_id else None
+            )
+            resolving_same_wait = state.resume_control_key == current_control_key and current_control_key is not None
+            resolving_after_wait_cleared = (
+                state.waiting_step_id is None
+                and state.resume_control_key
+                and state.resume_control_key.startswith("approval:")
+                and state.resume_control_key.rsplit(":", 1)[-1] == decision
+            )
+            if resolving_same_wait or resolving_after_wait_cleared:
+                return
             raise ValueError("Approval is already being resolved")
+        if not state.waiting_step_id:
+            raise ValueError("Run is not waiting for approval")
+        state.resume_control_key = f"approval:{state.waiting_step_id}:{decision}"
         state.resume_task = asyncio.create_task(self._resume_graph(state, decision))
 
     async def clarify(self, run_id: str, answers: dict[str, Any]) -> None:
         state = self._active.get(run_id)
-        if not state or state.waiting_step_id != "__clarification__":
+        if not state:
             raise ValueError("Run is not waiting for requirement clarification")
-        if state.resume_task and not state.resume_task.done():
-            raise ValueError("Clarification is already being resolved")
         if state.requirement_spec is None or not state.clarification_request:
             raise ValueError("需求确认状态不完整，请刷新运行状态后重试。")
+        answer_payload = dict(answers or {})
         submitted_request_id = str((answers or {}).get("request_id") or "").strip()
         current_request_id = str(state.clarification_request.get("request_id") or "").strip()
         if submitted_request_id and submitted_request_id != current_request_id:
             raise ValueError("需求确认请求已更新，请刷新后按当前问题重新提交。")
+        canonical_answers = json.dumps(answer_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        control_key = f"clarification:{current_request_id}:{uuid.uuid5(uuid.NAMESPACE_OID, canonical_answers).hex}"
+        if state.resume_task and not state.resume_task.done():
+            if state.resume_control_key == control_key:
+                return
+            raise ValueError("Clarification is already being resolved")
+        if state.waiting_step_id != "__clarification__":
+            raise ValueError("Run is not waiting for requirement clarification")
         # Reject an empty/invalid custom answer before scheduling graph resume.
         # Otherwise the HTTP endpoint reports success while the Run fails later.
         self.clarification_service.apply_answer(
             state.requirement_spec,
             ClarificationRequest.model_validate(state.clarification_request),
-            dict(answers or {}),
+            answer_payload,
         )
-        state.resume_task = asyncio.create_task(self._resume_graph(state, dict(answers or {})))
+        state.resume_control_key = control_key
+        state.resume_task = asyncio.create_task(self._resume_graph(state, answer_payload))
 
     async def wait_for_control_resolution(self, run_id: str) -> None:
         """Wait until an approval/clarification resume reaches its next stable state."""
         state = self._active.get(run_id)
         task = state.resume_task if state else None
         if task is not None:
-            await task
-
-    @staticmethod
-    def _begin_approval_wait(state: RunState) -> None:
-        if state.approval_started_perf is None:
-            state.approval_started_perf = time.perf_counter()
-
-    @staticmethod
-    def _end_approval_wait(state: RunState) -> None:
-        if state.approval_started_perf is None:
-            return
-        state.excluded_approval_ms += max(
-            0,
-            int((time.perf_counter() - state.approval_started_perf) * 1000),
-        )
-        state.approval_started_perf = None
-
-    @staticmethod
-    def _approval_duration_ms(state: RunState) -> int:
-        current_wait = (
-            int((time.perf_counter() - state.approval_started_perf) * 1000)
-            if state.approval_started_perf is not None
-            else 0
-        )
-        return max(0, state.excluded_approval_ms + current_wait)
-
-    @classmethod
-    def _active_duration_ms(cls, state: RunState) -> int:
-        wall_duration = int((time.perf_counter() - state.started_perf) * 1000)
-        return max(0, wall_duration - cls._approval_duration_ms(state))
+            await asyncio.shield(task)
 
     async def stop(self, run_id: str) -> None:
         state = self._active.get(run_id)
@@ -673,9 +656,8 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         """Detach local execution without changing the durable Run status.
 
         A fenced Redis lease may be lost while another Worker is taking over.
-        Marking the Run STOPPED here would overwrite the successor's recovery
-        state, so the old Worker only cancels its local tasks and persists the
-        last stable snapshot.
+        The stale Worker must not persist its in-memory snapshot over the
+        successor's newer checkpoint.
         """
         state = self._active.get(run_id)
         if state is None:
@@ -683,7 +665,6 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         for task in (state.task, state.resume_task):
             if task and not task.done() and task is not asyncio.current_task():
                 task.cancel()
-        self._persist_state(state)
         self._active.pop(run_id, None)
 
     async def resume_persisted(self, run_id: str, workflow: WorkflowDefinition) -> int:
@@ -1087,24 +1068,6 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                 return
         await self._finish(state, RunStatus.SUCCESS, final_report=final_report)
 
-    @staticmethod
-    def _delivery_proof(state: RunState) -> dict[str, Any]:
-        proof = dict(state.context.snapshot().get("artifact_validation") or {})
-        checks = [item for item in proof.get("checks", []) if isinstance(item, dict)]
-        approval_steps = [step for step in state.workflow.steps if step.type == StepType.APPROVAL]
-        if approval_steps and not any(item.get("id") == "capability-human_approval" for item in checks):
-            checks.append(
-                {
-                    "id": "capability-human_approval",
-                    "status": "passed"
-                    if all(state.results.get(step.id) == StepStatus.SUCCESS for step in approval_steps)
-                    else "blocked",
-                    "message": "人工审批结果",
-                }
-            )
-        proof["checks"] = checks
-        return proof
-
     async def _attempt_delivery_gate_repair(
         self,
         state: RunState,
@@ -1312,6 +1275,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
             {"evidence": delivery_evidence, "failureFacts": delivery_failures},
         )
 
+    @provider_run_scope
     async def _resume_graph(self, state: RunState, decision: Any) -> None:
         try:
             if not state.graph:
@@ -1341,6 +1305,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         except Exception as exc:
             await self._finish(state, RunStatus.FAILED, str(exc))
 
+    @provider_run_scope
     async def _run_state(self, state: RunState) -> None:
         if not state.graph:
             state.graph = self._build_graph(state.workflow)
@@ -1384,54 +1349,6 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         except Exception as exc:
             await self._finish(state, RunStatus.FAILED, str(exc))
 
-    def _runtime_for_step(self, state: RunState, step: StepDefinition) -> dict[str, Any]:
-        """Compatibility shim for extensions that called the former helper."""
-        return self.runtime_policy.resolve(state, step)
-
-    @staticmethod
-    def _runtime_plan_target_step_ids(state: RunState, planner_step_id: str) -> set[str]:
-        return RuntimePolicyResolver.runtime_plan_target_step_ids(state, planner_step_id)
-
-    @staticmethod
-    def _confirmed_requirement_for_budget(state: RunState) -> str:
-        return RuntimePolicyResolver.confirmed_requirement_for_budget(state)
-
-    @staticmethod
-    def _generation_mode(state: RunState, step: StepDefinition) -> str:
-        return RuntimePolicyResolver.generation_mode(state, step)
-
-    async def _skip_by_policy(self, state: RunState, step: StepDefinition) -> None:
-        skip_reason = str(
-            state.adaptive_policy.get("skip_reasons", {}).get(step.id)
-            or "Architecture 与需求能力路由确认该步骤不是必需能力。"
-        )
-        state.results[step.id] = StepStatus.SKIPPED
-        if step.output:
-            state.context.set(step.output, f"Not required: {skip_reason}")
-            state.context.set(f"{step.output}_files", "[]")
-        self.repository.upsert_step(
-            state.run_id,
-            step.id,
-            agent_id=step.agent_id,
-            status=StepStatus.SKIPPED.value,
-            finished_at=utc_now(),
-            error_message=f"Skipped by adaptive capability policy: {skip_reason}",
-        )
-        await self.event_bus.emit(
-            "step.skipped",
-            state.run_id,
-            {
-                "stepId": step.id,
-                "status": StepStatus.SKIPPED.value,
-                "reason": skip_reason,
-            },
-        )
-
-    @staticmethod
-    def _dependency_satisfied(state: RunState, dependency: str, steps: dict[str, StepDefinition]) -> bool:
-        status = state.results.get(dependency)
-        return status == StepStatus.SUCCESS or (status == StepStatus.SKIPPED and dependency in state.policy_skipped_steps) or (status == StepStatus.FAILED and steps[dependency].failure_policy == "continue")
-
     def _validate_architecture_candidate(self, candidate: dict[str, Any], requirement_spec: RequirementSpec) -> dict[str, Any]:
         """Backward-compatible entry point for architecture repair tests."""
         return self.architecture_contract.validate_candidate(candidate, requirement_spec)
@@ -1466,6 +1383,13 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         total_output_tokens = 0
         artifact_validation_result: ArtifactValidationResult | None = None
         validation_failure_summary: str | None = None
+
+        def record_artifact_response(item: LLMResponse) -> None:
+            nonlocal last_provider_record
+            last_provider_record = item.provider_record()
+            provider_attempts.append(last_provider_record)
+            self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
+
         try:
             if state.workflow.meta.get("delivery_contract") and step.id in {"database", "backend", "frontend", "tester", "reviewer"}:
                 frozen = state.context.snapshot().get("delivery_contract")
@@ -1511,10 +1435,11 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                         "source": budget_plan.get("source"),
                     },
                 )
-            effective_thinking, thinking_warning = self.provider.resolve_thinking(runtime["thinking"])
+            provider = self.model_invocation.current_provider()
+            effective_thinking, thinking_warning = provider.resolve_thinking(runtime["thinking"])
             if thinking_warning:
                 await self.event_bus.emit("step.runtime_adjusted", state.run_id, {"stepId": step.id, "requestedThinking": runtime["thinking"], "effectiveThinking": effective_thinking, "warning": thinking_warning})
-            capabilities = self.provider.capabilities()
+            capabilities = provider.capabilities()
             validation_config = dict(step.validation) if isinstance(step.validation, dict) else {}
             validation_config["run_id"] = state.run_id
             if validation_config.get("enabled"):
@@ -1626,9 +1551,20 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
 
                 async def prepare_candidate(repair_plan: dict[str, Any], repair_attempt: int) -> None:
                     nonlocal candidate_workspace
+                    snapshot = candidate_state.context.snapshot()
+                    compiled = snapshot.get("compiled_contract")
+                    file_plan = compiled.get("file_plan", []) if isinstance(compiled, dict) else []
+                    if not isinstance(file_plan, list):
+                        file_plan = []
+                    files = snapshot.get("__artifact_files__", [])
+                    normalized_files = self._normalize_artifact_manifest(
+                        files if isinstance(files, list) else [],
+                        file_plan,
+                    )
+                    candidate_state.context.set("__artifact_files__", normalized_files)
                     candidate_snapshots[repair_attempt] = candidate_state.context.snapshot()
                     candidate_validation_snapshots[repair_attempt] = repair_coordinator_validation["value"]
-                    files = candidate_state.context.snapshot().get("__artifact_files__", [])
+                    files = normalized_files
                     if candidate_workspace is None:
                         candidate_workspace = self.code_company_runtime.prepare_candidate(
                             state.workspace or {},
@@ -1641,6 +1577,12 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                             "candidate": candidate_workspace.as_dict(),
                         })
                     else:
+                        owners = tuple(dict.fromkeys((
+                            *candidate_workspace.owners,
+                            *(str(owner) for owner in repair_plan.get("owners") or []),
+                        )))
+                        if owners != candidate_workspace.owners:
+                            candidate_workspace = replace(candidate_workspace, owners=owners)
                         self.code_company_runtime.update_candidate(
                             candidate_workspace,
                             files if isinstance(files, list) else [],
@@ -1691,13 +1633,181 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                         guidance if isinstance(guidance, dict) else {},
                     )
                     validation = repair_coordinator_validation["value"]
-                    if repair_mode == "grounded_multi_file_patch" and not owner_reexecution_used:
-                        repaired_files, repair_responses = await self._reexecute_validation_owners(
+                    repaired_files: list[str] = []
+                    repair_responses: list[LLMResponse] = []
+                    recorded_repair_response_ids: set[int] = set()
+                    snapshot = candidate_state.context.snapshot()
+                    compiled = snapshot.get("compiled_contract")
+                    file_plan = compiled.get("file_plan", []) if isinstance(compiled, dict) else []
+                    if not isinstance(file_plan, list):
+                        file_plan = []
+                    if candidate_workspace is not None:
+                        original_files = snapshot.get("__artifact_files__", [])
+                        if not isinstance(original_files, list):
+                            original_files = []
+                        ownership = (candidate_state.blueprint or {}).get("artifact_ownership") or {}
+                        step_by_id = {
+                            item.id: item for item in state.workflow.steps
+                            if item.type == StepType.AGENT and item.agent_id
+                        }
+                        for owner in repair_plan.get("owners") or []:
+                            owner = str(owner).strip().lower()
+                            owner_step = step_by_id.get(owner)
+                            patterns = ownership.get(owner) if isinstance(ownership, dict) else None
+                            if isinstance(patterns, str):
+                                patterns = [patterns]
+                            writable_patterns = tuple(str(item) for item in patterns or [] if str(item).strip())
+                            if owner_step is None or not owner_step.agent_id or not writable_patterns:
+                                continue
+                            owner_files_before = {
+                                str(item.get("name") or ""): str(item.get("content") or "")
+                                for item in original_files
+                                if isinstance(item, dict)
+                                and str(item.get("step_id") or "").lower() == owner
+                            }
+                            owner_checks = self.repair_engine.checks_for_owner(validation, owner)
+                            required_for_owner = tuple(
+                                str(row.get("path") or "").replace("\\", "/").strip("/")
+                                for row in file_plan
+                                if isinstance(row, dict)
+                                and str(row.get("owner") or "").strip().casefold() == owner.casefold()
+                                and str(row.get("path") or "").strip()
+                            )
+                            owner_existing = {
+                                str(item.get("name") or "").replace("\\", "/").casefold()
+                                for item in original_files
+                                if isinstance(item, dict)
+                            }
+                            missing_owned = [path for path in required_for_owner if path.casefold() not in owner_existing]
+                            diagnostics = "\n\n".join(
+                                f"[{check.id} · {check.label}] {check.message}\n{check.output}".strip()
+                                for check in owner_checks
+                            )
+                            diagnostics = CodingAgentLoop._safe_text(diagnostics)[:12000]
+                            role_contracts = compiled.get("role_contracts", {}) if isinstance(compiled, dict) else {}
+                            role_contract = role_contracts.get(owner, {}) if isinstance(role_contracts, dict) else {}
+                            allowed_files = sorted(owner_files_before)
+                            task_text = (
+                                "Repair only the concrete defects supported by the Tester evidence below.\n"
+                                f"Original requirement:\n{snapshot.get('requirement', '')}\n\n"
+                                f"Frozen role contract:\n{json.dumps(role_contract, ensure_ascii=False, default=str)}\n\n"
+                                f"Files currently owned by {owner}:\n{json.dumps(allowed_files, ensure_ascii=False)}\n\n"
+                                f"Missing frozen files for this owner (create each one if listed):\n{json.dumps(missing_owned, ensure_ascii=False)}\n\n"
+                                f"Failed checks and evidence:\n{diagnostics}\n\n"
+                                "Preserve the frozen API/schema and all previously passed checks. Inspect the candidate files first; "
+                                "make the smallest complete fix, including a missing owned file only when the evidence requires it. "
+                                "Do not remove tests or weaken validation. The platform will run the target Gate and full regression."
+                            )
+                            target_runtime = self.runtime_policy.resolve(state, owner_step)
+                            provider_limit = self.token_budget_manager.provider_max_tokens(capabilities)
+                            owner_tokens = self._coding_loop_budget(
+                                file_plan,
+                                owner,
+                                max(1, int(target_runtime.get("max_tokens") or 3000)),
+                                provider_limit,
+                                str(target_runtime.get("budget_mode") or "auto"),
+                            )
+                            configured_owner_actions = state.runtime.get("max_tool_steps")
+                            owner_actions = (
+                                max(16, len(required_for_owner) + 4)
+                                if configured_owner_actions is None
+                                else int(configured_owner_actions or 16)
+                            )
+                            owner_actions = max(1, min(31, owner_actions))
+                            thinking, _ = provider.resolve_thinking(str(target_runtime.get("thinking") or "auto"))
+                            loop_responses: list[LLMResponse] = []
+
+                            def record_loop_response(item: LLMResponse) -> None:
+                                loop_responses.append(item)
+                                recorded_repair_response_ids.add(id(item))
+                                record_artifact_response(item)
+
+                            async def emit_loop_event(event_type: str, payload: dict[str, Any], owner_id: str = owner) -> None:
+                                await self.event_bus.emit(
+                                    event_type,
+                                    state.run_id,
+                                    {
+                                        "stepId": owner_id,
+                                        "validationStepId": step.id,
+                                        "repairAttempt": repair_attempt,
+                                        **payload,
+                                    },
+                                )
+
+                            loop = CodingAgentLoop(
+                                provider,
+                                self.code_company_runtime.gateway_for_owner(
+                                    owner, candidate_state.blueprint, coding_loop=True,
+                                ),
+                                repository=self.repository,
+                            )
+                            try:
+                                await loop.run(
+                                    candidate_workspace.as_dict(),
+                                    task_text,
+                                    system_prompt=self.registry.get(owner_step.agent_id).system_prompt,
+                                    config=CodingLoopConfig(
+                                        max_iterations=owner_actions + 1,
+                                        timeout_seconds=max(30.0, float(owner_step.timeout_seconds)),
+                                        max_tokens=owner_tokens,
+                                        response_max_tokens=provider_limit,
+                                        thinking=thinking,
+                                        max_tool_actions=owner_actions,
+                                        required_artifacts=required_for_owner,
+                                    ),
+                                    emit=emit_loop_event,
+                                    run_id=state.run_id,
+                                    step_id=f"repair-{repair_attempt}-{candidate_workspace.candidate_id}-{owner}",
+                                    on_response=record_loop_response,
+                                )
+                            except CodingLoopError as exc:
+                                await emit_loop_event("coding_loop.repair_interrupted", {
+                                    "owner": owner,
+                                    "reason": str(exc)[:500],
+                                })
+                            except Exception as exc:
+                                await emit_loop_event("coding_loop.repair_interrupted", {
+                                    "owner": owner,
+                                    "reason": f"{type(exc).__name__}: {str(exc)[:400]}",
+                                })
+                            repair_responses.extend(loop_responses)
+                            collected = self.workspace_artifacts.collect_workspace(
+                                candidate_workspace.as_dict(), owner, ownership=ownership, file_plan=file_plan,
+                            )
+                            after_by_name = {
+                                str(item.get("name") or ""): str(item.get("content") or "")
+                                for item in collected
+                            }
+                            changed_names = sorted(
+                                name for name, content in after_by_name.items()
+                                if owner_files_before.get(name) != content
+                            )
+                            if changed_names:
+                                merged_files = self.workspace_artifacts.merge_owner_artifacts(
+                                    original_files,
+                                    collected,
+                                    owner,
+                                    file_plan=file_plan,
+                                )
+                                candidate_state.context.set("__artifact_files__", merged_files)
+                                original_files = merged_files
+                                owner_files_before = after_by_name
+                                self.code_company_runtime.update_candidate(candidate_workspace, merged_files)
+                                repaired_files.extend(changed_names)
+                                await emit_loop_event("coding_loop.repair_candidate", {
+                                    "owner": owner,
+                                    "files": changed_names,
+                                    "verification": "pending_target_gate",
+                                })
+
+                    if not repaired_files and repair_mode == "grounded_multi_file_patch" and not owner_reexecution_used:
+                        repaired_files, owner_responses = await self._reexecute_validation_owners(
                             candidate_state, validation, repair_attempt, step.id,
                         )
+                        repair_responses.extend(owner_responses)
                         owner_reexecution_used = True
-                    else:
-                        repaired_files, repair_responses = await self._repair_failed_artifacts(
+                    elif not repaired_files:
+                        generated_files, generated_responses = await self._repair_failed_artifacts(
                             candidate_state,
                             validation,
                             repair_attempt,
@@ -1705,17 +1815,22 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                             step.timeout_seconds,
                             self.token_budget_manager.provider_max_tokens(capabilities),
                         )
+                        repaired_files.extend(generated_files)
+                        repair_responses.extend(generated_responses)
                         if not repaired_files and not owner_reexecution_used:
-                            repaired_files, repair_responses = await self._reexecute_validation_owners(
+                            reexecuted_files, owner_responses = await self._reexecute_validation_owners(
                                 candidate_state, validation, repair_attempt, step.id,
                             )
+                            repaired_files.extend(reexecuted_files)
+                            repair_responses.extend(owner_responses)
                             owner_reexecution_used = True
                     repaired_by_attempt[repair_attempt] = list(repaired_files)
                     for repair_response in repair_responses:
                         total_input_tokens += repair_response.input_tokens
                         total_output_tokens += repair_response.output_tokens
                         last_provider_record = repair_response.provider_record()
-                        provider_attempts.append(last_provider_record)
+                        if id(repair_response) not in recorded_repair_response_ids:
+                            provider_attempts.append(last_provider_record)
                     if provider_attempts:
                         self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
                     if candidate_workspace is not None:
@@ -1899,13 +2014,16 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
             attempt_prompt = prompt
             generation_mode = self.runtime_policy.generation_mode(state, step)
             artifact_result: ArtifactGenerationResult | None = None
+            coding_loop_fallback_reason: str | None = None
+            artifact_target_paths: list[str] | None = None
+            artifact_seed_files: list[dict[str, Any]] = []
             automatic_structured_recovery_used = False
 
-            def record_artifact_response(item: LLMResponse) -> None:
-                nonlocal last_provider_record
-                last_provider_record = item.provider_record()
-                provider_attempts.append(last_provider_record)
-                self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
+            def record_coding_response(item: LLMResponse) -> None:
+                nonlocal total_input_tokens, total_output_tokens
+                record_artifact_response(item)
+                total_input_tokens += max(0, int(item.input_tokens or 0))
+                total_output_tokens += max(0, int(item.output_tokens or 0))
 
             async def emit_artifact_event(event_type: str, payload: dict[str, Any]) -> None:
                 await self.event_bus.emit(
@@ -1914,28 +2032,162 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                     {"stepId": step.id, "status": StepStatus.RUNNING.value, **payload},
                 )
 
+            agent_stage_timeout = max(0.1, float(step.timeout_seconds))
+            agent_stage_deadline: float | None = None
+            if step.enforce_artifact_contract and step.id in {"database", "backend", "frontend"}:
+                compiled_for_budget = state.context.snapshot().get("compiled_contract")
+                owner_file_plan = (
+                    compiled_for_budget.get("file_plan", [])
+                    if isinstance(compiled_for_budget, dict) else []
+                )
+                owner_plan_size = sum(
+                    1 for row in owner_file_plan
+                    if isinstance(row, dict)
+                    and str(row.get("owner") or "").strip().casefold() == step.id.casefold()
+                )
+                agent_stage_timeout = min(
+                    1800.0,
+                    agent_stage_timeout + max(0, owner_plan_size - 1) * 90.0,
+                )
+                agent_stage_deadline = asyncio.get_running_loop().time() + agent_stage_timeout
+                await emit_artifact_event("step.artifact_budget_started", {
+                    "agentId": agent.id,
+                    "plannedFileCount": owner_plan_size,
+                    "perRequestTimeoutSeconds": float(step.timeout_seconds),
+                    "stageTimeoutSeconds": agent_stage_timeout,
+                    "bounded": True,
+                })
+
             while True:
                 try:
                     if generation_mode == "coding_loop":
+                        compiled_contract = state.context.snapshot().get("compiled_contract")
+                        file_plan = compiled_contract.get("file_plan", []) if isinstance(compiled_contract, dict) else []
+                        if not isinstance(file_plan, list):
+                            file_plan = []
+                        required_artifacts = tuple(
+                            str(row.get("path") or "").replace("\\", "/").strip("/")
+                            for row in file_plan
+                            if isinstance(row, dict)
+                            and str(row.get("owner") or "").strip().casefold() == step.id.casefold()
+                            and str(row.get("path") or "").strip()
+                        )
                         loop = CodingAgentLoop(
-                            self.provider,
-                            self.code_company_runtime.gateway_for_owner(step.id, state.blueprint),
-                        )
-                        loop_result = await loop.run(
-                            self.workspace_artifacts.workspace_for_step(state, step.id),
-                            prompt,
-                            system_prompt=effective_system_prompt,
-                            config=CodingLoopConfig(
-                                max_iterations=max(1, min(32, int(state.runtime.get("max_tool_steps", 8) or 8))),
-                                timeout_seconds=step.timeout_seconds,
-                                max_tokens=int(runtime["max_tokens"]),
-                                thinking=effective_thinking,
+                            provider,
+                            self.code_company_runtime.gateway_for_owner(
+                                step.id, state.blueprint, coding_loop=True
                             ),
-                            emit=emit_artifact_event,
+                            repository=self.repository,
                         )
+                        configured_tool_steps = state.runtime.get("max_tool_steps")
+                        if configured_tool_steps is None:
+                            max_tool_steps = max(16, len(required_artifacts) + 4)
+                        else:
+                            max_tool_steps = int(configured_tool_steps or 16)
+                        max_tool_steps = max(1, min(31, max_tool_steps))
+                        coding_loop_budget = self._coding_loop_budget(
+                            file_plan,
+                            step.id,
+                            int(runtime["max_tokens"]),
+                            self.token_budget_manager.provider_max_tokens(capabilities),
+                            str(runtime.get("budget_mode") or "auto"),
+                        )
+                        loop_task = prompt
+                        if required_artifacts:
+                            checklist = "\n".join(f"- {path}" for path in required_artifacts)
+                            loop_task += (
+                                "\n\nFrozen deliverables owned by this Agent (all must exist and be non-empty before final):\n"
+                                + checklist
+                            )
+                        workspace_ref = self.workspace_artifacts.workspace_for_step(state, step.id)
+                        loop_output_start = total_output_tokens
+                        loop_remaining_time = (
+                            agent_stage_deadline - asyncio.get_running_loop().time()
+                            if agent_stage_deadline is not None else float(step.timeout_seconds)
+                        )
+                        if loop_remaining_time <= 0:
+                            raise CodingLoopError("编码 Agent 阶段总时限已到，未将未验证成果标记为完成。")
+                        try:
+                            loop_result = await loop.run(
+                                workspace_ref,
+                                loop_task,
+                                system_prompt=effective_system_prompt,
+                                config=CodingLoopConfig(
+                                    max_iterations=max_tool_steps + 1,
+                                    timeout_seconds=loop_remaining_time,
+                                    max_tokens=coding_loop_budget,
+                                    response_max_tokens=self.token_budget_manager.provider_max_tokens(capabilities),
+                                    thinking=effective_thinking,
+                                    max_tool_actions=max_tool_steps,
+                                    required_artifacts=required_artifacts,
+                                ),
+                                emit=emit_artifact_event,
+                                run_id=state.run_id,
+                                step_id=step.id,
+                                on_response=record_coding_response,
+                            )
+                        except CodingLoopError as exc:
+                            workspace_after = self.workspace_artifacts.collect(state, step.id)
+                            workspace_after_by_name = {
+                                str(item.get("name") or "").replace("\\", "/").casefold(): str(item.get("content") or "")
+                                for item in workspace_after
+                            }
+                            remaining_budget = coding_loop_budget - max(0, total_output_tokens - loop_output_start)
+                            coding_loop_fallback_reason = str(exc)[:800]
+                            missing_required = [
+                                path for path in required_artifacts
+                                if not workspace_after_by_name.get(path.replace("\\", "/").casefold(), "").strip()
+                            ]
+                            if required_artifacts and not missing_required:
+                                # A protocol/finalization failure does not erase
+                                # staged source. The frozen outer Gates remain
+                                # authoritative for whether that source is usable.
+                                loop_result = CodingLoopResult(
+                                    output="受控工作区已包含本 Agent 的全部冻结文件；编码循环未正常汇报结束，交由外层成果物和运行 Gate 验证。",
+                                    iterations=0,
+                                    verified=False,
+                                )
+                                await emit_artifact_event("coding_loop.outputs_pending_validation", {
+                                    "reason": coding_loop_fallback_reason,
+                                    "files": list(required_artifacts),
+                                    "verification": "pending_outer_gate",
+                                })
+                            elif str((state.workspace or {}).get("mode") or "") == "existing_repo":
+                                # Artifact generation cannot safely write a
+                                # separate candidate into a user's checkout.
+                                raise
+                            elif not required_artifacts:
+                                raise
+                            elif agent_stage_deadline is not None and asyncio.get_running_loop().time() >= agent_stage_deadline:
+                                raise CodingLoopError(
+                                    f"Agent 阶段总时限已到（{agent_stage_timeout:g}s），且仍缺少冻结文件。"
+                                ) from exc
+                            elif remaining_budget <= 0:
+                                raise CodingLoopError(
+                                    "Coding loop used its complete Agent budget; missing frozen files cannot be recovered."
+                                ) from exc
+                            else:
+                                artifact_target_paths = missing_required
+                                artifact_seed_files = workspace_after
+                                generation_mode = "artifacts"
+                                runtime = {**runtime, "max_tokens": remaining_budget}
+                                attempt_prompt = (
+                                    prompt
+                                    + "\n\nThe controlled coding loop stopped before all frozen files were staged. "
+                                    + "Recover only the missing files listed below; do not regenerate completed files.\n"
+                                    + "\n".join(f"- {path}" for path in missing_required)
+                                    + f"\nCoding loop diagnostic: {coding_loop_fallback_reason}"
+                                )
+                                await emit_artifact_event("coding_loop.fallback_started", {
+                                    "reason": coding_loop_fallback_reason,
+                                    "codingLoopUnusedOutputTokens": max(0, remaining_budget),
+                                    "targetFiles": list(missing_required),
+                                    "stagedFilesPreserved": len(artifact_seed_files),
+                                    "recoveryBound": "frozen_missing_file_list_and_provider_caps",
+                                    "verification": "pending_outer_gate",
+                                })
+                                continue
                         response = loop_result.responses[-1] if loop_result.responses else LLMResponse(text=loop_result.output)
-                        total_input_tokens = sum(item.input_tokens for item in loop_result.responses)
-                        total_output_tokens = sum(item.output_tokens for item in loop_result.responses)
                         response = replace(
                             response,
                             text=loop_result.output,
@@ -1945,34 +2197,55 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                             output_tokens=total_output_tokens,
                             usage={"prompt_tokens": total_input_tokens, "completion_tokens": total_output_tokens},
                         )
-                        last_provider_record = response.provider_record()
-                        provider_attempts.extend(item.provider_record() for item in loop_result.responses)
-                        self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
+                        if loop_result.responses:
+                            last_provider_record = response.provider_record()
                         workspace_files = self.workspace_artifacts.collect(state, step.id)
                         if workspace_files:
                             existing_artifacts = state.context.snapshot().get("__artifact_files__", [])
                             if not isinstance(existing_artifacts, list):
                                 existing_artifacts = []
-                            filtered_artifacts = [
-                                item for item in existing_artifacts
-                                if isinstance(item, dict) and item.get("step_id") != step.id
-                            ]
-                            state.context.set("__artifact_files__", [
-                                *filtered_artifacts,
-                                *workspace_files,
-                            ])
+                            state.context.set(
+                                "__artifact_files__",
+                                self.workspace_artifacts.merge_owner_artifacts(
+                                    existing_artifacts,
+                                    workspace_files,
+                                    step.id,
+                                    file_plan=file_plan,
+                                ),
+                            )
                         await emit_artifact_event(
                             "step.coding_loop_completed",
-                            {"iterations": loop_result.iterations, "toolCount": len(loop_result.tool_results), "verified": loop_result.verified},
+                            {
+                                "iterations": loop_result.iterations,
+                                "toolCount": len(loop_result.tool_results),
+                                "verified": False,
+                                "verification": "pending_outer_gate",
+                                "recoveredAfterLoopError": bool(coding_loop_fallback_reason),
+                                "completionProtocolValid": not bool(coding_loop_fallback_reason),
+                            },
                         )
                         break
                     if generation_mode == "artifacts":
+                        progress_fingerprint, resume_files = self._artifact_progress(state, step.id)
+
+                        async def checkpoint_artifact_file(file_record: dict[str, str]) -> None:
+                            completed = await self._checkpoint_artifact_file(state, step.id, progress_fingerprint, file_record)
+                            await emit_artifact_event("step.artifact_file_checkpointed", {
+                                "fileName": file_record.get("name"), "completedFiles": completed,
+                            })
+
+                        if agent_stage_deadline is None:
+                            agent_stage_deadline = asyncio.get_running_loop().time() + agent_stage_timeout
+                        remaining_stage_time = agent_stage_deadline - asyncio.get_running_loop().time()
+                        if remaining_stage_time <= 0:
+                            raise LLMTimeoutError("Artifact Agent 阶段总时限已到")
+                        bounded_request_timeout = min(float(step.timeout_seconds), remaining_stage_time)
                         artifact_result = await generate_artifacts(
                             system_prompt=effective_system_prompt,
-                            original_prompt=prompt,
+                            original_prompt=attempt_prompt,
                             base_config={
                                 "agent_id": agent.id,
-                                "request_timeout": step.timeout_seconds,
+                                "request_timeout": bounded_request_timeout,
                                 "connect_timeout": 10,
                                 "read_timeout": 120,
                                 "write_timeout": 30,
@@ -1984,43 +2257,66 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                                 "delivery_contract": state.context.snapshot().get("delivery_contract"),
                                 "compiled_contract": state.context.snapshot().get("compiled_contract"),
                             },
-                            request_timeout=step.timeout_seconds,
+                            request_timeout=bounded_request_timeout,
                             max_tokens=int(runtime["max_tokens"]),
                             provider_max_tokens=self.token_budget_manager.provider_max_tokens(capabilities),
                             request=self.model_invocation.generate,
                             record_response=record_artifact_response,
                             emit=emit_artifact_event,
+                            target_artifacts=artifact_target_paths,
+                            seed_files=artifact_seed_files,
+                            resume_files=resume_files,
+                            on_file=checkpoint_artifact_file,
+                            total_timeout_seconds=remaining_stage_time,
                         )
+                        if step.enforce_artifact_contract and step.id in {"database", "backend", "frontend"}:
+                            artifact_result.files, early_responses = await self._owner_preflight_repair(
+                                state, step.id, artifact_result.files,
+                                remaining_seconds=max(0.0, agent_stage_deadline - asyncio.get_running_loop().time()),
+                                provider_max_tokens=self.token_budget_manager.provider_max_tokens(capabilities),
+                            )
+                            for item in early_responses:
+                                record_artifact_response(item)
+                                artifact_result.input_tokens += max(0, int(item.input_tokens or 0))
+                                artifact_result.output_tokens += max(0, int(item.output_tokens or 0))
+                        prior_input_tokens = total_input_tokens
+                        prior_output_tokens = total_output_tokens
                         retry_count = artifact_result.repair_count
-                        accumulated_input_tokens = artifact_result.input_tokens
-                        accumulated_output_tokens = artifact_result.output_tokens
-                        total_input_tokens = artifact_result.input_tokens
-                        total_output_tokens = artifact_result.output_tokens
+                        accumulated_input_tokens = prior_input_tokens + artifact_result.input_tokens
+                        accumulated_output_tokens = prior_output_tokens + artifact_result.output_tokens
+                        total_input_tokens = accumulated_input_tokens
+                        total_output_tokens = accumulated_output_tokens
                         response = replace(
                             artifact_result.last_response,
                             text=artifact_result.summary,
                             message_content=artifact_result.summary,
                             finish_reason="stop",
-                            input_tokens=artifact_result.input_tokens,
-                            output_tokens=artifact_result.output_tokens,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
                             usage={
-                                "prompt_tokens": artifact_result.input_tokens,
-                                "completion_tokens": artifact_result.output_tokens,
+                                "prompt_tokens": total_input_tokens,
+                                "completion_tokens": total_output_tokens,
                             },
                         )
                         existing_artifacts = state.context.snapshot().get("__artifact_files__", [])
                         if not isinstance(existing_artifacts, list):
                             existing_artifacts = []
+                        compiled_contract = state.context.snapshot().get("compiled_contract")
+                        file_plan = compiled_contract.get("file_plan", []) if isinstance(compiled_contract, dict) else []
+                        generated_files = [
+                            {"step_id": step.id, **artifact}
+                            for artifact in artifact_result.files
+                        ]
                         state.context.set(
                             "__artifact_files__",
-                            [
-                                *existing_artifacts,
-                                *[
-                                    {"step_id": step.id, **artifact}
-                                    for artifact in artifact_result.files
-                                ],
-                            ],
+                            self.workspace_artifacts.merge_owner_artifacts(
+                                existing_artifacts,
+                                generated_files,
+                                step.id,
+                                file_plan=file_plan if isinstance(file_plan, list) else [],
+                            ),
                         )
+                        self._clear_artifact_progress(state, step.id)
                         if step.output:
                             # Keep the compact Agent summary for ordinary
                             # logs, but expose an explicit file-scoped context
@@ -2042,10 +2338,16 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                                     ensure_ascii=False,
                                 ),
                             )
+                        if coding_loop_fallback_reason:
+                            await emit_artifact_event("coding_loop.fallback_completed", {
+                                "reason": coding_loop_fallback_reason,
+                                "files": [item["name"] for item in artifact_result.files],
+                                "verification": "pending_outer_gate",
+                            })
                         break
 
                     attempt_thinking = _thinking_for_attempt(effective_thinking, retry_count)
-                    attempt_thinking, _ = self.provider.resolve_thinking(attempt_thinking)
+                    attempt_thinking, _ = provider.resolve_thinking(attempt_thinking)
                     response = await self.model_invocation.generate(
                         effective_system_prompt,
                         attempt_prompt,
@@ -2127,7 +2429,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                     if not response.text.strip():
                         if _reasoning_budget_exhausted(response, int(runtime["max_tokens"])):
                             next_requested_thinking = _thinking_for_attempt(effective_thinking, retry_count + 1)
-                            next_effective_thinking, _ = self.provider.resolve_thinking(next_requested_thinking)
+                            next_effective_thinking, _ = provider.resolve_thinking(next_requested_thinking)
                             current_parameters = last_provider_record.get("request_parameters", {})
                             previous_parameters = provider_attempts[-2].get("request_parameters", {}) if len(provider_attempts) > 1 else {}
                             parameters_unchanged = bool(current_parameters) and current_parameters == previous_parameters
@@ -2192,6 +2494,12 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                         )
                     break
                 except (LLMTimeoutError, asyncio.TimeoutError) as exc:
+                    if agent_stage_deadline is not None and asyncio.get_running_loop().time() >= agent_stage_deadline:
+                        raise LLMError(
+                            f"Agent 阶段总时限已到（{agent_stage_timeout:g}s）",
+                            retryable=False,
+                            response_metadata=last_provider_record,
+                        ) from exc
                     if retry_count >= runtime["retry"]:
                         message = str(exc).strip() or f"Agent timed out after {step.timeout_seconds:g}s"
                         raise LLMError(message, retryable=False) from exc
@@ -2203,6 +2511,12 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                         last_provider_record = exc.response_metadata
                         provider_attempts.append(last_provider_record)
                         self.model_invocation.persist_attempts(state.run_id, step.id, provider_attempts)
+                    if agent_stage_deadline is not None and asyncio.get_running_loop().time() >= agent_stage_deadline:
+                        raise LLMError(
+                            f"Agent 阶段总时限已到（{agent_stage_timeout:g}s）",
+                            retryable=False,
+                            response_metadata=last_provider_record,
+                        ) from exc
                     if not exc.retryable or retry_count >= runtime["retry"]:
                         raise
                     retry_count += 1
@@ -2272,7 +2586,9 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                 })
             if artifact_validation_result is not None:
                 runtime_detail["validation"] = artifact_validation_result.as_dict()
-            await self.event_bus.emit("step.completed", state.run_id, {"stepId": step.id, "status": StepStatus.SUCCESS.value, "output": response.text, "durationMs": duration_ms, "retryCount": retry_count, "tokens": {"input": total_input_tokens, "output": total_output_tokens}, "runtime": runtime_detail, "provider": last_provider_record})
+            if coding_loop_fallback_reason:
+                runtime_detail["codingLoopFallbackReason"] = coding_loop_fallback_reason
+            await self.event_bus.emit("step.completed", state.run_id, {"stepId": step.id, "status": StepStatus.SUCCESS.value, "output": response.text, "durationMs": duration_ms, "retryCount": retry_count, "tokens": {"input": total_input_tokens, "output": total_output_tokens}, "runtime": runtime_detail, "provider": last_provider_record, "fallback": coding_loop_fallback_reason is not None})
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started_perf) * 1000)
             error_message = str(exc).strip() or f"{type(exc).__name__} without a message"
@@ -2287,7 +2603,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                 fallback_plan = build_local_runtime_budget_plan(
                     self.runtime_policy.confirmed_requirement_for_budget(state),
                     allowed_step_ids,
-                    capabilities if "capabilities" in locals() else self.provider.capabilities(),
+                    capabilities if "capabilities" in locals() else self.model_invocation.current_provider().capabilities(),
                 )
                 state.runtime_budget_plan = fallback_plan
                 if step.output:
@@ -2493,6 +2809,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         provider_max_tokens: int,
         *,
         bundle: bool = False,
+        only_missing_planned: bool = False,
     ) -> tuple[list[str], list[LLMResponse]]:
         """Return deterministic build errors to the Agent that owns each file."""
         raw_files = state.context.snapshot().get("__artifact_files__")
@@ -2502,11 +2819,7 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         responses: list[LLMResponse] = []
         failed_targets = self.repair_engine.targets(validation)
         for target in sorted(failed_targets):
-            target_checks = [
-                check
-                for check in validation.checks
-                if check.status == "failed" and check.target == target
-            ]
+            target_checks = self.repair_engine.checks_for_owner(validation, target)
             diagnostics = "\n\n".join(
                 f"[{check.label}] {check.message}\n{check.output}".strip()
                 for check in target_checks
@@ -2526,6 +2839,29 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
             )
             existing_names = {str(item.get("name") or "") for item in raw_files if isinstance(item, dict)}
             ownership = (state.blueprint or {}).get("artifact_ownership") or {}
+            compiled_contract = state.context.snapshot().get("compiled_contract")
+            compiled_contract = compiled_contract if isinstance(compiled_contract, dict) else {}
+            file_plan = compiled_contract.get("file_plan")
+            file_plan = file_plan if isinstance(file_plan, list) else []
+            missing_planned_files = missing_frozen_file_candidates(
+                target, target_checks, file_plan, ownership, existing_names,
+            )
+            for candidate in missing_planned_files:
+                await self.event_bus.emit("step.validation_missing_artifact", state.run_id, {
+                        "stepId": validation_step_id,
+                        "target": target,
+                        "fileName": candidate["name"],
+                        "repairAttempt": repair_attempt,
+                        "source": "frozen_file_plan",
+                    })
+            if only_missing_planned and not missing_planned_files:
+                await self.event_bus.emit("step.validation_repair_skipped", state.run_id, {
+                    "stepId": validation_step_id,
+                    "target": target,
+                    "repairAttempt": repair_attempt,
+                    "reason": "缺失文件没有与当前责任方匹配的冻结计划路径，未猜测创建。",
+                })
+                continue
             missing_declarations: list[dict[str, Any]] = []
             missing_modules: list[dict[str, Any]] = []
             if target == "frontend":
@@ -2579,9 +2915,18 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                         matched = next((item for item in controllers if str(item.get("name")) == name), None)
                         if matched and matched not in candidates:
                             candidates.insert(0, matched)
+            if missing_planned_files:
+                # A frozen file is a concrete, owner-authorized creation target.
+                # Do not make the repair model rewrite a neighboring file to
+                # compensate for an artifact that does not exist yet.
+                candidates = missing_planned_files
             if target == "frontend" and "缺少 src/main/resources/static/index.html" in diagnostics and not any(item.get("name") == "src/main/resources/static/index.html" for item in raw_files if isinstance(item, dict)):
                 candidates.insert(0, {"name": "src/main/resources/static/index.html", "content": "", "step_id": target, "create": True})
-            if (bundle and candidates and not missing_declarations and not missing_modules
+            precise_compiler_location = bool(re.search(
+                r"(?m)^\[ERROR\]\s+[^\r\n]+?\.java:\[\d+", diagnostics.replace("\\", "/"),
+            ))
+            if (bundle and candidates and not precise_compiler_location
+                    and not missing_declarations and not missing_modules
                     and not any(str(item.get("name")) == "pom.xml" for item in candidates)):
                 related = [item for item in owned_files if str(item.get("name", "")).lower().endswith(
                     ("controller.java", "service.java", "repository.java", "request.java")
@@ -2609,6 +2954,26 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
             agent = self.registry.get(f"{target}_agent")
             for candidate in candidates if bundle else candidates[:3]:
                 name = str(candidate["name"])
+                if target == "backend":
+                    compiled = state.context.snapshot().get("compiled_contract")
+                    normalized_table = self._frozen_table_annotation_repair(
+                        candidate, target_checks, compiled if isinstance(compiled, dict) else {},
+                    )
+                    if normalized_table is not None:
+                        raw_files = [
+                            {**item, "content": normalized_table}
+                            if isinstance(item, dict) and item.get("name") == name
+                            and item.get("step_id") == candidate.get("step_id")
+                            else item for item in raw_files
+                        ]
+                        state.context.set("__artifact_files__", raw_files)
+                        repaired.append(name)
+                        await self.event_bus.emit("step.artifact_table_normalized", state.run_id, {
+                            "stepId": validation_step_id, "fileName": name,
+                            "repairAttempt": repair_attempt,
+                            "reason": "实体显式表名已按冻结合同修正；候选仍需目标验证及完整回归。",
+                        })
+                        continue
                 if name == "pom.xml":
                     normalized_content, normalized = normalize_h2_flyway_dependency(str(candidate["content"]))
                     if normalized:
@@ -2685,7 +3050,14 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                     f"待修复文件当前内容：\n{candidate['content']}"
                 )
                 if candidate.get("create"):
-                    if candidate.get("symbol"):
+                    if candidate.get("planned"):
+                        prompt += (
+                            "\n\n该文件是冻结文件计划明确要求的缺失成果物，且责任方与文件路径已由平台合同校验。"
+                            "请创建该路径对应的完整文件，结合原始需求、冻结角色合同和当前项目文件实现其职责；"
+                            "不要改写引用它的其他文件，不得改变已冻结的文件计划或技术边界。"
+                            f"\n文件职责：{candidate.get('purpose') or '按冻结合同及原始需求实现'}。"
+                        )
+                    elif candidate.get("symbol"):
                         prompt += (
                             "\n\n该 Java 文件由编译证据定位为缺失声明，不代表可改变冻结合同。"
                             "请依据引用处、同目录现有源码和真实编译错误生成最小完整文件；"
@@ -2772,7 +3144,12 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
                     else:
                         updated_files.append(item)
                 if candidate.get("create"):
-                    mime_type = "text/html; charset=utf-8" if name.endswith(".html") else "text/plain; charset=utf-8"
+                    mime_type = {
+                        ".html": "text/html; charset=utf-8",
+                        ".css": "text/css; charset=utf-8",
+                        ".js": "application/javascript; charset=utf-8",
+                        ".json": "application/json; charset=utf-8",
+                    }.get(posixpath.splitext(name)[1].lower(), "text/plain; charset=utf-8")
                     updated_files.append({"name": name, "content": content, "step_id": target, "mime_type": mime_type})
                 raw_files = updated_files
                 state.context.set("__artifact_files__", raw_files)
@@ -2821,89 +3198,4 @@ class WorkflowExecutor(RunRecoveryMixin, ArtifactRepairSupportMixin):
         await self.event_bus.emit(event_type, state.run_id, {"workflowId": state.workflow.id, "status": status.value, "error": error, "finalReport": final_report, "durationMs": duration_ms, "approvalDurationMs": self._approval_duration_ms(state), "deliverable": bool((state.context.snapshot().get("delivery_gate") or {}).get("deliverable"))})
         if status in {RunStatus.SUCCESS, RunStatus.FAILED, RunStatus.STOPPED}:
             self._active.pop(state.run_id, None)
-
-
-def _thinking_for_attempt(initial: str, retry_count: int) -> str:
-    """Return a strictly non-increasing thinking level for each attempt."""
-    level = str(initial).strip().lower()
-    if retry_count <= 0:
-        return level
-    if retry_count == 1 and level in {"high", "max"}:
-        return "low"
-    return "off"
-
-
-def _reasoning_budget_exhausted(response: LLMResponse, max_tokens: int) -> bool:
-    """Detect a response that spent essentially all output budget on reasoning."""
-    if response.text.strip():
-        return False
-    usage = response.usage if isinstance(response.usage, dict) else {}
-    completion_tokens = int(usage.get("completion_tokens", response.output_tokens or 0) or 0)
-    details = usage.get("completion_tokens_details")
-    reasoning_tokens = int(details.get("reasoning_tokens", 0) or 0) if isinstance(details, dict) else 0
-    reached_limit = response.finish_reason == "length" or completion_tokens >= max(1, int(max_tokens * 0.95))
-    reasoning_dominated = reasoning_tokens >= max(1, int(completion_tokens * 0.9)) if completion_tokens else False
-    return reached_limit and (reasoning_dominated or bool((response.reasoning_content or "").strip()))
-
-
-def _can_use_structured_fallback(response: LLMResponse | None, error_message: str) -> bool:
-    """Allow local recovery only for response-format failures, not transport errors."""
-    if response is None:
-        return False
-    if str(response.finish_reason or "").strip().lower() == "length":
-        return True
-    if response.reasoning_content and not response.text.strip():
-        return True
-    normalized = error_message.lower()
-    return any(
-        marker in normalized
-        for marker in (
-            "output validation failed",
-            "invalid_json",
-            "empty output",
-            "truncated",
-            "query_parameters",
-            "attributeerror",
-            "object has no attribute",
-            "expected a valid json object",
-            "实体合同 fields",
-            "字段名到类型的映射",
-            "实体字段",
-            "类型未明确",
-        )
-    )
-
-
-def _continuation_prompt(original_prompt: str, partial_output: str) -> str:
-    return (
-        f"{original_prompt}\n\n"
-        "上一次输出已达到 Provider 的长度上限，以下是已保存的部分输出。"
-        "请只从末尾继续生成缺失内容，不要重复已有内容，不要重新开始：\n"
-        "<partial_output>\n"
-        f"{partial_output}\n"
-        "</partial_output>\n"
-        "请只输出新增内容。"
-    )
-
-
-def _merge_continuation(previous: str, current: str, output_format: str) -> str:
-    if not previous:
-        return current
-    if not current:
-        return previous
-    max_overlap = min(len(previous), len(current), 2000)
-    for size in range(max_overlap, 0, -1):
-        if previous[-size:] == current[:size]:
-            return previous + current[size:]
-    separator = "\n" if output_format in {"text", "markdown"} else ""
-    return previous + separator + current
-
-
-def _merge_usage(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(previous)
-    for key, value in current.items():
-        if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
-            merged[key] = merged[key] + value
-        elif key not in merged:
-            merged[key] = value
-    return merged
+            self.model_invocation.release_run(state.run_id)

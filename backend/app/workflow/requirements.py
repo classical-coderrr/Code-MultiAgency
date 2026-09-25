@@ -49,6 +49,10 @@ class RequirementSpec(BaseModel):
     gaps: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
     safe_defaults: dict[str, Any] = Field(default_factory=dict)
     primary_entities: list[str] = Field(default_factory=list, max_length=32)
+    entity_evidence: list[dict[str, str]] = Field(default_factory=list, max_length=32)
+    explicit_entity_fields: dict[str, dict[str, str]] = Field(default_factory=dict)
+    explicit_constraints: list[str] = Field(default_factory=list, max_length=32)
+    explicit_api_paths: list[str] = Field(default_factory=list, max_length=32)
     requested_stacks: dict[str, str] = Field(default_factory=dict)
     capability_profile: dict[str, bool] = Field(default_factory=dict)
     support_status: RequirementSupport = "SUPPORTED"
@@ -62,6 +66,8 @@ class RequirementSpec(BaseModel):
         "assumptions",
         "impactful_gaps",
         "primary_entities",
+        "explicit_constraints",
+        "explicit_api_paths",
         mode="before",
     )
     @classmethod

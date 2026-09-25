@@ -10,7 +10,7 @@ from math import ceil
 from pathlib import PurePath
 from typing import Any, Awaitable, Callable
 
-from ..llm.base import LLMError, LLMResponse
+from ..llm.base import LLMError, LLMResponse, LLMTimeoutError
 from ..code_company.artifact_contracts import enforce_artifact_plan
 from ..code_company.dependency_manifest import render_managed_artifact
 from ..services.artifact_paths import is_safe_artifact_path, normalize_artifact_path
@@ -21,6 +21,7 @@ from .maven_contract import normalize_h2_flyway_dependency
 RequestCall = Callable[[str, str, dict[str, Any], float], Awaitable[LLMResponse]]
 RecordResponse = Callable[[LLMResponse], None]
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
+FileCheckpoint = Callable[[dict[str, str]], Awaitable[None]]
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LANGUAGE_BY_SUFFIX = {
@@ -128,6 +129,11 @@ async def generate_artifacts(
     request: RequestCall,
     record_response: RecordResponse,
     emit: EmitEvent,
+    target_artifacts: list[str] | tuple[str, ...] | None = None,
+    seed_files: list[dict[str, Any]] | None = None,
+    resume_files: list[dict[str, Any]] | None = None,
+    on_file: FileCheckpoint | None = None,
+    total_timeout_seconds: float | None = None,
 ) -> ArtifactGenerationResult:
     """Plan and generate independent files without replaying a whole response.
 
@@ -138,6 +144,17 @@ async def generate_artifacts(
     """
 
     raw_request = request
+    stage_timeout = max(0.1, float(total_timeout_seconds or request_timeout))
+    stage_deadline = asyncio.get_running_loop().time() + stage_timeout
+
+    async def request_with_stage_deadline(
+        system: str, user: str, config: dict[str, Any], timeout: float,
+    ) -> LLMResponse:
+        remaining = stage_deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise LLMTimeoutError(f"Artifact Agent 阶段总时限已到（{stage_timeout:g}s）")
+        bounded_timeout = min(max(0.1, float(timeout)), remaining)
+        return await raw_request(system, user, config, bounded_timeout)
 
     async def request_with_transport_retry(
         system: str, user: str, config: dict[str, Any], timeout: float,
@@ -147,7 +164,7 @@ async def generate_artifacts(
         # the executor waits for cancellation cleanup on its timeout path.
         for attempt in range(2):
             try:
-                return await raw_request(system, user, config, timeout)
+                return await request_with_stage_deadline(system, user, config, timeout)
             except LLMError as exc:
                 reason = str(exc).lower()
                 transport = any(marker in reason for marker in (
@@ -168,46 +185,25 @@ async def generate_artifacts(
 
     safe_max_tokens = max(1, min(int(max_tokens), int(provider_max_tokens)))
     planning_responses: list[LLMResponse] = []
-    plan_budget = _artifact_plan_budget(original_prompt, safe_max_tokens, provider_max_tokens)
-    plan_response = await request(
-        _planning_system_prompt(),
-        _planning_prompt(original_prompt),
-        {
-            **base_config,
-            "generation_phase": "artifact_plan",
-            "continuation": False,
-            "max_tokens": plan_budget,
-            "effective_thinking": "off",
-            "thinking_type": "disabled",
-            "reasoning_effort": "off",
-        },
-        request_timeout,
-    )
-    record_response(plan_response)
-    planning_responses.append(plan_response)
-    plan = parse_artifact_manifest(plan_response.text)
-    if plan is None:
-        retry_budget = max(
-            plan_budget,
-            min(int(provider_max_tokens), ARTIFACT_PLAN_RETRY_TOKENS),
+    frozen_plan = _frozen_owner_manifest(base_config)
+    if frozen_plan is not None:
+        plan = frozen_plan
+        plan_source = "frozen_file_plan"
+        plan_response = LLMResponse(
+            text=json.dumps({"files": [item.name for item in plan]}, ensure_ascii=False),
+            model="frozen-contract",
+            finish_reason="stop",
         )
-        await emit(
-            "step.artifact_plan_recovering",
-            {
-                "reason": "成果物规划 JSON 不完整，正在使用精简清单自动重试",
-                "finishReason": plan_response.finish_reason,
-                "previousMaxTokens": plan_budget,
-                "nextMaxTokens": retry_budget,
-            },
-        )
+    else:
+        plan_budget = _artifact_plan_budget(original_prompt, safe_max_tokens, provider_max_tokens)
         plan_response = await request(
             _planning_system_prompt(),
-            _planning_retry_prompt(original_prompt),
+            _planning_prompt(original_prompt),
             {
                 **base_config,
-                "generation_phase": "artifact_plan_retry",
+                "generation_phase": "artifact_plan",
                 "continuation": False,
-                "max_tokens": retry_budget,
+                "max_tokens": plan_budget,
                 "effective_thinking": "off",
                 "thinking_type": "disabled",
                 "reasoning_effort": "off",
@@ -217,24 +213,55 @@ async def generate_artifacts(
         record_response(plan_response)
         planning_responses.append(plan_response)
         plan = parse_artifact_manifest(plan_response.text)
+        if plan is None:
+            retry_budget = max(
+                plan_budget,
+                min(int(provider_max_tokens), ARTIFACT_PLAN_RETRY_TOKENS),
+            )
+            await emit(
+                "step.artifact_plan_recovering",
+                {
+                    "reason": "成果物规划 JSON 不完整，正在使用精简清单自动重试",
+                    "finishReason": plan_response.finish_reason,
+                    "previousMaxTokens": plan_budget,
+                    "nextMaxTokens": retry_budget,
+                },
+            )
+            plan_response = await request(
+                _planning_system_prompt(),
+                _planning_retry_prompt(original_prompt),
+                {
+                    **base_config,
+                    "generation_phase": "artifact_plan_retry",
+                    "continuation": False,
+                    "max_tokens": retry_budget,
+                    "effective_thinking": "off",
+                    "thinking_type": "disabled",
+                    "reasoning_effort": "off",
+                },
+                request_timeout,
+            )
+            record_response(plan_response)
+            planning_responses.append(plan_response)
+            plan = parse_artifact_manifest(plan_response.text)
 
-    plan_source = "provider"
-    if plan is None:
-        contract = base_config.get("delivery_contract")
-        scope = _contract_technology_scope(contract) if isinstance(contract, dict) else original_prompt
-        plan = _fallback_artifact_manifest(
-            scope,
-            str(base_config.get("agent_id") or ""),
-            contract=base_config.get("delivery_contract"),
-        )
-        plan_source = "deterministic_fallback"
-        await emit(
-            "step.artifact_plan_fallback",
-            {
-                "reason": "Provider 两次未返回完整文件清单，已启用本地保守规划",
-                "fileCount": len(plan),
-            },
-        )
+        plan_source = "provider"
+        if plan is None:
+            contract = base_config.get("delivery_contract")
+            scope = _contract_technology_scope(contract) if isinstance(contract, dict) else original_prompt
+            plan = _fallback_artifact_manifest(
+                scope,
+                str(base_config.get("agent_id") or ""),
+                contract=base_config.get("delivery_contract"),
+            )
+            plan_source = "deterministic_fallback"
+            await emit(
+                "step.artifact_plan_fallback",
+                {
+                    "reason": "Provider 两次未返回完整文件清单，已启用本地保守规划",
+                    "fileCount": len(plan),
+                },
+            )
 
     if bool(base_config.get("enforce_artifact_contract", False)):
         plan = _complete_agent_manifest(
@@ -253,7 +280,7 @@ async def generate_artifacts(
                 name=str(row["path"]),
                 language=_LANGUAGE_BY_SUFFIX.get(PurePath(str(row["path"])).suffix.lower(), "text"),
                 purpose=f"冻结文件计划要求的 {', '.join(row.get('provides') or [str(row['path'])])}",
-                estimated_tokens=1024,
+                estimated_tokens=2400 if str(row["path"]).endswith("Manager.vue") else 1024,
                 owner=owner,
                 provides=tuple(str(value) for value in row.get("provides") or []),
                 requires=tuple(str(value) for value in row.get("requires") or []),
@@ -266,6 +293,26 @@ async def generate_artifacts(
                 "files": denied_files,
                 "reason": "文件不属于当前 Agent 的冻结 Artifact Ownership，已在生成前拒绝",
             })
+
+    complete_plan = list(plan)
+    target_keys: set[str] | None = None
+    if target_artifacts is not None:
+        target_keys = set()
+        for raw_path in target_artifacts:
+            normalized = normalize_artifact_path(raw_path)
+            if not normalized or not is_safe_artifact_path(normalized):
+                raise ValueError(f"Targeted artifact recovery contains an unsafe path: {raw_path!r}")
+            target_keys.add(normalized.casefold())
+        if not target_keys:
+            raise ValueError("Targeted artifact recovery requires at least one frozen file path")
+        available = {item.name.casefold() for item in complete_plan}
+        unknown = sorted(target_keys - available)
+        if unknown:
+            raise ValueError(
+                "Targeted artifact recovery may only generate files from the frozen Agent plan: "
+                + ", ".join(unknown[:20])
+            )
+        plan = [item for item in complete_plan if item.name.casefold() in target_keys]
 
     await emit(
         "step.artifact_planned",
@@ -288,16 +335,59 @@ async def generate_artifacts(
             ],
             "fileCount": len(plan),
             "planSource": plan_source,
+            "targetedRecovery": target_keys is not None,
         },
     )
 
     all_responses = planning_responses
+    complete_plan_names = {item.name.casefold(): item.name for item in complete_plan}
     files: list[dict[str, str]] = []
+    seeded_names: set[str] = set()
+    resumed_names: set[str] = set()
+    resume_keys = {
+        normalize_artifact_path(item.get("name") or item.get("path")).casefold()
+        for item in resume_files or [] if isinstance(item, dict)
+    }
+    for item, is_resume in [*((item, False) for item in (seed_files or [])), *((item, True) for item in (resume_files or []))]:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_artifact_path(item.get("name") or item.get("path"))
+        content = item.get("content")
+        if not normalized or not isinstance(content, str) or not content.strip():
+            continue
+        path_key = normalized.casefold()
+        if not is_resume and path_key in resume_keys:
+            continue
+        canonical_name = complete_plan_names.get(path_key)
+        if not canonical_name or path_key in seeded_names:
+            continue
+        if target_keys is not None and path_key in target_keys:
+            continue
+        seeded_names.add(path_key)
+        if is_resume:
+            resumed_names.add(path_key)
+        files.append({
+            "name": canonical_name,
+            "language": str(item.get("language") or _LANGUAGE_BY_SUFFIX.get(PurePath(canonical_name).suffix.lower(), "text")),
+            "purpose": str(item.get("purpose") or "已在受控工作区生成，作为定点补文件的依赖上下文"),
+            "content": content,
+        })
     repair_count = 0
     continuation_count = 0
     split_count = 0
     generation_original_prompt = original_prompt
+    if target_keys is not None:
+        target_names = [item.name for item in plan]
+        generation_original_prompt += (
+            "\n\n有界恢复要求：以下文件已由平台从冻结的 Artifact Contract 中确定，"
+            "本轮只生成这些缺失文件，不得改写或重新输出其他文件：\n"
+            + "\n".join(f"- {name}" for name in target_names)
+            + "\n其他已生成文件仅供依赖参考，必须保持不变。"
+        )
     for index, spec in enumerate(plan, start=1):
+        if spec.name.casefold() in resumed_names:
+            await emit("step.artifact_reused", {"fileName": spec.name, "fileIndex": index, "fileCount": len(plan)})
+            continue
         hidden_reasoning_observed = _has_hidden_reasoning(all_responses)
         base_config["hidden_reasoning_observed"] = hidden_reasoning_observed
         file_budget = provider_max_tokens if hidden_reasoning_observed else _file_budget(spec, safe_max_tokens, provider_max_tokens)
@@ -306,7 +396,11 @@ async def generate_artifacts(
             (base_config.get("compiled_contract") or {}).get("dependency_manifest") or {},
         )
         if managed_content is not None:
-            files.append(_artifact_file_record(spec, managed_content))
+            file_record = _artifact_file_record(spec, managed_content)
+            files[:] = [item for item in files if item["name"].casefold() != spec.name.casefold()]
+            files.append(file_record)
+            if on_file:
+                await on_file(file_record)
             await emit("step.artifact_manifest_compiled", {
                 "fileName": spec.name,
                 "fileIndex": index,
@@ -314,14 +408,16 @@ async def generate_artifacts(
                 "source": "dependency_manifest_compiler",
             })
             continue
-        completed_source = "\n".join(
-            f"--- {item['name']} ---\n{item['content']}" for item in files
+        completed_source = _relevant_completed_source(
+            files, spec, base_config.get("compiled_contract"),
         )
-        original_prompt = generation_original_prompt
+        original_prompt = generation_original_prompt + _frozen_file_constraints(
+            spec, base_config.get("compiled_contract"),
+        )
         if completed_source:
             original_prompt += (
                 "\n\n以下为本次已生成的真实兄弟文件。其依赖、包名、类型和公开方法签名是约束，"
-                "必须按这些源码调用，禁止重新猜测接口：\n" + completed_source[:32000]
+                "必须按这些源码调用，禁止重新猜测接口：\n" + completed_source
             )
         parts = spec.parts
         split_attempted = bool(parts)
@@ -538,7 +634,11 @@ async def generate_artifacts(
                 })
         if PurePath(spec.name).suffix.lower() == ".java":
             content = _complete_spring_web_annotation_imports(content)
-        files.append(_artifact_file_record(spec, content))
+        file_record = _artifact_file_record(spec, content)
+        files[:] = [item for item in files if item["name"].casefold() != spec.name.casefold()]
+        files.append(file_record)
+        if on_file:
+            await on_file(file_record)
         await emit("step.artifact_validated", {"fileName": spec.name, "fileIndex": index, "fileCount": len(plan)})
 
     if "frontend" in str(base_config.get("agent_id") or "").lower():
@@ -546,13 +646,15 @@ async def generate_artifacts(
         api_paths = list(((compiled.get("openapi") or {}).get("paths") or {})) if isinstance(compiled, dict) else []
         bootstrap = _ensure_vue_vite_config(files, api_paths=api_paths)
         if bootstrap:
+            if on_file:
+                await on_file(next(item for item in files if item["name"] == bootstrap))
             await emit("step.artifact_bootstrap_completed", {"fileName": bootstrap})
 
     summary = _summary(files, plan_response)
     return ArtifactGenerationResult(
         summary=summary,
         files=files,
-        last_response=all_responses[-1],
+        last_response=all_responses[-1] if all_responses else plan_response,
         input_tokens=sum(item.input_tokens for item in all_responses),
         output_tokens=sum(item.output_tokens for item in all_responses),
         repair_count=repair_count,
@@ -566,7 +668,7 @@ def parse_artifact_manifest(text: str) -> list[ArtifactFileSpec] | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("files"), list):
         return None
     result: list[ArtifactFileSpec] = []
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     for item in raw["files"][:12]:
         if not isinstance(item, dict):
             continue
@@ -574,7 +676,12 @@ def parse_artifact_manifest(text: str) -> list[ArtifactFileSpec] | None:
         raw_name = normalize_artifact_path(raw_name)
         if not raw_name or not is_safe_artifact_path(raw_name):
             continue
-        if raw_name in seen:
+        owner = str(item.get("owner") or "").strip().casefold()
+        path_key = raw_name.casefold()
+        previous_owner = seen.get(path_key)
+        if previous_owner is not None:
+            if owner and previous_owner and owner != previous_owner:
+                return None
             continue
         language = _normalize_language(str(item.get("language") or ""), raw_name)
         purpose = " ".join(str(item.get("purpose") or "").split())[:240] or "按用户需求生成的成果物文件"
@@ -586,8 +693,8 @@ def parse_artifact_manifest(text: str) -> list[ArtifactFileSpec] | None:
         provides = tuple(str(value) for value in item.get("provides") or [] if str(value).strip())
         requires = tuple(str(value) for value in item.get("requires") or [] if str(value).strip())
         dependencies = tuple(str(value) for value in item.get("depends_on_files") or [] if str(value).strip())
-        result.append(ArtifactFileSpec(raw_name, language, purpose, estimated, parts, str(item.get("owner") or ""), provides, requires, dependencies))
-        seen.add(raw_name)
+        result.append(ArtifactFileSpec(raw_name, language, purpose, estimated, parts, owner, provides, requires, dependencies))
+        seen[path_key] = owner
     return result or None
 
 
@@ -1063,6 +1170,49 @@ def _complete_spring_web_annotation_imports(content: str) -> str:
     return imports + "\n" + content
 
 
+def _frozen_owner_manifest(base_config: dict[str, Any]) -> list[ArtifactFileSpec] | None:
+    """Use the architecture-frozen owner file plan instead of another LLM plan call."""
+    if not base_config.get("enforce_artifact_contract"):
+        return None
+    compiled = base_config.get("compiled_contract")
+    file_plan = compiled.get("file_plan") if isinstance(compiled, dict) else None
+    if not isinstance(file_plan, list) or not file_plan:
+        return None
+    agent_name = str(base_config.get("agent_id") or "").lower()
+    owner = next((name for name in ("database", "backend", "frontend") if name in agent_name), agent_name)
+    rows = [
+        row for row in file_plan
+        if isinstance(row, dict)
+        and str(row.get("owner") or "").strip().casefold() == owner.casefold()
+        and normalize_artifact_path(row.get("path"))
+    ]
+    if not rows:
+        return None
+    manifest: list[ArtifactFileSpec] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = normalize_artifact_path(row.get("path"))
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        provides = tuple(str(value) for value in row.get("provides") or [] if str(value).strip())
+        requires = tuple(str(value) for value in row.get("requires") or [] if str(value).strip())
+        dependencies = tuple(str(value) for value in row.get("depends_on_files") or [] if str(value).strip())
+        purpose = str(row.get("purpose") or ", ".join(provides) or name)
+        manifest.append(ArtifactFileSpec(
+            name=name,
+            language=_LANGUAGE_BY_SUFFIX.get(PurePath(name).suffix.lower(), "text"),
+            purpose=purpose,
+            estimated_tokens=2400,
+            owner=owner,
+            provides=provides,
+            requires=requires,
+            depends_on_files=dependencies,
+        ))
+    return manifest or None
+
+
 def _artifact_plan_budget(original_prompt: str, safe_max_tokens: int, provider_max_tokens: int) -> int:
     """Allocate a small but realistic control budget for a file manifest."""
     normalized = str(original_prompt or "").lower()
@@ -1441,6 +1591,160 @@ def _manifest_java_target_path(
     else:
         layer = "model"
     return f"{package_root}/{layer}/{stem}.java"
+
+
+def _frozen_file_constraints(spec: ArtifactFileSpec, compiled: Any) -> str:
+    """State the approved mapping next to the file that must implement it."""
+    if not isinstance(compiled, dict):
+        return ""
+    name = spec.name.rsplit("/", 1)[-1]
+    tables = (compiled.get("database_schema") or {}).get("tables") or {}
+    if not isinstance(tables, dict):
+        tables = {}
+    if name == "schema.sql" and isinstance(tables, dict) and tables:
+        definitions = {
+            str(table): {
+                "entity_id": row.get("entity_id"),
+                "columns": row.get("columns"),
+                "primary_key": row.get("primary_key"),
+                "spring_jpa_sql_columns": {
+                    str(field): re.sub(r"(?<!^)(?=[A-Z])", "_", str(field)).lower()
+                    for field in (row.get("columns") or {})
+                },
+                "sql_table_identifier": f'"{table}"' if str(table).lower() == "order" else str(table),
+            }
+            for table, row in tables.items() if isinstance(row, dict)
+        }
+        return "\n\n当前 SQL 文件必须实现以下冻结表名及字段，不能自行改成复数或别名：" + json.dumps(definitions, ensure_ascii=False)
+    if name in {"application.yml", "application.yaml"}:
+        return (
+            "\n\nSpring YAML must define each key only once within its mapping. "
+            "Merge JPA settings under a single spring.jpa block; duplicate "
+            "spring.jpa sections fail at runtime even if Maven test passes."
+        )
+    if name.endswith(".java"):
+        entity = name.removesuffix(".java").removesuffix("Entity").casefold()
+        table = next((
+            str(table_name) for table_name, row in tables.items()
+            if isinstance(row, dict) and str(row.get("entity_id") or "").casefold() == entity
+        ), None)
+        if table and not name.endswith(("Controller.java", "Service.java", "Repository.java")):
+            if table.lower() == "order":
+                return (
+                    '\n\nThe frozen table name is the SQL keyword order. Keep this exact table name, '
+                    'and use a quoted JPA identifier: @Table(name="\\\"order\\\""). '
+                    'Do not rename the table or disable Hibernate schema validation.'
+                )
+            return f'\n\n当前实体的冻结数据库表名是 {table}；如果使用 @Table，必须写 @Table(name="{table}")。'
+        if name.endswith("Service.java"):
+            service_entity = name.removesuffix("Service.java").casefold()
+            generated_id = any(
+                isinstance(row, dict)
+                and str(row.get("entity_id") or "").casefold() == service_entity
+                and isinstance(row.get("columns"), dict)
+                and bool((row["columns"].get(str(row.get("primary_key") or "id")) or {}).get("generated"))
+                for row in tables.values()
+            )
+            if generated_id:
+                return (
+                    "\n\n当前实体主键由数据库生成。新增时不要调用 setId(null)；"
+                    "更新时先读取现有实体并只修改可编辑字段。"
+                    "所有调用的 getter/setter 必须在已生成的 Entity 源码中真实存在。"
+                )
+    if name.endswith(("Controller.java", ".vue", ".js", ".ts", ".html")):
+        paths = (compiled.get("openapi") or {}).get("paths") or {}
+        entity = (
+            name.removesuffix("Controller.java") if name.endswith("Controller.java")
+            else name.removesuffix("Manager.vue") if name.endswith("Manager.vue")
+            else ""
+        )
+        operations = [
+            f"{method.upper()} {path}"
+            for path, methods in paths.items() if isinstance(methods, dict)
+            for method, operation in methods.items()
+            if method.lower() in {"get", "post", "put", "patch", "delete"}
+            and isinstance(operation, dict)
+            and (not entity or str(operation.get("x-entity-id") or "").casefold() == entity.casefold())
+        ]
+        ui_contract = ""
+        if (spec.owner == "frontend" and name.endswith((".vue", ".js", ".ts", ".html"))
+                and (compiled.get("delivery_requirements") or {}).get("crud_required")):
+            component_rows = [
+                row for row in compiled.get("file_plan") or []
+                if isinstance(row, dict) and str(row.get("path") or "").startswith("src/components/")
+                and str(row.get("path") or "").endswith("Manager.vue")
+            ]
+            if spec.name == "src/App.vue" and component_rows:
+                components = ", ".join(str(row["path"]) for row in component_rows)
+                ui_contract = (
+                    "\n\nThis root Vue component only imports and visibly renders every "
+                    f"entity manager: {components}. Do not duplicate CRUD/API logic here; "
+                    "each manager owns its own visible CRUD panel. "
+                    "If managers are shown in switchable tabs, use semantic tab buttons "
+                    "(role=tab or aria-controls) so browser validation can open each view."
+                )
+            elif name.endswith("Manager.vue"):
+                schema = (compiled.get("json_schema") or {}).get(entity) or {}
+                ui_contract = (
+                    f"\n\nImplement only the {entity} CRUD view in this Vue component. "
+                    f"The root element must have data-testid=\"crud-panel-{entity}\" exactly once; "
+                    "do not repeat this marker on a decorative child. "
+                    "Inside that panel provide working crud-add, crud-save, crud-row, "
+                    "crud-edit, crud-delete, and crud-field-{JSON field name} controls. "
+                    "Do not implement another entity's API or UI. Entity schema: "
+                    + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+                )
+            elif spec.name != "src/main.js":
+                ui_contract = (
+                    "\n\nCRUD browser acceptance requires stable data-testid attributes: "
+                    "crud-add, crud-save, crud-row, crud-edit, crud-delete, and "
+                    "crud-field-{JSON field name}. The rendered controls must also perform real CRUD operations."
+                )
+        if operations:
+            return "\n\n当前文件必须遵守冻结 API 方法与路径：" + "、".join(operations[:30]) + ui_contract
+        return ui_contract
+    return ""
+
+
+def _relevant_completed_source(
+    files: list[dict[str, str]], spec: ArtifactFileSpec, compiled: Any,
+) -> str:
+    """Include direct file dependencies without replaying the entire project."""
+    if not files:
+        return ""
+    file_plan = compiled.get("file_plan") if isinstance(compiled, dict) else None
+    row = next((
+        item for item in file_plan
+        if isinstance(item, dict) and str(item.get("path") or "") == spec.name
+    ), None) if isinstance(file_plan, list) else None
+    if not isinstance(row, dict):
+        selected = files[-2:]
+    else:
+        dependencies = {str(name) for name in row.get("depends_on_files") or []}
+        basename = spec.name.rsplit("/", 1)[-1]
+        if basename in {"script.js", "style.css", "App.vue"}:
+            dependencies.add("index.html")
+        if basename.endswith(".css"):
+            dependencies.add("src/App.vue")
+        if basename.endswith("Controller.java"):
+            dependencies.add(spec.name.replace("Controller.java", ".java"))
+        selected = [item for item in files if item.get("name") in dependencies]
+    if spec.name == "src/App.vue" and selected and all(
+        str(item.get("name") or "").startswith("src/components/") for item in selected
+    ):
+        return "\n".join(
+            f"--- {item['name']} ---\nVue single-file component; import it by relative path and render it visibly."
+            for item in selected
+        )
+    sections: list[str] = []
+    remaining = 14000
+    for item in selected:
+        section = f"--- {item['name']} ---\n{item['content']}"
+        if len(section) > remaining:
+            continue
+        sections.append(section)
+        remaining -= len(section)
+    return "\n".join(sections)
 
 
 def _file_prompt(original_prompt: str, plan: list[ArtifactFileSpec], spec: ArtifactFileSpec) -> str:

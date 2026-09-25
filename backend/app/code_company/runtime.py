@@ -72,10 +72,25 @@ class CodeCompanyRuntime:
 
     def capabilities(self) -> dict[str, Any]:
         return {
-            "workspace": {"mode": "run_isolated", "existing_repo": True, "candidate": True, "parallel_agent_branches": True},
+            "workspace": {
+                "mode": "run_isolated",
+                "existing_repo": True,
+                "candidate": True,
+                "parallel_agent_branches": True,
+                "git_worktrees": True,
+                "dirty_repository_policy": "preserve_snapshot",
+                "source_branch_push": False,
+            },
             "tools": sorted(self.tool_gateway.policy.allowed_tools),
             "write_tools_enabled": True,
             "shell_enabled": True,
+            "coding_loop": {
+                "tools": sorted(ToolPolicy.coding_loop().allowed_tools),
+                "shell_enabled": False,
+                "verification": "owner_scoped_fixed_gates",
+                "write_scope": "frozen_artifact_ownership",
+                "action_journal": "sqlite",
+            },
             "repository_intelligence": ["directory_tree", "symbol_index", "import_graph", "dependency_summary", "relevant_files"],
             "context_layers": ["task", "project", "repository", "runtime", "evidence", "memory"],
             "dynamic_planner": True,
@@ -83,12 +98,57 @@ class CodeCompanyRuntime:
             "delivery": ["artifact_allowlist", "secret_scan", "zip"],
         }
 
-    def gateway_for_owner(self, owner: str, blueprint: dict[str, Any] | None) -> LocalToolGateway:
+    def gateway_for_owner(
+        self,
+        owner: str,
+        blueprint: dict[str, Any] | None,
+        *,
+        coding_loop: bool = False,
+    ) -> LocalToolGateway:
         """Create an Agent-scoped gateway from the frozen ownership contract."""
         ownership = (blueprint or {}).get("artifact_ownership") or {}
         patterns = ownership.get(owner) or []
         if isinstance(patterns, str):
             patterns = [patterns]
+        owner_patterns = tuple(str(item) for item in patterns if str(item).strip())
+        if coding_loop:
+            plan = (blueprint or {}).get("file_dependencies") or []
+            exact_paths = frozenset(
+                str(item.get("path") or "").replace("\\", "/").lstrip("/")
+                for item in plan
+                if isinstance(item, dict)
+                and str(item.get("owner") or "").strip().lower() == owner.strip().lower()
+                and str(item.get("path") or "").strip()
+            )
+            denied_patterns = tuple(
+                str(pattern)
+                for other_owner, values in ownership.items()
+                if str(other_owner).strip().lower() != owner.strip().lower()
+                for pattern in ([values] if isinstance(values, str) else values or [])
+                if str(pattern).strip()
+            )
+            # The coding loop may inspect non-secret project files, but writes
+            # fail closed unless Architecture froze explicit ownership globs.
+            database_mode = str(((blueprint or {}).get("database") or {}).get("mode") or "none").lower()
+            verification_gates = {
+                "backend": frozenset({"backend-compile"} if database_mode != "none" else {"backend-compile", "backend-test"}),
+                "frontend": frozenset({"frontend-build"}),
+            }.get(owner.strip().lower(), frozenset())
+            frontend_manifest = (((blueprint or {}).get("dependency_manifest") or {}).get("frontend") or {})
+            verification_dependencies = frozenset({
+                *(frontend_manifest.get("dependencies") or {}),
+                *(frontend_manifest.get("dev_dependencies") or {}),
+            }) if owner.strip().lower() == "frontend" else frozenset()
+            return LocalToolGateway(
+                self.workspace_service,
+                ToolPolicy.coding_loop(
+                    mutable_path_globs=owner_patterns,
+                    denied_write_path_globs=denied_patterns,
+                    exact_write_paths=exact_paths,
+                    verification_gates=verification_gates,
+                    verification_dependencies=verification_dependencies,
+                ),
+            )
         base = ToolPolicy.coding_default()
-        policy = replace(base, allowed_path_globs=tuple(str(item) for item in patterns) or base.allowed_path_globs)
+        policy = replace(base, allowed_path_globs=owner_patterns or base.allowed_path_globs)
         return LocalToolGateway(self.workspace_service, policy)

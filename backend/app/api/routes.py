@@ -140,6 +140,7 @@ def create_router(
         set_key(str(env_path), "MODEL_API_KEY", api_key)
         os.environ.update({"MODEL_PROVIDER": request.provider, "MODEL_BASE_URL": request.base_url, "MODEL_NAME": request.model_name, "MODEL_API_KEY": api_key})
         executor.provider = provider
+        executor.model_invocation.set_provider(provider)
         return {
             "success": True,
             "usingMock": isinstance(provider, MockProvider),

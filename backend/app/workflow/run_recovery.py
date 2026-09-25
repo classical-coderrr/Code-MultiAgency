@@ -263,6 +263,7 @@ class RunRecoveryMixin:
         )
         for key in stale_contract_keys:
             state.context.delete(key)
+        state.context.delete("__artifact_progress__")
         raw_files = snapshot.get("__artifact_files__")
         if isinstance(raw_files, list):
             state.context.set(
@@ -401,4 +402,3 @@ class RunRecoveryMixin:
                     not in generation_owners
                 ],
             )
-

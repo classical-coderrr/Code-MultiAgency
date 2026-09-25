@@ -65,6 +65,21 @@ def test_frontend_unknown_api_is_rejected_with_owner():
     assert "/api/student/list" in failure["message"]
 
 
+def test_encoded_id_template_literal_matches_frozen_detail_route():
+    _, compiled = _compiled()
+    source = (
+        "const API_BASE = '/api/students'; "
+        "fetch(`${API_BASE}/${encodeURIComponent(id)}`, { method: 'PUT' }); "
+        "fetch(`/api/students/${encodeURIComponent(id)}`, { method: 'DELETE' });"
+    )
+    checks = check_contract_conformance(compiled, [
+        {"step_id": "frontend", "name": "src/App.vue", "content": source},
+    ])
+    api = next(item for item in checks if item["id"] == "frontend-api-contract")
+    assert api["status"] == "passed"
+    assert "${encodeURIComponent" not in api["message"]
+
+
 def test_explicit_non_api_route_checks_frontend_backend_and_vite_proxy():
     compiled = {
         "openapi": {"paths": {
@@ -137,6 +152,82 @@ def test_database_schema_missing_entity_field_is_caught():
     failure = next(item for item in checks if item["id"] == "database-entity-contract")
     assert failure["status"] == "failed"
     assert "name" in failure["message"]
+
+
+def test_explicit_room_and_booking_entities_keep_both_user_named_crud_routes():
+    requirement = (
+        "开发酒店客房与预订管理系统，Spring Boot 3 + Vue 3/Vite + JPA/H2。"
+        "Room 实体字段 id(Long)、number(String)；Booking 实体字段 id(Long)、roomId(Long)、guestName(String)。"
+        "两实体分别提供 /api/rooms、/api/bookings 及各自 /{id} 的 CRUD。"
+    )
+    spec = CapabilityRouter().route(requirement)
+    assert set(spec.primary_entities) == {"Room", "Booking"}
+    decision = {
+        "project_type": "web_app", "backend_required": True,
+        "required_capabilities": ["frontend", "backend", "persistence"],
+        "delivery_contract": {
+            "entities": [
+                {"name": "Room", "fields": {"id": "Long", "number": "String"}},
+                {"name": "Booking", "fields": {"id": "Long", "roomId": "Long", "guestName": "String"}},
+            ],
+            "api_contract": [
+                {"entity_id": "Room", "path": "/api/rooms", "methods": ["GET", "POST", "PUT", "DELETE"]},
+                {"entity_id": "Booking", "path": "/api/bookings", "methods": ["GET", "POST", "PUT", "DELETE"]},
+            ],
+        },
+    }
+    contract = build_delivery_contract(requirement, decision, requirement_spec=spec.model_dump(mode="json"))
+    assert {row["path"] for row in contract["api_contract"]} == {"/api/rooms", "/api/bookings"}
+
+
+def test_default_spring_physical_naming_rejects_camelcase_sql_column():
+    compiled = {
+        "database_schema": {
+            "tables": {"order": {"entity_id": "Order", "columns": {"id": "Long", "productId": "Long"}}},
+        },
+    }
+    entity = {
+        "step_id": "backend", "name": "src/main/java/com/example/app/Order.java",
+        "content": '@Entity @Table(name="order") class Order { private Long id; private Long productId; }',
+    }
+    sql = {
+        "step_id": "database", "name": "src/main/resources/schema.sql",
+        "content": 'CREATE TABLE "order" (id BIGINT PRIMARY KEY, productId BIGINT NOT NULL);',
+    }
+
+    checks = {item["id"]: item for item in check_contract_conformance(compiled, [entity, sql])}
+    assert checks["database-entity-contract"]["status"] == "passed"
+    assert checks["database-physical-column-contract"]["status"] == "failed"
+    assert checks["database-physical-column-contract"]["target"] == "database"
+    assert checks["database-physical-column-contract"]["evidence"]["relatedFiles"] == [sql["name"]]
+
+    sql["content"] = sql["content"].replace("productId BIGINT", "product_id BIGINT")
+    checks = {item["id"]: item for item in check_contract_conformance(compiled, [entity, sql])}
+    assert checks["database-physical-column-contract"]["status"] == "passed"
+
+
+def test_order_entity_table_must_quote_frozen_sql_keyword_without_renaming_it():
+    compiled = {
+        "database_schema": {"tables": {"order": {"entity_id": "Order", "columns": {"id": "Long"}}}},
+        "backend_dto": {"Order": "Order(Long id)"},
+    }
+    entity = {
+        "step_id": "backend", "name": "src/main/java/com/example/app/Order.java",
+        "content": '@Entity @Table(name="order") class Order { private Long id; }',
+    }
+    checks = {item["id"]: item for item in check_contract_conformance(compiled, [entity])}
+    assert checks["backend-table-contract"]["status"] == "passed"
+    assert checks["backend-reserved-table-contract"]["status"] == "failed"
+    assert checks["backend-reserved-table-contract"]["evidence"]["relatedFiles"] == [entity["name"]]
+
+    entity["content"] = r'@Entity @Table(name="\"order\"") class Order { private Long id; }'
+    checks = {item["id"]: item for item in check_contract_conformance(compiled, [entity])}
+    assert checks["backend-table-contract"]["status"] == "passed"
+    assert checks["backend-reserved-table-contract"]["status"] == "passed"
+
+    entity["content"] = '@Entity class Order { private Long id; }'
+    checks = {item["id"]: item for item in check_contract_conformance(compiled, [entity])}
+    assert checks["backend-reserved-table-contract"]["status"] == "failed"
 
 
 def test_backend_entity_field_type_must_match_database_contract():
@@ -223,6 +314,17 @@ def test_file_plan_rejects_missing_provider_and_dependency_cycle():
     ]
     with pytest.raises(ValueError, match="存在环"):
         enforce_artifact_plan([ArtifactFileSpec("src/App.vue", "vue", "page", 500)], owner="frontend", compiled_contract=broken)
+
+
+def test_compiler_rejects_duplicate_paths_before_freezing_parallel_owner_plan():
+    blueprint = {
+        "backend": {"stack": "springboot"},
+        "frontend": {"stack": "none"},
+        "database": {"mode": "none"},
+        "entities": [{"id": "Application"}, {"id": "application"}],
+    }
+    with pytest.raises(ValueError, match="duplicate path"):
+        ContractCompiler()._file_plan(blueprint)
 
 
 def test_explicit_student_requirement_overrides_wrong_model_product_entity():

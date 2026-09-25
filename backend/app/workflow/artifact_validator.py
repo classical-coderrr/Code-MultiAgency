@@ -24,6 +24,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
 import httpx
+import yaml
+from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from ..services.artifact_paths import normalize_artifact_path
 from .integration_gate import IntegrationGate
@@ -101,6 +103,7 @@ class _SpringCrudSpec:
     record_id_field: str = "id"
     detail_required: bool = False
     database_probe_path: str = ""
+    entity_id: str = ""
 
 
 class ArtifactValidator:
@@ -108,6 +111,43 @@ class ArtifactValidator:
 
     _package_import = re.compile(r"(?:from|import)\s*[\"']([^\"']+)[\"']")
     _java_package = re.compile(r"^\s*package\s+([A-Za-z_][\w.]*)\s*;", re.MULTILINE)
+
+    def validate_owner_preflight(self, raw_files: list[dict[str, Any]], owner: str) -> ArtifactValidationResult:
+        """Cheap owner-only checks before the independent integration Tester.
+
+        Do not evaluate a cross-agent contract against incomplete parallel
+        branches. This gate never claims build, browser or API success.
+        """
+        files, error = self._normalize_files(raw_files)
+        target = str(owner or "").strip().lower()
+        if error:
+            return ArtifactValidationResult("failed", error, (target,), (
+                ValidationCheck("artifact-files", target, "文件清单", "failed", error),
+            ))
+        checks: list[ValidationCheck] = []
+        if target == "frontend":
+            if "package.json" in files:
+                checks.extend(self._frontend_structure(Path("."), files))
+            else:
+                html_name = next((name for name in ("index.html", "src/main/resources/static/index.html") if name in files), None)
+                if html_name:
+                    html_error = self._html_error(files[html_name])
+                    checks.append(ValidationCheck("static-html", "frontend", "HTML 结构", "failed" if html_error else "passed", html_error or "HTML 结构完整。"))
+                else:
+                    checks.append(ValidationCheck("frontend-entry", "frontend", "前端入口", "failed", "缺少可验证的前端入口。"))
+        elif target == "backend":
+            checks.extend(self._backend_structure(Path("."), files))
+        elif target == "database":
+            has_schema = any(name.endswith(("schema.sql", ".sql")) for name in files)
+            checks.append(ValidationCheck("database-schema-file", "database", "数据库 Schema", "passed" if has_schema else "failed", "已生成 SQL Schema。" if has_schema else "缺少 SQL Schema 文件。"))
+        else:
+            return ArtifactValidationResult("blocked", "没有该责任方的早期验证档位。", (target,), ())
+        failed = [check for check in checks if check.status == "failed"]
+        return ArtifactValidationResult(
+            "failed" if failed else "passed",
+            "责任方预检失败：" + "；".join(check.message for check in failed[:3]) if failed else "责任方结构预检通过；仍需最终构建、启动与集成验收。",
+            (target,), tuple(checks),
+        )
 
     async def validate(
         self,
@@ -165,6 +205,7 @@ class ArtifactValidator:
                 str(item.get("label") or "冻结合同一致性"),
                 str(item.get("status") or "failed"),
                 str(item.get("message") or ""),
+                evidence=item.get("evidence") if isinstance(item.get("evidence"), dict) else None,
             ))
 
         targets = self._targets(files, profile)
@@ -355,6 +396,7 @@ class ArtifactValidator:
         if not isinstance(raw_files, list) or not raw_files:
             return {}, "Run 没有可验证的结构化成果物。"
         files: dict[str, str] = {}
+        canonical_names: dict[str, str] = {}
         for item in raw_files:
             if not isinstance(item, dict):
                 continue
@@ -364,8 +406,10 @@ class ArtifactValidator:
                 return {}, "成果物包含不安全或无效的相对路径。"
             if not isinstance(content, str) or not content.strip():
                 return {}, f"成果物 {name} 没有非空文件内容。"
-            if name in files:
+            canonical_name = name.casefold()
+            if canonical_name in canonical_names:
                 return {}, f"成果物文件 {name} 被重复登记。"
+            canonical_names[canonical_name] = name
             files[name] = content
         return files, None
 
@@ -498,6 +542,7 @@ class ArtifactValidator:
                 checks.append(ValidationCheck("backend-resources", "backend", "后端配置目录", "failed", f"配置文件应放在 src/main/resources：{', '.join(misplaced_resources)}。"))
             else:
                 checks.append(ValidationCheck("backend-resources", "backend", "后端配置目录", "passed", "后端配置文件目录正确，或当前项目未声明运行配置。"))
+            checks.extend(self._spring_yaml_contract(files))
             h2_check = self._spring_h2_contract(files)
             if h2_check is not None:
                 checks.append(h2_check)
@@ -530,6 +575,56 @@ class ArtifactValidator:
             has_python = any(Path(name).suffix == ".py" for name in files)
             return [ValidationCheck("backend-python-layout", "backend", "Python 后端源码", "passed" if has_python else "failed", "已找到 Python 源码。" if has_python else "未找到 Python 源码文件。")]
         return [ValidationCheck("backend-entry", "backend", "后端入口", "failed", "未找到可识别的后端构建入口。")]
+
+    @staticmethod
+    def _spring_yaml_contract(files: dict[str, str]) -> list[ValidationCheck]:
+        """Catch invalid Spring YAML before Maven or the startup repair loop.
+
+        PyYAML normally accepts duplicate mapping keys by keeping the last
+        value, whereas Spring's SnakeYAML rejects them at startup.
+        """
+        checks: list[ValidationCheck] = []
+        for name, content in files.items():
+            if Path(name).name.lower() not in {"application.yml", "application.yaml"}:
+                continue
+            try:
+                documents = list(yaml.compose_all(content))
+                visited: set[int] = set()
+
+                def inspect(node: Any) -> None:
+                    if id(node) in visited:
+                        return
+                    visited.add(id(node))
+                    if isinstance(node, MappingNode):
+                        keys: set[str] = set()
+                        for key, value in node.value:
+                            if not isinstance(key, ScalarNode):
+                                raise ValueError(f"第 {key.start_mark.line + 1} 行使用了非标量配置键")
+                            if key.value in keys:
+                                raise ValueError(f"第 {key.start_mark.line + 1} 行重复定义配置键 {key.value}")
+                            keys.add(key.value)
+                            inspect(value)
+                    elif isinstance(node, SequenceNode):
+                        for child in node.value:
+                            inspect(child)
+
+                for document in documents:
+                    if document is not None:
+                        if not isinstance(document, MappingNode):
+                            raise ValueError("配置文档根节点必须是键值映射")
+                        inspect(document)
+            except (yaml.YAMLError, ValueError) as exc:
+                checks.append(ValidationCheck(
+                    "backend-config-yaml", "backend", "Spring 配置 YAML", "failed",
+                    f"{name} 无法被 Spring 正常加载：{exc}",
+                    evidence={"file": name, "reason": str(exc)},
+                ))
+            else:
+                checks.append(ValidationCheck(
+                    "backend-config-yaml", "backend", "Spring 配置 YAML", "passed",
+                    f"{name} 语法与配置键检查通过。", evidence={"file": name},
+                ))
+        return checks
 
     @staticmethod
     def _spring_h2_contract(files: dict[str, str]) -> ValidationCheck | None:
@@ -761,9 +856,10 @@ class ArtifactValidator:
             )
         }
         problems: list[str] = []
-        if not matching_paths:
+        unmatched_paths = frontend_paths - matching_paths
+        if unmatched_paths:
             problems.append(
-                f"前端 API 路径 {', '.join(sorted(frontend_paths))} 与 Controller 路径 "
+                f"前端 API 路径 {', '.join(sorted(unmatched_paths))} 与 Controller 路径 "
                 f"{', '.join(sorted(normalized_backend_bases)) or '（未识别）'} 不一致"
             )
         if not has_json_controller:
@@ -893,7 +989,11 @@ class ArtifactValidator:
                         continue
                     payload = api.get("payload") or {}
                     marker = next((key for key, value in payload.items() if isinstance(value, str) and key != api.get("identity_field", "id")), "")
-                    crud_specs.append(_SpringCrudSpec(api["path"], payload, marker, frozenset(methods), api.get("identity_field", "id"), api.get("detail_required", False), database_probe_path))
+                    crud_specs.append(_SpringCrudSpec(
+                        api["path"], payload, marker, frozenset(methods),
+                        api.get("identity_field", "id"), api.get("detail_required", False),
+                        database_probe_path, str(api.get("entity_id") or ""),
+                    ))
                 crud_spec = None
             await self._validate_startup(
                 root,
@@ -1182,8 +1282,14 @@ class ArtifactValidator:
                         break
                     await asyncio.sleep(0.25)
                 if status == "passed":
+                    # Startup polling must fail quickly, but the first JPA
+                    # transaction after startup can take longer than 1 s.
+                    # Use a separate bounded read budget for integration work.
+                    client.timeout = httpx.Timeout(5.0, connect=0.5)
                     for spec in (*crud_specs, *((crud_spec,) if crud_spec is not None else ())):
-                        integration_checks.append(await self._probe_spring_crud(client, f"http://127.0.0.1:{port}", spec))
+                        integration_checks.append(await self._probe_spring_crud_with_fixtures(
+                            client, f"http://127.0.0.1:{port}", spec, crud_specs,
+                        ))
                 if status == "passed" and page_paths:
                     integration_checks.extend(await self._probe_pages(client, f"http://127.0.0.1:{port}", page_paths, target))
                 if status == "passed" and browser_contract and browser_contract.get("browser_required"):
@@ -1254,18 +1360,21 @@ class ArtifactValidator:
                 "evidenceDir": str(contract.get("_validation_evidence_dir") or ""),
                 "evidenceId": f"browser-{uuid.uuid4().hex[:12]}",
             }, ensure_ascii=False).encode("utf-8")
-            outcome = await self._run_command(node, [str(script)], root, 90, input_data=spec)
+            # Browser probes emit one structured JSON line containing the phase,
+            # failure and evidence. Clipping before parsing can cut that line in
+            # half and misclassify a real browser result as an unknown failure.
+            outcome = await self._run_command(node, [str(script)], root, 90, input_data=spec, clip_output=False)
             try:
                 data = json.loads(outcome.output.strip().splitlines()[-1])
             except (ValueError, IndexError):
                 data = {"status": "failed", "message": outcome.output[-3000:]}
             status = "passed" if outcome.returncode == 0 and data.get("status") == "passed" else "blocked" if "Cannot find module" in outcome.output or "Executable doesn't exist" in outcome.output else "failed"
             browser_evidence = self._browser_evidence(data, path)
-            checks.append(ValidationCheck("browser-render", "frontend", "页面浏览器验证", status, data.get("message") or "页面已真实渲染，无同源资源错误或 JavaScript 异常。", duration_ms=outcome.duration_ms, output=outcome.output, evidence=browser_evidence))
+            checks.append(ValidationCheck("browser-render", "frontend", "页面浏览器验证", status, data.get("message") or "页面已真实渲染，无同源资源错误或 JavaScript 异常。", duration_ms=outcome.duration_ms, output=self._clip_output(outcome.output), evidence=browser_evidence))
             if contract.get("crud_required") and contract.get("backend_stack") != "none":
-                checks.append(ValidationCheck("browser-crud", "frontend", "浏览器 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已通过真实页面完成新增、查询、修改、删除" if data.get("uiCrud") else "真实页面 CRUD 未通过，不能以 API 测试替代。", evidence=browser_evidence))
+                checks.append(ValidationCheck("browser-crud", "frontend", "浏览器 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已通过真实页面完成新增、查询、修改、删除" if data.get("uiCrud") else f"真实页面 CRUD 未通过（{data.get('phase') or '未知步骤'}）：{str(data.get('message') or '未获得浏览器错误')[:400]}", evidence=browser_evidence))
             elif contract.get("crud_required"):
-                checks.append(ValidationCheck("browser-local-crud", "frontend", "浏览器本地 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已验证新增、刷新后持久化、编辑与删除" if data.get("uiCrud") else "本地 CRUD 未通过真实浏览器验证。", evidence={**browser_evidence, "persistentAcrossReload": bool(data.get("uiCrud"))}))
+                checks.append(ValidationCheck("browser-local-crud", "frontend", "浏览器本地 CRUD 操作", status if data.get("uiCrud") or status == "blocked" else "failed", "已验证新增、刷新后持久化、编辑与删除" if data.get("uiCrud") else f"本地 CRUD 未通过（{data.get('phase') or '未知步骤'}）：{str(data.get('message') or '未获得浏览器错误')[:400]}", evidence={**browser_evidence, "persistentAcrossReload": bool(data.get("uiCrud"))}))
         return checks
 
     @staticmethod
@@ -1277,6 +1386,7 @@ class ArtifactValidator:
 
         return {
             "path": path,
+            "phase": str(data.get("phase") or ""),
             "uiCrud": bool(data.get("uiCrud")),
             "visibleTextChars": int(data.get("visibleTextChars", 0) or 0),
             "screenshotPath": str(data.get("screenshotPath") or ""),
@@ -1288,6 +1398,21 @@ class ArtifactValidator:
             "crudStates": bounded_list("crudStates", 8),
         }
 
+    async def _ensure_joint_frontend_dependencies(self, root: Path, executable: str) -> ValidationCheck | None:
+        """A targeted backend gate uses a fresh workspace, not the prior npm install."""
+        if (root / "node_modules" / "vite").exists():
+            return None
+        install_args = (
+            ["ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+            if (root / "package-lock.json").exists()
+            else ["install", "--ignore-scripts", "--no-audit", "--no-fund"]
+        )
+        outcome = await self._run_command(executable, install_args, root, 120.0)
+        return self._command_check(
+            "frontend-install", "frontend", "安装联调前端依赖",
+            self._display_command(executable, install_args), outcome,
+        )
+
     async def _probe_joint_frontend(self, root: Path, backend_port: int, files: dict[str, str], contract: dict[str, Any], client: httpx.AsyncClient) -> list[ValidationCheck]:
         """Keep backend/H2 alive while exercising Vue UI through its own proxy."""
         import socket
@@ -1297,6 +1422,9 @@ class ArtifactValidator:
         script = next((name for name in ("dev", "start", "preview") if name in self._json_scripts(files.get("package.json", ""))), None)
         if not script:
             return [ValidationCheck("browser-render", "frontend", "页面浏览器验证", "failed", "缺少前端启动脚本。")]
+        install_check = await self._ensure_joint_frontend_dependencies(root, executable)
+        if install_check is not None and install_check.status != "passed":
+            return [install_check]
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
@@ -1310,7 +1438,7 @@ class ArtifactValidator:
                     response = await client.get(f"http://127.0.0.1:{port}/")
                     if response.status_code == 200:
                         page_checks = await self._probe_pages(client, f"http://127.0.0.1:{port}", tuple(contract.get("entrypoints", ["/"])), "frontend")
-                        return [*page_checks, *await self._probe_browser(root, f"http://127.0.0.1:{port}", contract)]
+                        return [*([install_check] if install_check else []), *page_checks, *await self._probe_browser(root, f"http://127.0.0.1:{port}", contract)]
                 except httpx.RequestError:
                     pass
                 await asyncio.sleep(0.25)
@@ -1341,6 +1469,48 @@ class ArtifactValidator:
         mode = contract.get("page_mode")
         if mode == "static_rest" and "src/main/resources/static/index.html" not in files:
             checks.append(ValidationCheck("spring-page-contract", "frontend", "页面打包合同", "failed", "缺少 src/main/resources/static/index.html；根目录 HTML 不会被 Spring Boot 打包。"))
+        if contract.get("browser_required") and contract.get("crud_required"):
+            ui_sources = {
+                name: source for name, source in files.items()
+                if name.endswith((".html", ".vue", ".js", ".jsx", ".ts", ".tsx"))
+            }
+            if ui_sources:
+                ui_text = "\n".join(ui_sources.values())
+                required_ids = (contract.get("ui_test_ids") or {
+                    "add": "crud-add", "save": "crud-save", "row": "crud-row",
+                    "edit": "crud-edit", "delete": "crud-delete",
+                })
+                missing_ids = [
+                    str(value) for key, value in required_ids.items()
+                    if key != "field" and isinstance(value, str) and value not in ui_text
+                ]
+                crud_apis = [
+                    item for item in contract.get("api_contract") or []
+                    if isinstance(item, dict) and item.get("payload") and "POST" in (item.get("methods") or [])
+                ]
+                if len(crud_apis) > 1:
+                    missing_ids.extend(
+                        f"crud-panel-{item.get('entity_id')}"
+                        for item in crud_apis
+                        if not item.get("entity_id") or f"crud-panel-{item['entity_id']}" not in ui_text
+                    )
+                if missing_ids:
+                    affected_components = sorted({
+                        name for marker in missing_ids if marker.startswith("crud-panel-")
+                        for name in ui_sources
+                        if name.endswith(f"/{marker.removeprefix('crud-panel-')}Manager.vue")
+                    })
+                    checks.append(ValidationCheck(
+                        "frontend-ui-hooks", "frontend", "浏览器 CRUD 控件合同", "failed",
+                        "页面缺少浏览器验收所需的控件标识：" + ", ".join(missing_ids),
+                        output="关联前端文件：" + ", ".join(sorted(ui_sources)),
+                        evidence={"files": affected_components} if affected_components else None,
+                    ))
+                else:
+                    checks.append(ValidationCheck(
+                        "frontend-ui-hooks", "frontend", "浏览器 CRUD 控件合同", "passed",
+                        "浏览器 CRUD 控件标识已声明；真实交互仍需浏览器验证。",
+                    ))
         if contract.get("crud_required") and contract.get("backend_stack") != "none":
             api = contract.get("api_contract") or []
             if not any(item.get("payload") and {"GET", "POST", "DELETE"}.issubset(item.get("methods", [])) and set(item.get("methods", [])) & {"PUT", "PATCH"} for item in api):
@@ -1532,6 +1702,77 @@ public class {class_name} {{
         return result
 
     @staticmethod
+    async def _probe_spring_crud_with_fixtures(
+        client: httpx.AsyncClient,
+        base_url: str,
+        spec: _SpringCrudSpec,
+        all_specs: tuple[_SpringCrudSpec, ...],
+    ) -> ValidationCheck:
+        """Create valid referenced records without replacing the real CRUD probe.
+
+        Each entity is still tested through POST/GET/PUT/DELETE. A child such
+        as Order needs an existing Product; the fixture is created separately
+        and removed after the child probe, so a valid referential-integrity
+        check is not mistaken for a broken POST endpoint.
+        """
+        payload = dict(spec.payload)
+        fixtures: list[tuple[str, Any]] = []
+        result: ValidationCheck | None = None
+        cleanup_error = ""
+        try:
+            for field in payload:
+                if field == spec.record_id_field or not field.lower().endswith("id"):
+                    continue
+                parent_name = field[:-2].casefold()
+                parent = next((item for item in all_specs if item.entity_id.casefold() == parent_name), None)
+                if parent is None:
+                    continue
+                parent_payload = dict(parent.payload)
+                quantity = payload.get("quantity")
+                if isinstance(quantity, (int, float)) and isinstance(parent_payload.get("stock"), (int, float)):
+                    parent_payload["stock"] = max(parent_payload["stock"], quantity + 1)
+                create = await client.post(f"{base_url}{parent.collection_path}", json=parent_payload)
+                if not 200 <= create.status_code < 400:
+                    raise RuntimeError(
+                        f"依赖记录 {parent.entity_id} 创建失败：HTTP {create.status_code} · {create.text[:300]}"
+                    )
+                try:
+                    record = create.json()
+                except ValueError as exc:
+                    raise RuntimeError(f"依赖记录 {parent.entity_id} 创建后未返回 JSON") from exc
+                parent_id = record.get(parent.record_id_field) if isinstance(record, dict) else None
+                if parent_id is None:
+                    raise RuntimeError(f"依赖记录 {parent.entity_id} 创建后缺少 {parent.record_id_field}")
+                fixtures.append((f"{base_url}{parent.collection_path}/{parent_id}", parent_id))
+                payload[field] = parent_id
+            result = await ArtifactValidator._probe_spring_crud(
+                client, base_url, replace(spec, payload=payload),
+            )
+        except (httpx.RequestError, RuntimeError) as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            result = ValidationCheck(
+                "spring-h2-crud", "backend", "前后端与 H2 CRUD 联调", "failed",
+                f"{spec.collection_path} 关联测试数据准备失败：{detail}",
+                evidence={"phase": "related-fixture", "path": spec.collection_path},
+            )
+        finally:
+            for url, _ in reversed(fixtures):
+                try:
+                    delete = await client.delete(url)
+                    if not 200 <= delete.status_code < 400:
+                        cleanup_error = f"清理关联测试记录返回 HTTP {delete.status_code}"
+                except httpx.RequestError as exc:
+                    cleanup_error = f"清理关联测试记录失败：{type(exc).__name__}"
+        assert result is not None
+        if cleanup_error and result.status == "passed":
+            return ValidationCheck(
+                "spring-h2-crud", "backend", "前后端与 H2 CRUD 联调", "failed",
+                f"{spec.collection_path} {cleanup_error}",
+                evidence={"phase": "related-fixture-cleanup", "path": spec.collection_path},
+            )
+        return result
+
+    @staticmethod
     async def _probe_spring_crud(
         client: httpx.AsyncClient,
         base_url: str,
@@ -1543,6 +1784,7 @@ public class {class_name} {{
         path = spec.collection_path
         created_id: Any = None
         storage_table: str | None = None
+        phase = "create"
         try:
             create = await client.post(f"{base_url}{path}", json=spec.payload)
             if not 200 <= create.status_code < 400:
@@ -1561,6 +1803,7 @@ public class {class_name} {{
             if isinstance(created, dict):
                 created_id = created.get(spec.record_id_field)
 
+            phase = "list-after-create"
             listing = await client.get(f"{base_url}{path}")
             if not 200 <= listing.status_code < 300:
                 raise RuntimeError(f"GET {path} 返回 HTTP {listing.status_code}")
@@ -1581,30 +1824,47 @@ public class {class_name} {{
             if not any(isinstance(item, dict) and str(item.get(spec.record_id_field)) == str(created_id) for item in listed):
                 raise RuntimeError("POST 返回成功，但新增记录未出现在查询结果中")
             if spec.database_probe_path:
+                phase = "database-after-create"
                 tables = await ArtifactValidator._h2_rows(client, base_url + spec.database_probe_path)
                 storage_table = next((table for table, rows in tables.items() if any(ArtifactValidator._h2_record_matches(row, spec, created_id, spec.payload.get(spec.identity_field)) for row in rows)), None)
                 if storage_table is None:
                     raise RuntimeError("接口新增成功，但 H2 表中没有对应记录；可能使用内存 Map 或数据库字段映射错误")
             if spec.detail_required:
+                phase = "detail"
                 detail = await client.get(f"{base_url}{path}/{created_id}")
                 if not 200 <= detail.status_code < 300:
                     raise RuntimeError(f"详情 GET {path}/{{id}} 返回 HTTP {detail.status_code}")
 
             update_method = "PATCH" if "PATCH" in spec.expected_methods and "PUT" not in spec.expected_methods else "PUT"
             updated_payload = dict(spec.payload)
-            changed_fields: dict[str, Any] = {}
+            mutable_fields: list[tuple[int, str, Any]] = []
             for field, value in spec.payload.items():
-                if field == spec.record_id_field:
+                if field == spec.record_id_field or field.lower().endswith("id"):
                     continue
                 changed = ArtifactValidator._mutated_contract_value(value)
                 if changed != value:
+                    lowered = field.lower()
+                    priority = (
+                        0 if lowered in {"name", "title", "guestname", "number", "description"}
+                        else 1 if isinstance(value, str) and not re.search(r"status|state|type|date|time|email", lowered)
+                        else 2 if lowered in {"quantity", "stock"}
+                        else 3 if isinstance(value, (int, float))
+                        else 4
+                    )
+                    mutable_fields.append((priority, field, changed))
+            changed_fields: dict[str, Any] = {}
+            if mutable_fields:
+                safe_fields = [item for item in mutable_fields if item[0] < 4]
+                for _, field, changed in safe_fields or [min(mutable_fields, key=lambda item: (item[0], item[1]))]:
                     updated_payload[field] = changed
                     changed_fields[field] = changed
             if not changed_fields:
                 raise RuntimeError("CRUD 合同缺少可安全修改的字段，不能用未改变的数据冒充 UPDATE 验证")
+            phase = "update"
             update = await client.request(update_method, f"{base_url}{path}/{created_id}", json=updated_payload)
             if not 200 <= update.status_code < 400:
                 raise RuntimeError(f"{update_method} {path}/{{id}} 返回 HTTP {update.status_code}：{update.text[:500]}")
+            phase = "list-after-update"
             after_update = await client.get(f"{base_url}{path}")
             if not 200 <= after_update.status_code < 300:
                 raise RuntimeError(f"修改后 GET {path} 返回 HTTP {after_update.status_code}")
@@ -1624,6 +1884,7 @@ public class {class_name} {{
             if missing_updates:
                 raise RuntimeError("修改接口返回成功，但查询结果未反映修改后的合同字段：" + "、".join(missing_updates))
             if storage_table:
+                phase = "database-after-update"
                 tables = await ArtifactValidator._h2_rows(client, base_url + spec.database_probe_path)
                 stored_record = next((row for row in tables.get(storage_table, []) if str(ArtifactValidator._h2_column(row, spec.record_id_field)) == str(created_id)), None)
                 if stored_record is None:
@@ -1635,9 +1896,11 @@ public class {class_name} {{
                 if missing_storage_updates:
                     raise RuntimeError("接口修改成功，但 H2 未更新合同字段：" + "、".join(missing_storage_updates))
 
+            phase = "delete"
             delete = await client.delete(f"{base_url}{path}/{created_id}")
             if not 200 <= delete.status_code < 400:
                 raise RuntimeError(f"DELETE {path}/{{id}} 返回 HTTP {delete.status_code}：{delete.text[:500]}")
+            phase = "list-after-delete"
             after_delete = await client.get(f"{base_url}{path}")
             if not 200 <= after_delete.status_code < 300:
                 raise RuntimeError(f"删除后 GET {path} 返回 HTTP {after_delete.status_code}")
@@ -1652,17 +1915,21 @@ public class {class_name} {{
             if any(isinstance(item, dict) and str(item.get(spec.record_id_field)) == str(created_id) for item in remaining):
                 raise RuntimeError("DELETE 返回成功，但记录仍存在于查询结果中")
             if storage_table:
+                phase = "database-after-delete"
                 tables = await ArtifactValidator._h2_rows(client, base_url + spec.database_probe_path)
                 if any(str(ArtifactValidator._h2_column(row, spec.record_id_field)) == str(created_id) for row in tables.get(storage_table, [])):
                     raise RuntimeError("接口删除成功，但 H2 对应记录仍存在")
         except (httpx.RequestError, RuntimeError) as exc:
+            detail = str(exc).strip() or type(exc).__name__
             return ValidationCheck(
                 "spring-h2-crud",
                 "backend",
                 "前后端与 H2 CRUD 联调",
                 "failed",
-                f"H2 CRUD 闭环失败：{exc}。",
+                f"H2 CRUD 闭环失败（{phase}）：{detail}。",
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                evidence={"phase": phase, "exceptionClass": type(exc).__name__}
+                if isinstance(exc, httpx.RequestError) else None,
             )
         return ValidationCheck(
             "spring-h2-crud",
@@ -1720,7 +1987,7 @@ public class {class_name} {{
             raise RuntimeError("测试数据源不是可验证的 H2 数据库")
         return data["tables"]
 
-    async def _run_command(self, executable: str, args: list[str], cwd: Path, timeout: float, *, input_data: bytes | None = None) -> "_CommandOutcome":
+    async def _run_command(self, executable: str, args: list[str], cwd: Path, timeout: float, *, input_data: bytes | None = None, clip_output: bool = True) -> "_CommandOutcome":
         started = time.perf_counter()
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         try:
@@ -1741,7 +2008,9 @@ public class {class_name} {{
         communication = asyncio.create_task(asyncio.to_thread(process.communicate, input_data))
         try:
             output_bytes, _ = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
-            output = self._clip_output((output_bytes or b"").decode("utf-8", errors="replace"))
+            output = (output_bytes or b"").decode("utf-8", errors="replace")
+            if clip_output:
+                output = self._clip_output(output)
             return _CommandOutcome(process.returncode, output, int((time.perf_counter() - started) * 1000))
         except asyncio.TimeoutError:
             await self._terminate_process(process)
@@ -1749,7 +2018,9 @@ public class {class_name} {{
                 output_bytes, _ = await asyncio.wait_for(asyncio.shield(communication), timeout=5)
             except Exception:
                 output_bytes = b""
-            output = self._clip_output((output_bytes or b"").decode("utf-8", errors="replace"))
+            output = (output_bytes or b"").decode("utf-8", errors="replace")
+            if clip_output:
+                output = self._clip_output(output)
             return _CommandOutcome(None, f"命令超过 {timeout:g} 秒超时。\n{output}".strip(), int((time.perf_counter() - started) * 1000), timed_out=True)
         except asyncio.CancelledError:
             await self._terminate_process(process)

@@ -119,6 +119,38 @@ def test_api_contract_uses_explicit_entity_and_separate_detail_path():
     assert "Api" not in compiled["json_schema"]
 
 
+def test_stateless_api_uses_request_response_schemas_without_fake_entity_or_database():
+    value = blueprint(
+        frontend="html",
+        database="none",
+        api=[{
+            "path": "/api/convert",
+            "methods": ["POST"],
+            "fields": ["amount", "currency"],
+            "payload": {"amount": 100, "currency": "USD"},
+            "request_schema": {
+                "type": "object",
+                "properties": {"amount": {"type": "number"}, "currency": {"type": "string"}},
+                "required": ["amount", "currency"],
+            },
+            "response_schema": {
+                "type": "object",
+                "properties": {"convertedAmount": {"type": "number"}},
+            },
+        }],
+    )
+    value["entities"] = []
+    value["delivery_requirements"]["crud_required"] = False
+
+    compiled = ContractCompiler().compile(value)
+    operation = compiled["openapi"]["paths"]["/api/convert"]["post"]
+
+    assert operation["x-entity-id"] is None
+    assert operation["requestBody"]["content"]["application/json"]["schema"]["required"] == ["amount", "currency"]
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["convertedAmount"]["type"] == "number"
+    assert compiled["database_schema"]["tables"] == {}
+
+
 def test_ambiguous_api_entity_is_rejected_instead_of_guessed_from_api_prefix():
     rows = [{"path": "/api/items", "methods": ["POST"], "fields": ["name"], "payload": {"name": "x"}}]
     value = blueprint(entities=[entity("Product"), entity("Order")], api=rows)
@@ -182,6 +214,45 @@ def test_blueprint_compiler_emits_manifest_ownership_role_contracts_and_file_dag
     assert enriched["role_contracts"]["backend"]["apis"]
     assert enriched["role_contracts"]["frontend"]["file_plan"]
     assert any(item["provides"] == ["ProductService"] for item in enriched["file_dependencies"])
+
+
+def test_multi_entity_vue_file_plan_splits_managers_and_keeps_root_small():
+    compiled = ContractCompiler().compile(blueprint(entities=[entity("Student"), entity("Course")], api=[
+        {"entity_id": "Student", "path": "/api/students", "methods": ["GET", "POST", "PUT", "DELETE"],
+         "fields": ["id", "name"], "payload": {"name": "A"}, "identity_field": "id"},
+        {"entity_id": "Course", "path": "/api/courses", "methods": ["GET", "POST", "PUT", "DELETE"],
+         "fields": ["id", "name"], "payload": {"name": "B"}, "identity_field": "id"},
+    ]))
+    by_path = {row["path"]: row for row in compiled["file_plan"]}
+    managers = {"src/components/StudentManager.vue", "src/components/CourseManager.vue"}
+    assert managers.issubset(by_path)
+    assert set(by_path["src/App.vue"]["depends_on_files"]) == managers
+    assert set(by_path["src/App.vue"]["requires"]) == {"StudentManagerComponent", "CourseManagerComponent"}
+    planned, denied = enforce_artifact_plan(
+        [ArtifactFileSpec("src/App.vue", "vue", "Root", 3500)], owner="frontend", compiled_contract=compiled,
+    )
+    assert not denied
+    selected = {item.name: item for item in planned}
+    assert managers.issubset(selected)
+    assert selected["src/App.vue"].estimated_tokens <= 1000
+    assert all(selected[path].estimated_tokens >= 2400 for path in managers)
+    assert [item.name for item in planned].index("src/App.vue") > max(
+        [item.name for item in planned].index(path) for path in managers
+    )
+    assert set(by_path["src/main/java/com/example/app/StudentService.java"]["depends_on_files"]) == {
+        "src/main/java/com/example/app/Student.java",
+        "src/main/java/com/example/app/StudentRepository.java",
+    }
+    assert set(by_path["src/main/java/com/example/app/CourseController.java"]["depends_on_files"]) == {
+        "src/main/java/com/example/app/Course.java",
+        "src/main/java/com/example/app/CourseService.java",
+    }
+
+
+def test_single_entity_vue_plan_keeps_existing_app_component():
+    by_path = {row["path"]: row for row in ContractCompiler().compile(blueprint())["file_plan"]}
+    assert not any(path.startswith("src/components/") for path in by_path)
+    assert by_path["src/App.vue"]["requires"] == ["ApiContract"]
 
 
 def test_dependency_files_are_deterministic_and_have_no_duplicate_h2():

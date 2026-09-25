@@ -274,11 +274,14 @@ Agent 定义位于 [backend/agents](backend/agents)，包含系统提示词、�
 - `defaults` / `runtime`：默认 `max_tokens`、重试次数和思考强度；
 - `failure_policy`：失败后停止、跳过或继续；
 - `generation_mode: single | artifacts | auto`：单次文本或按文件生成源码；
+- `generation_mode: coding_loop`：受控 Plan → Act → Observe 循环，以 Agent 所有权合同限制文件创建/定点修改；
 - `skills` / `skill_mode`：按角色注入后端 API、前端实现、成果物生成等 Skill；
 - `validation`：构建、启动、浏览器验收和自动修复门禁；
 - `meta.delivery_contract`：冻结实体、API、依赖、文件归属和交付证据。
 
 Executor 通过 `RequirementSpec → DeliveryContract → ProjectBlueprint → ContractCompiler` 固定实现边界，再把角色合同分别交给 Database、Backend、Frontend 和 Tester，减少接口、字段和文件归属漂移。
+
+代码公司中的 Database、Backend、Frontend 默认在各自隔离的 Workspace 里通过工具逐步创建和修改文件。模型每轮只提交一个工具动作；SQLite 记录模型轮次预算和文件动作意图，重启后核对已完成动作而不盲目重放。Tester 的确定性失败会按责任 Agent 路由到 Candidate Workspace：先执行目标 Gate，再执行完整回归；未推进或破坏既有通过项的候选会撤回。Agent 循环不执行任意 Shell，构建、启动、浏览器联调和交付判定仍由外层 Gate 负责。
 
 ## API 概览
 
@@ -334,6 +337,12 @@ python backend/scripts/regression_suite.py --cases backend/scripts/regression_ca
 
 ```powershell
 python backend/scripts/regression_suite.py --live --auto-approve --cases backend/scripts/regression_cases.json --repeat 2 --timeout 1800
+```
+
+需要进行难度递增的 10 场景实测时，使用独立用例集；报告会在每个场景完成后同时更新 JSON 与 Markdown：
+
+```powershell
+python backend/scripts/regression_suite.py --live --auto-approve --cases backend/scripts/regression_cases_swe_10.json --timeout 1800
 ```
 
 浏览器交付门禁需要 Playwright/Chromium：

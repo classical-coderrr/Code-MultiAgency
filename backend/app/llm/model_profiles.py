@@ -23,6 +23,7 @@ class ModelProfile:
     max_output_tokens: int = 6000
     transport: str = "openai_compatible"
     configuration_warning: str | None = None
+    supports_json_mode: bool = False
 
     @property
     def supported_levels(self) -> tuple[str, ...]:
@@ -84,6 +85,7 @@ def resolve_model_profile(provider_name: str, base_url: str, model_name: str) ->
             protocol="deepseek",
             supports_thinking=True,
             default_level="high",
+            supports_json_mode=True,
         )
 
     if model.startswith("qwen3"):
@@ -92,6 +94,7 @@ def resolve_model_profile(provider_name: str, base_url: str, model_name: str) ->
             protocol="qwen",
             supports_thinking=True,
             default_level="max" if model.startswith("qwen3.8") else "high",
+            supports_json_mode=True,
         )
 
     return ModelProfile(family="unknown", protocol="generic", supports_thinking=False)

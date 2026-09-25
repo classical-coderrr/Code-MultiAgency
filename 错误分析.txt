@@ -1359,3 +1359,181 @@ Agent Team 错误分析记录（历史重总结版）
 8. 将重试/合同重开/失效清理抽到 run_recovery.py，将证据定位/Owner 重放保护/修复候选选择抽到 artifact_repair_support.py；WorkflowExecutor 从 3904 行降到 2909 行，恢复为编排门面。
 9. 新增企业恢复矩阵，覆盖静态 HTML、localStorage、Spring Boot + HTML、Vue + Spring Boot、双实体 CRUD，以及故意注入的漏 entity_id、漏文件、错误路由和验证器内部故障；所有失败必须保持 Gate=failed，禁止改成 skipped 伪造通过。
 验证结果：定向恢复、Artifact、责任路由、需求确认与结构守卫测试 111 项通过；企业恢复矩阵 12 项通过；后端全量测试 737 项通过、0 失败、1 项按环境跳过；前端 TypeScript 检查和 Vite 生产构建通过。真实云端模型输出质量与第三方服务波动仍需通过实际 Run 持续观察，但失败将保留证据、有限回退并可恢复，不再无限循环或静默改错 Agent。
+
+【2026-09-23】* 十档回归中的跨层修复证据丢失、浏览器编辑竞态及真实交付超时
+错误要点：旧十档回归的 L2/L3 全部未交付。05 图书场景先后出现 Maven 测试失败、浏览器找不到 CRUD 控件；04 便签场景浏览器在更新后仍看到旧标题，重复修复仍超时。架构多实体漏项和表名不一致也会在错误责任方或无充分证据时反复修复。测试报告中的 TIMEOUT 不能算成功。
+根因分析：跨层失败虽能分类给多个 Agent，修复执行却只按校验器原始 target 取证据，次要责任 Agent 得不到错误；架构回退补丁对缺失实体/API 的插入和范围约束不足；文件生成重复注入大量无关源码，且没有把冻结表名、API 路径和 CRUD 控件标识放到对应文件提示中。浏览器验证点击编辑后立即填写，未等待异步详情 GET 填充表单，GET 可覆盖新值，造成 PUT 200 但列表仍旧值的假失败。H2 请求异常的 str(exc) 可能为空，日志只显示“失败：。”。
+实际解决步骤：
+1. 修复跨层失败证据分发，使每个被判定的责任 Agent 都收到相关 ValidationCheck；保留结构化失败阶段、受影响文件与预期/实际值。
+2. 架构合同回退仅补写错误明确指出的缺失实体与 API，继续执行完整预检；冻结表名不一致时只在隔离候选中做精确注解修正，随后跑目标 Gate 与完整回归，不绕过合同。
+3. 文件生成只传直接依赖源码，并向对应 SQL、Java Entity、Controller、Frontend 文件注入冻结表名、API 路径和 CRUD 浏览器控件约束。
+4. 浏览器 CRUD 控件缺失提前由 frontend-ui-hooks Gate 报告给 Frontend；浏览器编辑测试等待当前记录实际进入表单后再修改，消除验证器自身竞态；新增慢速编辑表单的真实浏览器回归测试。
+5. H2 联调请求异常记录操作阶段及异常类型；空异常文本使用异常类名，避免空白主因，同时保持原有业务校验结果结构。
+验证结果：定向测试通过；2026-09-23 真实 04-spring-notes 回归最终 SUCCESS、deliverable=true、first_pass=true，Tester 的 Maven、H2、页面与浏览器 CRUD、最终交付门禁均通过，耗时 612.495 秒。此前 05-spring-books 在 900 秒内目标修复 Gate 已通过，但完整回归未结束，报告仍为 TIMEOUT、deliverable=false；此前 04-spring-notes 在浏览器竞态修复前 1200 秒超时，也不能计为通过。十档中其他 L2/L3 场景尚未重新全跑，不能据单个成功案例宣称总体成功率已提升；云端模型输入 Token 与总耗时仍偏高，需单独优化。
+
+【2026-09-23 补充】* 08 多实体回归暴露测试快照文件锁与本地模型调用超时
+错误要点：08 第一次重跑在架构生成期间因 `PermissionError: [WinError 5] evidence.json.tmp -> evidence.json` 被测试工具中断，属于平台写入冲突，不是 Agent 合同失败。修复测试工具后重跑，Architecture 合同目标 Gate 通过、人工审批自动完成、Database 完成；Frontend 的 `src/App.vue` 生成调用两次触及每次 120 秒上限，整条 Run 最终达到 1200 秒总时限，仍未交付。
+根因分析：Windows 读者短暂持有 `evidence.json` 时，原测试工具使用固定临时文件名且只尝试一次原子替换，碰到共享锁便终止 Run。第二次真实失败则是当前 `chatgpt_local` / Codex CLI 模型 `gpt-5.6-luna` 处理双实体 Vue 页面时的 Provider 调用超时；该失败发生在成果物生成阶段，不可归咎于 Architecture 漏 `entity_id`，也不能通过放宽合同伪造通过。
+实际解决步骤：1. 测试工具为每次证据快照使用唯一临时文件名；仅针对 Windows 共享锁错误 5/32 做有限退避重试，其他权限错误照常抛出。2. 增加模拟前两次替换被占用、第三次成功的自动回归测试。3. 重新执行相同 08 场景，确认架构合同与数据库节点已通过，同时如实保留 Frontend Provider 超时与总 Run 超时证据。
+验证结果：后端全量 748 通过、1 跳过；04-spring-notes 仍是本次唯一完整交付成功的 L2 真实案例。08-vue-courses 的架构阶段通过，但整体 `TIMEOUT`、`deliverable=false`。剩余问题：对复杂多实体页面，本地 Codex CLI 在 120 秒单次请求与 1200 秒总 Run 上限下仍可能超时；需另行评估用户配置的超时、模型吞吐、任务拆分与并发策略，不能宣称 L3 已跑通。
+
+【2026-09-23 补充】* 双实体 Vue 交付的生成拆分、修复推进与验证器误归责
+错误要点：08 双实体 Run 多次在 1200 秒内未交付。先是单个 App.vue 输出过大，之后出现合法的 Vue 动态 API 路径被误判、分页式第二管理视图未被浏览器测试切换、修复通过原目标 Gate 后因暴露新错误而被判“无进展”。真实 Run 还发现 application.yml 重复定义 spring.jpa 导致启动失败；另一轮目标 Gate 在新临时目录里缺少 Vite，却错误地把前端启动故障派给 Frontend Agent。
+根因分析：双实体页面缺少按实体划分的冻结文件计划；API 路径规范化未覆盖 encodeURIComponent(id)；浏览器验证默认认为所有 CRUD 面板同时可见；修复推进仅比较最终失败状态，没有记录旧 Gate 明确转为通过；目标验证每轮使用新临时目录，却没有复用或重新安装 npm 依赖；PyYAML 默认不拒绝重复键，原结构检查不能提前发现 Spring SnakeYAML 启动错误。
+实际解决步骤：1. 冻结文件计划按实体生成独立 Vue Manager 组件，App.vue 只负责组合/切换，并只向文件任务注入直接依赖和相关合同。2. 扩展动态 API 路径解析；浏览器测试只点击语义标签切换到目标实体，再执行真实 CRUD，同时等待异步编辑表单数据。3. 修复协调器接受旧目标 Gate 明确通过后的跨阶段进展，仍禁止已通过 Gate 回退。4. 对 Spring application.yml/application.yaml 增加快速语法与重复键检查，失败证据精确定位到配置文件。5. 目标 Gate 的新临时工作区缺少 Vite 时先有界安装依赖，不再把环境缺依赖误派给业务组件。
+验证结果：08-vue-courses 的最终真实 Run 位于 backend/data/regression/20260923-211350-572e005d，状态 SUCCESS、deliverable=true，Student/Course 的 Spring Boot + H2 CRUD、Vue 构建和真实浏览器双实体 CRUD、ZIP CRC 均通过。该 Run 仍需 4 轮修复，耗时 1409.354 秒、总 Token 659709，不能据此宣称复杂场景已高效或所有 L3 场景都能稳定通过。新增配置键和临时依赖安装专项测试通过；后端全量 769 通过、1 跳过。09 商品/订单场景仍在继续验证，结果需另记。
+
+【2026-09-23 补充】* 09 商品/订单关联 CRUD 的测试数据误判与 SQL 保留字
+错误要点：09-vue-orders 前两轮真实 Run 均达到 1800 秒上限，TIMEOUT、deliverable=false。首轮在修好 UI 控件标识后，Spring JPA 找不到 product_id 列，继而订单 POST 因引用不存在的 Product 返回 400；Tester 又把 productId 从 1 变成不存在的 2，订单 PUT 再次返回 400。第二轮提前修正 SQL 物理列名后，订单 POST 已成功，但查询订单列表返回 HTTP 500；浏览器只表现为“订单行不可见”，实际后端日志明确显示 SQL `FROM order` 语法错误。
+根因分析：冻结合同的 productId 是逻辑字段，Spring 默认 JPA 物理列名是 product_id；旧预检容许 schema.sql 使用 camelCase，却未比对默认物理命名。商品/订单是有外键关系的两个实体，旧 API 与浏览器探针各自独立 CRUD，先删除 Product 再创建 Order，或无依据地修改外键，测试数据违反了用户要求的“商品必须存在”约束。`order` 是 SQL 关键字，schema.sql 使用带引号的表名，而 `Order.java` 的 `@Table(name="order")` 未引用标识符，Hibernate 查询失败；旧修复器主要看到 browser-render 症状并误改 Frontend 或 pom.xml。
+实际解决步骤：1. 在合同预检中增加 database-physical-column-contract，按 Spring 默认命名核对实体字段与 SQL 物理列，失败证据指向 schema.sql。2. API CRUD 探针为外键字段创建真实父记录并清理，更新时不随机更换外键；浏览器探针同样仅用 API 建立测试前置数据，子实体的新增、查询、修改、删除仍逐项由真实页面完成。3. 增加 backend-reserved-table-contract，冻结表名为 order 时要求 JPA 注解引用保留字，证据指向 Order.java；生成提示明确保持表名、正确引用，禁止重命名或关闭 Schema 校验。4. 针对数据库列名、关联库存、浏览器关联记录和保留字分别新增回归测试。
+验证结果：第二轮真实 09 仍为 TIMEOUT、deliverable=false，不能算修好；上述补丁专项测试与后端全量 774 通过、1 跳过。第三轮同需求正在以新补丁重跑，需以最终报告和真实联调证据为准。
+
+【2026-09-23 补充验证】09-vue-orders 第三轮成功交付
+运行证据：backend/data/regression/20260923-224505-24f4a7a0/report.json；状态 SUCCESS、deliverable=true、first_pass=false，耗时 1408.52 秒，修复 2 轮，总 Token 609452。冻结数据库物理列名与 JPA 保留字表名 Gate、前端构建/启动、后端 Maven 测试/启动、Product 和 Order 各自的 H2 CRUD、真实浏览器双实体 CRUD、ZIP CRC 均为 passed；Tester 完整回归无已通过 Gate 倒退。生成的 OrderService 明确校验 Product 存在、quantity 为正且不超过 stock，OrderController 将参数错误转为 HTTP 400。仍需改进：耗时与输入 Token 明显偏高，首轮生成仍缺少两个 Vue 面板标识并触发修复；第三轮中的一次关联测试数据准备曾因首次请求短超时返回空错误，已把探针联调读取上限从启动轮询的 1 秒独立调整为 5 秒并显示异常类名，该超时调整在本次启动的旧进程中未生效，需以后续运行验证。
+
+【2026-09-24 *多轮：10-vue-room-bookings 架构漏实体与浏览器证据误解析】
+错误要点：首轮真实运行在合同冻结前反复报“缺少 /api/bookings”，Architecture 回退两轮仍失败。第二轮虽然生成文件、编译与服务联调基本完成，但浏览器 Gate 显示“未知步骤”和被截断的 JSON 片段，误把平台探针解析问题派给前端，触发无效的多文件整改；该旧进程已取消并保留报告，不计成功。
+根因：原始需求明确写出 Room、Booking 的“实体字段”，需求路由只识别内置 Room 别名，构建交付合同时过滤掉模型正确生成的 Booking 合同；另一个根因是浏览器探针输出包含 DOM、网络与表单证据，长度超过日志上限后，验证器先截断整行 JSON 再解析，丢失 status、phase 和 uiCrud。两处都是平台合同/验证器缺陷，不应靠放宽合同或让前端盲修。
+实际解决步骤：1. 在需求路由中按明确的“实体字段 / entity fields”声明抽取实体名，保留原始需求中的 Room 与 Booking，并加合同回归测试。2. 浏览器命令执行支持保留原始输出；先解析完整结构化 JSON、提取阶段与结果，再压缩持久化日志；加超过 18000 字符的探针与命令输出测试。3. 停止使用旧代码的无效 Run，启动新进程重跑同一需求，保留原有 Gate；前端首轮缺少两个 crud-panel 标识时，只在隔离候选中定点修复两个 Manager 组件，并通过目标 Gate 和完整回归后提升候选。
+验证结果：后端全量测试 781 通过、1 跳过；新运行 backend/data/regression/20260923-234405-9edfa687/report.json 为 SUCCESS、deliverable=true、first_pass=false，耗时 934.501 秒、自动修复 1 轮、总 Token 540557。Maven 测试/启动、Vue 安装/构建/启动、Room 与 Booking 的 API/H2 存储审计、真实浏览器双实体 CRUD、交付 ZIP CRC 均通过；无重试、续写或模型降级。剩余风险：首轮 Vue 生成仍常漏浏览器控件标识，需 1 轮修复；复杂场景耗时与输入 Token 仍偏高，一轮通过率尚未达到理想值。
+
+【2026-09-24】* Coding Agent Loop 协议、工具边界与中断恢复
+错误要点：现有编码循环可能把非 JSON 文本当最终结果、接受模型自报 verified、在同一轮连续执行多个预先生成的动作；自定义 Agent Prompt 会替换工具协议。默认工具策略还允许 Shell、删除和任意写入；动作历史只在内存，进程中断后无法辨认文件动作是否已生效。
+关键证据：backend/app/code_company/coding_loop.py、backend/app/platform/tool_gateway.py、backend/app/code_company/runtime.py、backend/app/repositories/sqlite.py、backend/app/workflow/executor.py。
+根因分析：Agent 内部执行协议与角色提示词未组合；成功状态由模型输出控制；Tool Gateway 缺少按 Agent 所有权区分的只读/写入权限；副作用没有先写持久动作意图，LangGraph Checkpoint 因而无法核对工具执行的微观状态。
+解决步骤：1. 保留 Agent 角色 Prompt 并追加强制单对象 JSON 协议；一轮仅接受一个工具动作，忽略模型的 verified 声明，非 JSON、length 截断和空 final 均不算完成。2. 为编码循环使用独立最小权限策略：只读检索、Git 状态/差异、归属范围内 create、带 SHA-256 前置条件的唯一补丁和分块追加；不开放 Shell、构建、测试、删除、移动或重命名。没有冻结文件归属时写入失败关闭。3. 在 SQLite 新增 coding_tool_actions，动作副作用前存入不含源码正文的意图摘要；写入后存储有界、脱敏结果；恢复时按文件前后哈希核对，结果不明时标 UNKNOWN，不盲目重放。4. 为循环设置最大轮次、工具动作数、总耗时和本步骤可见输出 Token 预算；重复失败指纹熔断，并在 provider 每次返回后立即持久化用量记录。5. 将候选提交与最终验证分开，通过 SSE 在 Agent 日志展示动作开始/完成、恢复核对、策略拒绝、协议错误、熔断和等待外层 Gate。
+验证结果：本次未启动服务、未运行自动化测试或真实端到端任务；本次实现需在下一轮按代码公司现有工作流执行定向测试及 L1/L2/L3 回归后确认。剩余风险：动作日志跨进程恢复与严格工具策略尚未用真实取消/进程重启场景实测；工具输出脱敏是通用模式匹配，不能替代密钥管理和源仓库保密策略。
+
+【2026-09-24】Coding Agent 文件计划、工作区隔离与 Artifact 合并回归修复
+错误要点：Agent 可能绕过冻结文件清单写入其他 Agent 的目录；跨 Agent 同名产物或大小写不同路径可能被归并器提前覆盖/丢弃，导致 Gate 看不到真实冲突；Auto Token 预算被当成单次请求上限，复杂任务产物不足；候选工作区与来源工作区隔离不完整；结构测试发现 WorkflowExecutor 超过既有 3200 行上限。
+根因分析：文件归属、重复产物归一化、代码循环预算和工作区生命周期分散在多个路径，缺少统一的大小写无关身份与明确写入边界；Auto 策略没有区分 Agent 累计预算与 Provider 单次输出上限；执行器策略辅助逻辑长期堆积在主类。
+实际解决步骤：1. 冻结文件计划精确授权优先于通配规则，并拒绝其他 Agent 的路径；Glob 按路径段匹配，避免单星号越过目录边界。2. 编译及 Artifact 合并使用大小写无关路径身份，重复清单在冻结前失败；同一 Owner 的重复版本可归一，不同 Owner 的冲突保留给 Artifact Gate 判定。3. Auto 预算按 Agent 负责的冻结文件规模计算累计上限，每次 Provider 请求仍受单次上限约束；必需文件未完成时不接受伪成功，并把缺失文件交回其 Owner 修复。4. 干净 Git 仓库使用本地隔离 worktree 和独立候选分支；脏仓库、非 Git 仓库或包含敏感环境文件时退回过滤后的文件快照；候选通过后只提升被管理的产物文件。5. 将审批耗时、交付证明、运行策略、清单归一化和跳过策略抽到 ExecutorSupportMixin，保留兼容入口并满足既有执行器文件大小门槛。
+验证结果：完整后端测试 807 passed、0 failed、1 skipped；相关定向测试 112 passed；Python compileall 通过；executor.py 为 3177 行，低于 3200 行结构门槛；git diff --check 无空白错误。未提交 Git commit，未运行需要真实云端密钥的模型端到端调用。
+剩余风险：worktree 的进程中断恢复和多实例同时写同一来源仓库仍需真实部署环境压力验证；Auto 预算是基于产物文件类型的有界估算，不保证所有模型都能一次生成完整代码，最终仍由文件 Gate 与测试证据兜底。
+
+【2026-09-24】* L1-L10 真实模型回归中断（完成前三题）
+错误要点：使用本机 Codex Provider 对难度递增的 10 个代码公司场景做真实回归时，用户中断了测试；已完成的前三题为 1 题可交付、2 题不可交付，首轮可交付为 0。L4 正在运行但没有形成结果，L5-L10 未执行。
+关键证据：Provider 为 chatgpt_local / gpt-5.6-luna（密钥未配置，使用本机登录态）；部分报告 backend/data/regression/20260924-224804-56ad43b8/report.json。L1 FAILED，350.923 秒，277445 Token，Frontend Coding Loop 因两次单对象 JSON 协议错误且无动作进展而熔断；L2 SUCCESS/deliverable，715.167 秒，302692 Token，修复一次后通过完整回归；L3 TIMEOUT，900.859 秒，414560 Token，Tester 通过后 Reviewer 超过 Run 总超时仍未完成。三题合计 994697 Token。用户中断后回归主进程结束，未发现对应 Worker 残留。
+根因分析：L1 失败位置已确认在 Coding Loop 输出协议不合规；模型为何在该任务连续返回不合规响应，待确认。L3 确认尾部 Reviewer 阶段耗时超过 900 秒总超时；是 Provider 延迟、Reviewer 调用还是其他阻塞，待确认。L4 及之后没有验证证据，不作推断。
+解决步骤：1. 使用隔离回归脚本和唯一新目录启动 10 个 L1-L10 样例，自动审批仅作用于本次测试 Run。2. 用户中断后立即停止回归进程；保留前三题的 report.json/report.md 及隔离运行证据，不清理或覆盖。3. 检查并确认已完成题目指标与 L4 未完成状态；没有宣称整组测试完成，也没有修改项目代码。
+验证结果：阶段性报告有效，前三题统计为成功/可交付 1/3、首轮通过 0/3、修复轮次 2 次、总耗时 1966.949 秒、Token 994697；L4-L10 未执行完成。后续继续前应确认是否恢复剩余 7 题，并重点评估本机 Provider Token 消耗及 Reviewer 的总超时配置。
+
+【2026-09-25】* L1-L8 真实模型回归续测失败分析
+错误要点：续测 L4-L8 后，8 个难度场景中仅 L2 被报告为可交付，L1、L4、L5、L6、L7、L8 失败，L3 超出回归总时限；首轮可交付仍为 0。多个场景在 Coding Loop 阶段因模型未遵守单对象 JSON 工具协议而无进展熔断，未进入完整 Tester/交付 Gate；另有审批状态冲突和总时限不足。
+关键证据：Provider 为本机 Codex `chatgpt_local / gpt-5.6-luna`。报告 `backend/data/regression/20260924-224804-56ad43b8/report.md` 与 `backend/data/regression/20260924-233310-aed56d2d/report.md` 合计 8 题、约 4803.8 秒、2,982,193 Token。L1 前端两次 `coding_loop.protocol_error` 后触发 `no_progress`，最终缺少结构化 Artifact，Tester/Reviewer 被跳过；L4 后端、L5 前后端、L8 前端重复 Coding Loop 协议错误并熔断；L6 报 `ValueError: Approval is already being resolved`，事件显示架构审批等待后运行被清理停止；L7 在 900 秒上限时后端仍处于分文件产物生成，未完成集成验证。L2 运行 715.2 秒、302,692 Token，经过 1 次验证修复后可交付。L3 回归报告为 900.9 秒 TIMEOUT，但其事件证据显示工作流最终 SUCCESS 且交付 Gate 检查通过，故属于外层回归时限/结果归类问题，不应简单记为 Agent 业务失败。L9 在用户要求暂停后停止，L10 未启动。
+根因分析：已确认的直接失败点是 Coding Loop 返回内容不符合规定的单个 JSON 对象协议，连续无效响应后触发无进展熔断；模型为何在这些任务中反复不遵守协议、协议适配是否与本机 Provider 输出形式有关，待确认。L6 是审批解析状态冲突，推测测试自动审批与工作流审批状态推进发生竞争，需专项复现确认。L3/L7 超时分别涉及外层计时/归类与后端长时间分文件生成；需进一步检查总时限预算和阶段耗时策略。此次未修改代码，也未宣称修复完成。
+解决步骤：1. 按用户要求停止 L9/L10 续测，只核对已完成的 L1-L8 报告、result.json 与事件证据。2. 按“未通过交付 Gate”“执行超时”“审批生命周期异常”区分失败类型，避免将 Agent 协议失败误写成编译或成果物验证失败。3. 保留两批回归报告和每题隔离证据，未覆盖历史记录、未清理产物。
+验证结果：L1-L8 统计为可交付 1/8（12.5%）、首轮可交付 0/8；实际只有 L2 完整交付，L3 的 Gate 已通过但外层报表按超时未计交付。未运行新测试、未修改实现，因此协议兼容、审批竞争和运行时限问题仍待修复与回归验证。
+
+【2026-09-25】* L1-L8 回归问题的结构化响应、有限恢复与超时归类修复
+错误要点：真实回归暴露多类可重复风险：本机 Codex/云端模型未稳定遵守编码循环 JSON 协议；编码 Agent 已写入文件但最终协议回复失败时可能丢弃工作区结果；回退生成可能重复生成已完成文件；重复审批/需求确认可能在 Graph 正在恢复时返回冲突；多文件 Artifact 每次请求都使用节点超时，累计时间不受控；回归监督器与工作流共用同一硬超时，可能把已完成且 Gate 通过的 Run 错记为超时。
+关键证据：L1-L8 报告 `backend/data/regression/20260924-224804-56ad43b8/report.md` 与 `backend/data/regression/20260924-233310-aed56d2d/report.md`；Coding Loop 的协议错误与熔断、L6 `Approval is already being resolved`、L3 Gate 已过但 supervisor TIMEOUT、L7 多文件阶段未完成。
+根因分析：协议靠 Prompt 而非 Provider 可用的结构化输出能力；Executor 把阶段失败和已落盘的源码状态当成同一件事；Artifact 回退未按缺失清单收窄；控制端点没有同请求幂等键且回归驱动器未等待恢复任务达到稳定状态；单个 Provider 请求超时与 Agent 阶段总时限混用；外层进程监督器没有为终态证据持久化预留宽限，也未按核心 Run 和 Delivery Gate 证据重算交付状态。
+解决步骤：1. Coding Loop 发送统一 JSON Schema；对能力登记确认支持 JSON mode 的 DeepSeek/Qwen 使用 `response_format=json_object`，对本机 Codex CLI 使用 `--output-schema` 并读取 `--output-last-message`，其他模型保持兼容的 Prompt 协议，不盲发厂商字段。2. 软件开发工作流的 Database/Backend/Frontend 首轮默认使用独立文件 Artifact 生成；已有仓库仍走 Coding Loop。若循环结束协议失败但冻结文件已齐全，则保留工作区并交给原有外层 Gate；如有缺失，只允许按冻结清单补缺失文件，并把已生成文件作为依赖上下文，不降低验证门槛。3. Approval 与 Clarification 对相同的进行中请求执行幂等返回；恢复等待接口使用 shield；隔离回归驱动器在同一 deadline 内等待人工控制解析到稳定状态。4. 代码 Agent 阶段按冻结文件数扩展总时限，每个额外文件增加 90 秒、单 Agent 阶段最多 1800 秒；Provider 单次请求仍受 Step 超时限制，所有节点重试共享阶段总 deadline。5. 回归监督器在 Workflow deadline 后另留默认 45 秒落盘/清理宽限；若宽限耗尽，仅当 SQLite 中 Run 已为 SUCCESS 且重新计算得到真实技术栈匹配与 Delivery Gate 全通过时，才记录为“终态交付后监督器超时”，否则维持超时失败并保留证据。
+验证结果：修改涉及 `backend/app/llm/model_profiles.py`、`openai_compatible.py`、`local_codex.py`、`backend/app/code_company/coding_loop.py`、`backend/app/workflow/artifact_generation.py`、`run_state.py`、`executor.py`、`software-development.yaml` 与 `backend/scripts/regression_suite.py`。Python AST 静态解析通过（8 个 Python 文件）；`git diff --check` 通过。按本次任务要求未运行自动化测试、全链路回归或云端模型调用，因此不能宣称 L1-L8 已通过或成功率已提升；后续需用 DeepSeek/Qwen 与本机 Codex 分别验证结构化响应、重复审批幂等、缺失文件定点补齐、阶段超时及终态证据归类。
+剩余风险：JSON mode 只在能力登记明确的模型族启用，其他模型仍可能不遵守协议；Artifact 回退的 Provider 消耗仍由缺失文件数、单文件上限和阶段总时限共同约束，并非严格 Agent 累计 Token 硬上限；真实工作流的取消、进程重启、云端响应和交付 Gate 尚未端到端复测。
+
+【2026-09-25】* WorkflowExecutor 结构上限回归
+错误要点：后端全量测试中的结构约束失败，executor.py 达到 3288 行，超过 3200 行上限，执行器继续膨胀会增加维护风险。
+关键证据：test_executor_file_cannot_silently_grow_back_to_previous_size 报 3288 <= 3200 断言失败。
+根因分析：模型响应重试/续写辅助函数及运行快照辅助逻辑仍放在执行器主文件中。
+解决步骤：1. 核对失败断言和执行器现有支持模块。2. 将模型响应辅助函数、快照脱敏和持久化方法迁入 ExecutorSupportMixin 所在模块，保留执行器对辅助函数的兼容导入与原有调用。3. 重新统计主文件行数并运行相关及全量测试。
+验证结果：executor.py 降至 3172 行；相关定向测试 16 通过；后端全量 pytest 为 807 通过、0 失败、1 跳过。仍需在后续功能开发中持续控制执行器体积。
+
+【2026-09-25】* 工作流图往返测试沿用旧生成模式
+错误要点：图转回 Workflow 后的生成模式为 artifacts，测试却要求 database、backend、frontend 为 coding_loop，导致图往返测试失败。
+关键证据：test_graph_to_workflow_preserves_layout_and_dependencies 中 database 的实际值 artifacts、预期值 coding_loop。
+根因分析：当前软件开发模板已将新项目的三个实现节点设置为 artifacts；测试新增的固定断言没有与模板策略同步。已有仓库是否使用 coding_loop 由运行时策略判定。
+解决步骤：1. 核对 YAML、图序列化字段及运行时模式选择。2. 将测试改为验证图往返后保留原 Workflow 的每个节点模式，并明确验证当前模板三个节点默认 artifacts。3. 运行定向及全量测试。
+验证结果：图往返测试通过；后端全量 pytest 为 807 通过、0 失败、1 跳过。该测试只证明配置往返一致，不代替真实已有仓库编码流程验证。
+
+【2026-09-25】* 需求澄清测试未计入幂等请求标识
+错误要点：自动澄清测试预期只向执行器传 primary_entity，实际还传入 request_id，导致断言失败。
+关键证据：test_synthetic_case_clarification_uses_only_explicit_answers 中实际答案含 request_id=request-1，预期字典未包含该标识。
+根因分析：澄清流程新增 request_id 用于定位和防止同一请求重复提交，测试仍按旧参数约定断言。
+解决步骤：1. 核对 drive_run 向 clarify 传参及澄清幂等语义。2. 更新测试名称和断言，要求只传用户明确回答的字段及当前澄清请求标识，不接纳其他隐式答案。3. 运行定向及全量测试。
+验证结果：澄清测试通过；后端全量 pytest 为 807 通过、0 失败、1 跳过。真实页面人工澄清交互未在本次测试中重新执行。
+
+【2026-09-25】* 回归监督器调用遗漏工作目录
+错误要点：重复回归测试在启动 worker 前因 TypeError 失败；真实 --live 回归也会在相同调用点中断。
+关键证据：test_repeats_keep_independent_databases_and_one_frozen_workflow 报 local_worker 缺少 directory 参数；supervise 的函数签名要求 command、directory 两个位置参数。
+根因分析：增加外层收尾宽限时间时，main 中的 supervise 调用漏传了隔离用例目录；这是生产脚本调用错误，不是模拟函数本身的缺陷。
+解决步骤：1. 对照 supervise 定义与 main 调用及测试桩签名。2. 在调用中传入当前用例 directory，确保 worker.log、release/cancel 标记和工作目录均落在该用例隔离目录。3. 运行重复场景定向测试及全量测试。
+验证结果：重复运行测试通过；后端全量 pytest 为 807 通过、0 失败、1 跳过。此次未调用真实 Provider 运行长时端到端回归。
+
+【2026-09-25】* 编码 Agent 自检修复后无法重验同一 Gate
+错误要点：`verify.run` 首次失败后，即使 Agent 已修复源码，再次运行同一 Gate 仍可能被无进展规则拦截，不能形成“验证失败 → 定点修复 → 再验证”的闭环。
+关键证据：新增回归测试先使 `backend-compile` 失败、修改 `pom.xml`，然后再次调用同一 Gate；修复前重复失败指纹阻止第二次验证。
+根因分析：Coding Loop 对失败工具调用按参数指纹缓存，但验证参数只有固定 Gate 名称；源码改变后仍被视为同一失败请求。
+解决步骤：成功的 `fs.create`、`fs.patch` 或 `fs.append` 动作后，清除先前失败的验证 Gate 指纹；保留对未修改源码的无进展熔断。验证仍通过授权的固定入口，不允许模型传任意命令。
+验证结果：该回归测试通过；后端全量测试 816 通过、1 跳过；前端构建通过。真实云端 Provider 的 L1–L3 交付率尚未重新测量。
+
+【2026-09-25】* 逐文件恢复改动触发执行器结构上限
+错误要点：加入 Run 级逐文件检查点后，结构测试发现 `executor.py` 达到 3216 行，超过项目设定的 3200 行门槛。
+关键证据：`test_executor_file_cannot_silently_grow_back_to_previous_size` 首次全量执行失败，提示执行器继续膨胀。
+根因分析：文件进度指纹、快照写入及清理辅助方法被放在原本已接近上限的主执行器中。
+解决步骤：将逐文件进度辅助方法移入 `executor_support.py`，执行器只保留调用；不改变原有 Workflow、LangGraph、Checkpoint 和最终成果物登记路径。
+验证结果：`executor.py` 为 3193 行，结构测试通过；最终后端全量测试 816 通过、1 跳过。已完成文件失败重试仅补未完成文件的集成回归测试通过。
+
+【2026-09-25】* 前端固定构建档位仍可能执行 npm 生命周期脚本
+错误要点：即使冻结的 `package.json` 中 `build` 等于 `vite build`，`npm run build` 仍可执行同一包的 `prebuild` 和 `postbuild`，超出了受控自检原本允许的动作。
+关键证据：代码审查发现原固定档位通过 `npm run build` 启动；新增测试在 package.json 设置 `prebuild`/`postbuild` 并检查实际命令。
+根因分析：只校验 build 字符串没有限制 npm 的生命周期钩子；本地进程 Sandbox 也不等于强隔离容器。
+解决步骤：自检档位直接通过 Node 调用工作区内 Vite CLI；依赖安装仍使用 `--ignore-scripts`、冻结依赖白名单与固定 registry；保留最终 Tester 独立验收。计划外内部辅助文件另要求填写原因并记录在动作审计中。
+验证结果：定向测试 12 通过；最终后端全量测试 816 通过、1 跳过；前端生产构建通过。Vite 配置、Maven 插件与第三方依赖本身仍可执行代码，面向不可信仓库前需要真正隔离的 Worker，不能把当前本地 Sandbox 当成安全边界。
+
+【2026-09-25】多实体需求在合同冻结前丢失 Booking（未修复）
+错误要点：原始酒店管理题明确要求 Room 和 Booking 两个实体的完整 CRUD，但当前需求归一化只提取 Room；合同编译进一步过滤 Booking 和 /api/bookings，后续即使所有生成文件符合冻结合同，也可能交付不完整业务范围。
+关键证据：对 backend/scripts/regression_cases_swe_10.json 的 L10 原题执行当前 CapabilityRouter，primary_entities 为 [Room]；向 build_delivery_contract 提供包含 Room、Booking 两实体及路由的提案后，结果仅保留 Room 和 /api/rooms，assumptions 显示 Booking 被当作与原始需求不一致而忽略。L7/L9 的同一解析器还会把“库存”识别成额外 Inventory 实体。
+根因分析：RequirementGapAnalyzer 的实体识别主要依赖有限别名和特定“实体字段”句式；DeliveryContract 把识别结果当成排他白名单过滤架构提案，缺少“原始需求实体覆盖率”核对。具体修复与完整跨模型影响尚未验证。
+解决步骤：1. 只读复现当前十道题原文的需求解析结果。2. 用 L10 原文与双实体架构提案调用合同构建器，确认 Booking 确实被过滤。3. 建议在冻结前增加原文实体/字段/API 覆盖核验；显式需求不能确定解析时阻断并询问用户，不允许静默删减；用十道原题逐字建立回归测试。本次未修改源码。
+验证结果：上述解析和合同构建的只读复现已确认缺陷；真实 Provider 的新一轮十题尚未执行，修复效果未知。
+
+【2026-09-25】Provider 配置切换后请求服务可能继续使用旧实例（未修复）
+错误要点：保存新的模型供应商配置只替换 WorkflowExecutor.provider，已构造的 ModelInvocationService.provider 不随之更新；后续 Run 可能同时按新配置计算能力，却用旧实例实际发出模型请求。
+关键证据：backend/app/api/routes.py 的保存配置端点赋值 executor.provider；backend/app/workflow/model_invocation.py 构造函数持有独立 provider，generate 调用该实例；本次仅代码审查，未对运行中的服务做切换复现。
+根因分析：Provider 生命周期是多处可变引用，没有以 Run 为边界冻结同一个 Provider 实例与模型能力；运行中切换配置时缺少原子性。实际触发范围待端到端验证。
+解决步骤：1. 对照配置保存、Executor 和 ModelInvocationService 的实例持有路径，确认引用不一致。2. 建议在 Run 创建时冻结 Provider 标识、模型能力及凭据引用，由统一 ProviderSession 注入所有调用路径；保存配置只影响新 Run，老 Run 保持原配置。3. 补“运行中切换供应商”和“新 Run 使用新供应商”并发回归测试。本次未修改源码。
+验证结果：静态代码路径已确认；运行时复现、修复和回归测试尚未进行，不能宣称已解决。
+
+【2026-09-25】* 多实体范围、Provider 会话与恢复写入一致性
+错误要点：显式需求实体/字段可能在 Architecture 合同生成时遗漏；保存 Provider 后 Executor 与真实调用服务可能不一致；固定文件计划仍额外调用模型规划；Redis Worker 失去租约后可能将旧状态覆盖到 SQLite。
+关键证据：RequirementSpec 原先只保存 primary_entities，未保留显式字段证据；DeliveryContract 只过滤模型实体但未补齐需求已确认的实体；配置路由分别更新了 executor.provider 与 ModelInvocationService.provider；Artifact Generator 总是请求模型生成清单；save_run_snapshot 无版本比较，失租后 abandon 仍写状态快照。
+根因分析：需求范围、Provider 实例、文件计划和持久化状态缺少同一 Run 边界下的证据与版本控制，且 Redis 租约没有延伸到 SQLite 写入端。
+解决步骤：1. RequirementSpec 增加显式实体/字段/API/约束证据；Architecture 漏掉用户已明确的实体时，仅按路由安全字段默认补齐，DeliveryGate 对实体、字段和显式路径做覆盖检查。2. DeliveryContract 增加按实体/API 路径绑定的 CRUD 生命周期与数据库往返验收项，必须找到对应验证证据。3. ModelInvocationService 为新 Run 捕获 Provider 实例，运行中的 Run 与审批恢复共享该快照，配置更新只影响新 Run。4. 冻结文件计划完整时跳过 LLM 文件清单规划；Backend 等待 Database 完成；Reviewer 失败不覆盖 Tester 交付状态。5. Artifact 文件进度采用 Run 内异步锁；SQLite 快照加入单调 revision/CAS；Redis Worker 通过 ContextVar 将租约 token 传至仓储写操作并拒绝陈旧租约；失租清理不再写旧快照。
+验证结果：修改的 Python 文件通过 py_compile；git diff --check 未报告空白错误（仅有 Git 换行符提示）；按本轮要求未运行 pytest、真实 Provider 或端到端场景，自动修复效果、交付率和 Redis 多 Worker 行为仍需后续回归确认。未提交代码。
+
+【2026-09-25】多实体交付修复补充
+错误要点：仅记录路由实体名仍不足以保护用户明确声明的实体字段；“库存/stock”作为订单或商品业务规则出现时也不应自动扩展为独立 CRUD 实体。
+关键证据：需求路由的 Inventory 别名曾对任意“库存”字样命中；显式实体字段声明未进入 RequirementSpec 与冻结合同的覆盖门禁。
+根因分析：词汇命中与实体定义混为一谈，且合同只比较实体名称，没有字段级来源证据。
+解决步骤：Inventory 只在明确管理/CRUD/表/实体语境下识别；解析明确的实体字段与类型，并让原始类型覆盖模型草案；将显式业务约束保存在合同范围证据中供下游 Agent 审核。
+验证结果：已对修改的 Python 文件执行语法编译，并解析软件开发 Workflow YAML；未运行功能测试或真实 LLM，尚未证明不同模型下的多实体/复杂业务规则端到端通过。
+
+【2026-09-25】本轮工作流依赖调整补充
+错误要点：Token 预算评估 Agent 原先位于 Architecture 之前，增加架构审批等待的串行延迟。
+关键证据：software-development.yaml 原依赖为 requirement → token_estimator → architecture。
+根因分析：预算控制节点与架构设计串联，即使架构设计并不使用后续节点预算，也必须等待预算模型请求返回。
+解决步骤：Architecture 与 token_estimator 改为在 requirement 后并行；Database、Frontend 在执行前等待预算计划，Backend 通过 Database 间接等待；Reviewer 设置为非阻断失败策略。
+验证结果：Python 语法编译通过、Workflow YAML 可解析；未跑 DAG 行为测试，仍需回归确认审批与节点依赖、跳过分支兼容性。
+
+【2026-09-25】L4 汇率应用未通过 API 交付证据门禁（未修复）
+错误要点：难度递增实测 L4 汇率换算应用时，Spring Boot Maven 检查和首页启动检查通过，但 Run 最终因 POST /api/convert 缺少覆盖冻结 API 方法及字段的明确验证证据而未交付。当前证据不能证明是接口实现错误，还是验证器未生成/关联所需证据。
+关键证据：Run `swe-l4-converter` 状态 FAILED，耗时 339.9 秒，Token 194,180；失败 Gate 为 `delivery-api:POST:/api/convert`，消息为“缺少覆盖冻结 API 方法及字段的明确验证证据”；Maven 输出 BUILD SUCCESS，但显示 No tests to run；`/` 启动检查返回 HTTP 200。
+根因分析：已确认的直接阻断原因是 Delivery Gate 没有收到与冻结的 POST 方法、请求/响应字段对应的通过证据。Maven 编译和首页可访问不能代替该接口的真实行为验证。接口是否存在字段或语义偏差待进一步检查，本轮没有直接调用该成果物 API 并复现。
+解决步骤：
+1. 使用本机 Codex Provider 对 L1–L10 十条回归用例按难度顺序执行真实工作流并启用隔离 Run 的架构自动审批。
+2. 检查 L4 的 Run 事件和最终 delivery_gate，确认 Maven 和启动检查通过，但 `delivery-api:POST:/api/convert` 被阻断。
+3. 对照冻结合同确认该接口是非 CRUD POST；本轮未修改代码，也未放宽 Gate。后续需让验证器实际发送合同定义的请求、核对响应字段，并把结果与该 API 合同绑定；若请求失败则再分流到 Backend 修复。
+验证结果：十条总计 9/10 可交付、6/10 首轮通过；L4 未交付。本轮仅运行测试并追加记录，接口行为验证器仍待修复和回归。详细报告：`backend/data/regression/20260925-144722-426e0c94/report.md`。
+
+【2026-09-25】* Codex 本地 Provider 的修复结构化输出 Schema 不兼容（未修复）
+错误要点：L5、L8、L9 的 Tester 将浏览器/前端验收失败定点转交 Frontend 修复时，修复调用曾被本机 Codex CLI 拒绝，导致候选修复中断；有限回退后续调用最终成功，三个 Run 均完成目标 Gate 和完整回归，但底层 Schema 兼容问题仍存在。
+关键证据：三条真实 Run 均出现 `invalid_json_schema`；Codex 报错指出 `properties.arguments` 必须提供 `additionalProperties: false`。首次失败责任类别均为 Frontend 修复调用；L5 检查 `browser-render`/`browser-crud`，L8 与 L9 检查 `frontend-ui-hooks`。后续修复候选均被提升并通过完整回归。
+根因分析：当前向本地 Codex CLI 提交的 `codex_output_schema` 不符合其严格 JSON Schema 约束，具体是 `arguments` 对象缺少关闭额外属性的声明。该问题与生成的业务代码内容无关；重复发生说明适配层尚未统一校验/规范化结构化输出 Schema。
+解决步骤：
+1. 在 L5、L8、L9 真实成果物验证触发的 Frontend 定点修复事件中复现该拒绝，并从 Provider 错误响应确认规则字段。
+2. 继续观察各 Run 的有界修复过程：后续调用生成候选，目标 Gate 通过、完整回归无回退，候选被提升；没有将中断的请求或未验证候选记作成功。
+3. 本轮未修改 Provider 适配代码。后续应在 Provider 边界统一规范并验证所有 response schema，保证对象属性定义兼容本地 Codex 和云端 OpenAI-compatible Provider；同时保留修复调用失败分类及重试上限。
+验证结果：三个受影响 Run 最终均交付成功；本轮十条统计为 9/10 可交付、6/10 首轮通过、3 次验证修复，耗时 4,491.8 秒，累计 2,690,616 Token。该 Schema 拒绝在三条 Run 中复现，虽有后续恢复仍属未修复风险。无密钥写入记录。

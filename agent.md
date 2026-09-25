@@ -204,6 +204,17 @@ QUEUED → RUNNING → WAITING_APPROVAL → RUNNING
 - Agent 只能检索已授权的知识范围。
 - 代码写入和命令执行只能发生在受控 Workspace，默认禁止任意本机脚本和无限制 Shell。
 
+#### Coding Agent Loop 约束
+
+- LangGraph 继续负责跨 Agent 编排、Checkpoint、审批、取消和恢复；代码公司的 Database、Backend、Frontend 默认使用有界 Plan → Act → Observe 循环，现有仓库也可使用同一模式。架构/文件归属合同先冻结，Agent 只在自己的 Workspace 和文件范围内写入；不替代或重建 Workflow Engine。
+- 角色 Prompt 必须与工具协议合并，不能因传入自定义 Prompt 而丢失工具调用约束；响应只接受严格 JSON，每轮最多一个工具动作，模型自报 verified 不构成验证证据。
+- 自动编码循环默认只允许仓库只读、Git 状态/差异查看，以及冻结 artifact_ownership 范围内的文件创建、带预期 SHA-256 的精确补丁和分块追加；缺少所有权规则时禁止写入。
+- 自动循环不得自行运行 Shell、构建或测试，也不得删除、移动或重命名文件；由外层 Tester / Gate 执行确定性验证。
+- 每个副作用前写入 SQLite 动作意图日志；恢复时根据文件前后哈希核对，不盲目重放不确定动作。重复失败指纹应熔断，动作数、总时限、单步输出 Token 预算均有上限。
+- 每轮模型请求先持久化预算预留；进程在响应边界中断时按预留上限计入消耗，避免恢复后无限重复付费请求。Tester 证据按责任 Agent 回流到隔离 Candidate Workspace，先跑目标 Gate，再跑完整回归；无改动或工具式修复失败时才回退到现有文件级修复。
+- 新项目首轮生成也必须通过文件工具写入 Workspace；文件由平台收集为 Artifact。代码 Agent 不在循环内执行任意 Shell，构建、启动、联调和浏览器检查统一由外层 Gate 执行。
+- Agent 的 final 只是提交候选，不是成功；必须由外层成果物检查、构建、联调、浏览器等适用 Gate 判定交付状态。
+
 ### 九、三家公司首期边界
 
 - 代码开发公司：需求、架构、前端、后端、测试、审查、代码生成、检查和 HTML 预览。

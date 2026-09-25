@@ -13,6 +13,20 @@ def render_managed_artifact(path: str, manifest: dict[str, Any]) -> str | None:
         return _render_pom(manifest.get("backend") or {})
     if path == "package.json" and owner == "frontend":
         return _render_package_json(manifest.get("frontend") or {})
+    if path == "index.html" and owner == "frontend":
+        return "<!doctype html>\n<html lang=\"zh-CN\">\n<head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>应用</title></head>\n<body><div id=\"app\"></div><script type=\"module\" src=\"/src/main.js\"></script></body>\n</html>\n"
+    if path == "src/main.js" and owner == "frontend":
+        return "import { createApp } from 'vue';\nimport App from './App.vue';\nimport './style.css';\n\ncreateApp(App).mount('#app');\n"
+    if path == "src/main/java/com/example/app/Application.java" and owner == "backend":
+        return (
+            "package com.example.app;\n\n"
+            "import org.springframework.boot.SpringApplication;\n"
+            "import org.springframework.boot.autoconfigure.SpringBootApplication;\n\n"
+            "@SpringBootApplication\npublic class Application {\n"
+            "    public static void main(String[] args) {\n"
+            "        SpringApplication.run(Application.class, args);\n"
+            "    }\n}\n"
+        )
     return None
 
 

@@ -149,6 +149,23 @@ class ArchitectureContractService:
                     "API 合同缺少原始需求明确指定的路由："
                     + "、".join(sorted(named_paths - actual_paths))
                 )
+        if decision.get("backend_required") and requirement_spec.explicit_api_paths:
+            api_rows = [
+                row
+                for row in contract.get("api_contract", [])
+                if isinstance(row, dict)
+            ]
+            actual_paths = {
+                str(row.get(field) or "").rstrip("/")
+                for row in api_rows
+                for field in ("path", "collection_path", "detail_path")
+            }
+            missing_paths = set(requirement_spec.explicit_api_paths) - actual_paths
+            if missing_paths:
+                raise ArchitectureContractError(
+                    "API 合同缺少原始需求明确指定的路径："
+                    + "、".join(sorted(missing_paths))
+                )
         blueprint = self.blueprint_builder(
             requirement_spec.raw_requirement,
             requirement_spec.model_dump(mode="json"),

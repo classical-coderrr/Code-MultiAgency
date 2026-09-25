@@ -161,8 +161,8 @@ def _parse_failure_policy(value: Any) -> str:
 
 def _parse_generation_mode(value: Any) -> str:
     mode = str(value or "single").strip().lower()
-    if mode not in {"single", "artifacts", "auto"}:
-        raise WorkflowParseError("generation_mode must be one of single, artifacts, auto")
+    if mode not in {"single", "artifacts", "auto", "coding_loop"}:
+        raise WorkflowParseError("generation_mode must be one of single, artifacts, auto, coding_loop")
     return mode
 
 

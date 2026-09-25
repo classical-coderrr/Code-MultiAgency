@@ -47,6 +47,8 @@ class ApiContract(BaseModel):
     methods: list[str] = Field(default_factory=lambda: ["GET", "POST", "PUT", "DELETE"], max_length=8)
     fields: list[str] = Field(default_factory=list, max_length=32)
     payload: dict[str, Any] = Field(default_factory=dict)
+    request_schema: dict[str, Any] = Field(default_factory=dict)
+    response_schema: dict[str, Any] = Field(default_factory=dict)
     identity_field: str = "id"
     query_parameters: list[str] = Field(default_factory=list, max_length=16)
     detail_required: bool = False
@@ -131,7 +133,7 @@ class ApiContract(BaseModel):
 
 
 class DeliveryContract(BaseModel):
-    schema_version: str = "2.0"
+    schema_version: str = "2.1"
     backend_stack: str
     frontend_stack: str
     page_mode: str
@@ -143,6 +145,8 @@ class DeliveryContract(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     crud_required: bool = False
     entities: list[dict[str, Any]] = Field(default_factory=list, max_length=16)
+    scope_evidence: dict[str, Any] = Field(default_factory=dict)
+    acceptance_spec: dict[str, Any] = Field(default_factory=dict)
     assumptions: list[str] = Field(default_factory=list)
     requirement_hash: str
     browser_required: bool = True
@@ -394,7 +398,18 @@ def build_delivery_contract(
         page_mode = "none"
     proposed_entities = [item for item in (proposal.get("entities") or []) if isinstance(item, dict)]
     expected_entities = {str(item).lower() for item in normalized_spec.get("primary_entities") or []}
+    explicit_entity_fields = normalized_spec.get("explicit_entity_fields") or {}
     discarded_entities: list[str] = []
+    # Architecture may describe request/response DTOs as "entities" even for
+    # stateless APIs. Do not turn those suggestions into persistence models,
+    # repositories, or CRUD controllers unless the user asked for CRUD/storage.
+    if not crud and database_mode == "none":
+        discarded_entities.extend(
+            str(item.get("id") or item.get("name") or "<unnamed>")
+            for item in proposed_entities
+        )
+        proposed_entities = []
+    used_default_entities = False
     if crud and expected_entities:
         kept_entities = []
         for item in proposed_entities:
@@ -404,7 +419,62 @@ def build_delivery_contract(
             else:
                 discarded_entities.append(name or "<unnamed>")
         proposed_entities = kept_entities
-    used_default_entities = False
+        evidence_by_entity = {
+            str(item.get("entity") or "").casefold(): item
+            for item in normalized_spec.get("entity_evidence", [])
+            if isinstance(item, dict)
+        }
+        for item in proposed_entities:
+            name = str(item.get("id") or item.get("name") or "").strip()
+            if name.casefold() in evidence_by_entity:
+                item.setdefault("scope_evidence", evidence_by_entity[name.casefold()])
+    if crud and isinstance(explicit_entity_fields, dict):
+        explicit_fields_by_entity = {
+            str(entity).casefold(): fields
+            for entity, fields in explicit_entity_fields.items()
+        }
+        for item in proposed_entities:
+            name = str(item.get("id") or item.get("name") or "").strip()
+            required_fields = explicit_fields_by_entity.get(name.casefold())
+            if not isinstance(required_fields, dict):
+                continue
+            proposed_fields = item.get("fields")
+            if isinstance(proposed_fields, (list, str)):
+                proposed_fields = _field_list_to_mapping(
+                    proposed_fields, entity_name=name, type_hints={},
+                )
+                item["fields"] = proposed_fields
+            elif not isinstance(proposed_fields, dict):
+                proposed_fields = {}
+                item["fields"] = proposed_fields
+            # An explicitly stated field/type is authoritative over model text.
+            proposed_fields.update(required_fields)
+    # Architecture may omit an explicitly scoped entity from its proposal.
+    # Restore only entities already present in RequirementSpec, using the
+    # router's conservative field defaults; never promote model-invented scope.
+    if crud and expected_entities:
+        present = {
+            str(item.get("id") or item.get("name") or "").strip().lower()
+            for item in proposed_entities
+        }
+        defaults = normalized_spec.get("safe_defaults") or {}
+        field_defaults = defaults.get("entity_fields") or {}
+        for scoped_name in normalized_spec.get("primary_entities") or []:
+            if str(scoped_name).lower() in present:
+                continue
+            fields = field_defaults.get(scoped_name) if isinstance(field_defaults, dict) else None
+            if isinstance(fields, dict) and fields:
+                proposed_entities.append({
+                    "name": str(scoped_name),
+                    "table": f"{str(scoped_name).lower()}s",
+                    "identity_field": "id",
+                    "fields": fields,
+                    "scope_evidence": next((
+                        item for item in normalized_spec.get("entity_evidence", [])
+                        if isinstance(item, dict) and str(item.get("entity", "")).lower() == str(scoped_name).lower()
+                    ), {"source": "raw_requirement", "entity": str(scoped_name)}),
+                })
+                used_default_entities = True
     if crud and not proposed_entities:
         defaults = normalized_spec.get("safe_defaults") or {}
         field_defaults = defaults.get("entity_fields") or {}
@@ -417,6 +487,12 @@ def build_delivery_contract(
     for row in proposal.get("api_contract") or []:
         candidate = dict(row) if isinstance(row, dict) else {}
         explicit_entity = str(candidate.get("entity_id") or candidate.get("entity") or "").strip()
+        if not crud and database_mode == "none":
+            # A stateless endpoint may have input/output schemas, but it is not
+            # a persisted entity and must not inherit a model-invented entity id.
+            candidate["entity_id"] = None
+            candidate.pop("entity", None)
+            explicit_entity = ""
         if expected_entities and explicit_entity and explicit_entity.lower() not in expected_entities:
             continue
         matched_entity = _match_api_entity(candidate, proposed_entities, requirement)
@@ -488,6 +564,37 @@ def build_delivery_contract(
             f"Vite proxy 的 {', '.join(proxy_paths)} target 使用 process.env.VITE_API_PROXY || "
             "'http://127.0.0.1:2198'；后端本地端口 2198，验证时通过环境变量注入隔离端口"
         )
+    acceptance_checks: list[dict[str, Any]] = []
+    for api in api_rows.values():
+        entity_id = str(api.get("entity_id") or "").strip()
+        if not entity_id:
+            continue
+        acceptance_checks.append({
+            "id": f"crud-lifecycle:{entity_id}",
+            "kind": "crud_lifecycle",
+            "entity_id": entity_id,
+            "api_path": str(api.get("path") or ""),
+            "operations": ["create", "list", "read", "update", "delete"],
+            "assertions": [
+                "created_record_is_listed",
+                "detail_returns_created_record",
+                "updated_fields_are_persisted",
+                "deleted_record_is_absent",
+            ],
+        })
+        if backend and database_mode != "none":
+            acceptance_checks.append({
+                "id": f"persistence-roundtrip:{entity_id}",
+                "kind": "database_roundtrip",
+                "entity_id": entity_id,
+                "api_path": str(api.get("path") or ""),
+                "operations": ["create", "update", "delete"],
+                "assertions": [
+                    "created_record_exists_in_database",
+                    "updated_fields_exist_in_database",
+                    "deleted_record_is_absent_from_database",
+                ],
+            })
     contract = DeliveryContract(
         backend_stack=backend_stack, frontend_stack=frontend_stack, page_mode=page_mode,
         database_mode=database_mode if backend else "none",
@@ -496,6 +603,13 @@ def build_delivery_contract(
         entrypoints=["/"] if frontend_required else [],
         api_contract=list(api_rows.values()),
         entities=_entity_contracts(proposed_entities, list(api_rows.values())),
+        scope_evidence={
+            "entities": normalized_spec.get("entity_evidence") or [],
+            "entity_fields": explicit_entity_fields,
+            "api_paths": normalized_spec.get("explicit_api_paths") or [],
+            "explicit_constraints": normalized_spec.get("explicit_constraints") or [],
+        },
+        acceptance_spec={"version": "1.0", "checks": acceptance_checks},
         required_capabilities=capabilities, crud_required=crud,
         assumptions=assumptions,
         requirement_hash=hashlib.sha256(requirement.encode()).hexdigest(),

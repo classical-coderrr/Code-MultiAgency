@@ -1,18 +1,85 @@
 import asyncio
 import json
 import sys
+from unittest.mock import AsyncMock
 
 import httpx
 
 from app.agents.registry import AgentRegistry
 from app.repositories.sqlite import SQLiteRepository
 from app.services.artifacts import ArtifactService
-from app.workflow.artifact_validator import ArtifactValidationResult, ArtifactValidator, ValidationCheck
+from app.workflow.artifact_validator import ArtifactValidationResult, ArtifactValidator, ValidationCheck, _CommandOutcome
 from app.workflow.context import WorkflowContext
 from app.workflow.dag import build_dag
 from app.workflow.events import WorkflowEventBus
 from app.workflow.executor import RunState, WorkflowExecutor
 from app.workflow.models import RunStatus, StepDefinition, StepStatus, WorkflowDefinition
+
+
+def test_owner_preflight_does_not_require_other_parallel_branch():
+    validator = ArtifactValidator()
+    frontend = validator.validate_owner_preflight([
+        {"name": "index.html", "content": "<!doctype html><html><body>ok</body></html>"},
+    ], "frontend")
+    assert frontend.passed
+    assert not any(check.id == "frontend-package" for check in frontend.checks)
+    broken = validator.validate_owner_preflight([
+        {"name": "index.html", "content": "<html><body>unfinished"},
+    ], "frontend")
+    assert not broken.passed
+    assert any(check.id == "static-html" for check in broken.checks)
+
+
+def test_owner_preflight_repair_promotes_only_passing_candidate(tmp_path, monkeypatch):
+    repository = SQLiteRepository(":memory:")
+    artifacts = ArtifactService(repository, tmp_path / "workspaces")
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"),
+        _TestProvider(), WorkflowEventBus(), repository, artifact_service=artifacts,
+    )
+    workflow = WorkflowDefinition(id="owner-preflight", name="owner-preflight", steps=[
+        StepDefinition("frontend", agent_id="frontend_agent"),
+    ])
+    workspace = executor.code_company_runtime.prepare_run("owner_preflight_run")
+    state = RunState(
+        run_id="owner_preflight_run", workflow=workflow, dag=build_dag(workflow),
+        context=WorkflowContext({"compiled_contract": {"file_plan": []}, "requirement": "Vue app"}),
+        workspace=workspace.as_dict(),
+        blueprint={"artifact_ownership": {"frontend": ["package.json", "index.html", "src/**"]}},
+    )
+    files = [
+        {"name": "package.json", "content": json.dumps({"scripts": {"build": "vite build"}, "dependencies": {"vue": "^3"}})},
+        {"name": "index.html", "content": "<!doctype html><html><body><div id='app'></div></body></html>"},
+        {"name": "src/App.vue", "content": "<template><div>ok</div></template>"},
+    ]
+    assert not executor.artifact_validator.validate_owner_preflight(files, "frontend").passed
+    assert executor.repair_engine.targets(executor.artifact_validator.validate_owner_preflight(files, "frontend")) == ["frontend"]
+
+    async def fake_repair(candidate_state, *args, **kwargs):
+        current = candidate_state.context.snapshot()["__artifact_files__"]
+        candidate_state.context.set("__artifact_files__", [
+            *current,
+            {"step_id": "frontend", "name": "src/main.js", "content": "import { createApp } from 'vue';\n"},
+        ])
+        return ["src/main.js"], []
+
+    monkeypatch.setattr(executor, "_repair_failed_artifacts", fake_repair)
+    repaired, responses = asyncio.run(executor._owner_preflight_repair(
+        state, "frontend", files, remaining_seconds=60, provider_max_tokens=2000,
+    ))
+    assert responses == []
+    assert "src/main.js" in [item["name"] for item in repaired]
+    assert executor.artifact_validator.validate_owner_preflight(repaired, "frontend").passed
+    assert "__artifact_files__" not in state.context.snapshot()
+
+    async def ineffective_repair(candidate_state, *args, **kwargs):
+        return ["src/main.js"], []
+
+    monkeypatch.setattr(executor, "_repair_failed_artifacts", ineffective_repair)
+    unchanged, _ = asyncio.run(executor._owner_preflight_repair(
+        state, "frontend", files, remaining_seconds=60, provider_max_tokens=2000,
+    ))
+    assert unchanged == files  # no false promotion from an unadvanced Gate
 
 
 def _result(status: str) -> ArtifactValidationResult:
@@ -24,6 +91,7 @@ def _result(status: str) -> ArtifactValidationResult:
 def test_browser_evidence_is_bounded_and_keeps_failure_context():
     data = {
         "uiCrud": False,
+        "phase": "create-visible-row",
         "visibleTextChars": 42,
         "screenshotPath": "D:/evidence/failure.png",
         "screenshotPaths": [f"D:/evidence/{index}.png" for index in range(12)],
@@ -37,6 +105,7 @@ def test_browser_evidence_is_bounded_and_keeps_failure_context():
     evidence = ArtifactValidator._browser_evidence(data, "/rooms")
 
     assert evidence["path"] == "/rooms"
+    assert evidence["phase"] == "create-visible-row"
     assert evidence["screenshotPath"].endswith("failure.png")
     assert len(evidence["screenshotPaths"]) == 8
     assert len(evidence["domSnapshot"]) == 12000
@@ -44,6 +113,37 @@ def test_browser_evidence_is_bounded_and_keeps_failure_context():
     assert len(evidence["networkEvents"]) == 100
     assert evidence["formValues"]["crud-field-name"] == "Room 101"
     assert len(evidence["crudStates"]) == 8
+
+
+def test_browser_probe_parses_large_structured_result_before_clipping(tmp_path):
+    validator = ArtifactValidator()
+    validator._executable = lambda *_args: "node"
+    browser_result = {
+        "status": "passed", "phase": "delete", "uiCrud": True,
+        "domSnapshot": "x" * 18000,
+    }
+    validator._run_command = AsyncMock(return_value=_CommandOutcome(0, json.dumps(browser_result), 10))
+
+    checks = asyncio.run(validator._probe_browser(
+        tmp_path, "http://127.0.0.1:5173",
+        {"entrypoints": ["/"], "crud_required": True, "backend_stack": "spring_boot"},
+    ))
+
+    assert all(check.status == "passed" for check in checks)
+    assert next(check for check in checks if check.id == "browser-crud").message == "已通过真实页面完成新增、查询、修改、删除"
+    assert len(next(check for check in checks if check.id == "browser-render").output) < 12000
+    assert validator._run_command.await_args.kwargs["clip_output"] is False
+
+
+def test_command_can_preserve_large_structured_stdout_until_parsed(tmp_path):
+    validator = ArtifactValidator()
+    outcome = asyncio.run(validator._run_command(
+        sys.executable, ["-c", "print('x' * 18000)"], tmp_path, 5,
+        clip_output=False,
+    ))
+
+    assert outcome.returncode == 0
+    assert len(outcome.output) >= 18000
 
 
 def test_frontend_validation_requires_standard_source_tree():
@@ -77,6 +177,169 @@ def test_nested_frontend_and_spring_files_pass_structural_validation():
 
     assert result.status == "passed"
     assert {check.target for check in result.checks} == {"frontend", "backend"}
+
+
+def test_artifact_manifest_rejects_case_insensitive_path_collision():
+    files, error = ArtifactValidator._normalize_files([
+        {"name": "src/Application.java", "content": "class Application {}"},
+        {"name": "src/application.java", "content": "class application {}"},
+    ])
+
+    assert files == {}
+    assert error is not None
+
+
+def test_spring_duplicate_yaml_key_fails_preflight_and_routes_to_config_file():
+    validator = ArtifactValidator()
+    config_name = "src/main/resources/application.yml"
+    files = [
+        {"name": "pom.xml", "content": "<project />"},
+        {"name": "src/main/java/com/example/Application.java", "content": "package com.example; class Application {}"},
+        {"name": config_name, "content": "spring:\n  jpa:\n    hibernate:\n      ddl-auto: validate\n  jpa:\n    open-in-view: false\n"},
+    ]
+
+    result = asyncio.run(validator.validate({"__artifact_files__": files}, {"build": False, "startup": False}))
+
+    check = next(check for check in result.checks if check.id == "backend-config-yaml")
+    assert result.status == "failed"
+    assert check.evidence == {"file": config_name, "reason": "第 5 行重复定义配置键 jpa"}
+    assert WorkflowExecutor._validation_repair_candidates(files, check.message, checks=[check]) == [files[2]]
+
+
+def test_spring_distinct_nested_yaml_keys_pass_preflight():
+    checks = ArtifactValidator._spring_yaml_contract({
+        "src/main/resources/application.yml": "spring:\n  jpa:\n    hibernate:\n      ddl-auto: validate\n    open-in-view: false\n",
+    })
+    assert len(checks) == 1
+    assert checks[0].status == "passed"
+
+
+def test_joint_browser_probe_installs_vite_in_fresh_target_workspace(tmp_path):
+    validator = ArtifactValidator()
+    validator._run_command = AsyncMock(return_value=_CommandOutcome(0, "installed", 12))
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    check = asyncio.run(validator._ensure_joint_frontend_dependencies(tmp_path, "npm"))
+
+    assert check is not None and check.status == "passed"
+    validator._run_command.assert_awaited_once_with(
+        "npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], tmp_path, 120.0,
+    )
+    (tmp_path / "node_modules" / "vite").mkdir(parents=True)
+    assert asyncio.run(validator._ensure_joint_frontend_dependencies(tmp_path, "npm")) is None
+    assert validator._run_command.await_count == 1
+
+
+def test_order_crud_probe_seeds_product_without_weakening_product_existence_rule():
+    from app.workflow.artifact_validator import _SpringCrudSpec
+
+    product = _SpringCrudSpec(
+        "/api/products", {"name": "Fixture", "stock": 2}, "name",
+        frozenset({"GET", "POST", "PUT", "DELETE"}), entity_id="Product",
+    )
+    order = _SpringCrudSpec(
+        "/api/orders", {"productId": 1, "quantity": 3, "status": "new"}, "status",
+        frozenset({"GET", "POST", "PUT", "DELETE"}), entity_id="Order",
+    )
+    products: dict[int, dict] = {}
+    orders: dict[int, dict] = {}
+    submitted_order_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        payload = json.loads(request.content) if request.content else {}
+        if path == "/api/products" and request.method == "POST":
+            products[42] = {**payload, "id": 42}
+            return httpx.Response(201, json=products[42])
+        if path == "/api/products/42" and request.method == "DELETE":
+            products.pop(42, None)
+            return httpx.Response(204)
+        if path == "/api/orders" and request.method == "POST":
+            submitted_order_payloads.append(payload)
+            parent = products.get(payload.get("productId"))
+            if parent is None or payload["quantity"] > parent["stock"]:
+                return httpx.Response(400, json={"error": "invalid product or stock"})
+            orders[7] = {**payload, "id": 7}
+            return httpx.Response(201, json=orders[7])
+        if path == "/api/orders" and request.method == "GET":
+            return httpx.Response(200, json=list(orders.values()))
+        if path == "/api/orders/7" and request.method == "PUT":
+            assert payload["productId"] == 42
+            orders[7] = {**payload, "id": 7}
+            return httpx.Response(200, json=orders[7])
+        if path == "/api/orders/7" and request.method == "DELETE":
+            orders.clear()
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ArtifactValidator._probe_spring_crud_with_fixtures(
+                client, "http://test", order, (product, order),
+            )
+
+    check = asyncio.run(exercise())
+    assert check.status == "passed"
+    assert submitted_order_payloads[0]["productId"] == 42
+    assert products == {}
+    assert orders == {}
+
+
+def test_related_fixture_timeout_has_nonempty_diagnostic():
+    from app.workflow.artifact_validator import _SpringCrudSpec
+
+    product = _SpringCrudSpec("/api/products", {"name": "Fixture"}, "name", frozenset({"POST"}), entity_id="Product")
+    order = _SpringCrudSpec("/api/orders", {"productId": 1, "status": "new"}, "status", frozenset({"POST"}), entity_id="Order")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ArtifactValidator._probe_spring_crud_with_fixtures(
+                client, "http://test", order, (product, order),
+            )
+
+    check = asyncio.run(exercise())
+    assert check.status == "failed"
+    assert "ReadTimeout" in check.message
+
+
+def test_crud_update_changes_only_safe_booking_field():
+    from app.workflow.artifact_validator import _SpringCrudSpec
+
+    payload = {
+        "roomId": 7, "guestName": "Alice", "checkIn": "2026-10-01",
+        "checkOut": "2026-10-03", "status": "CONFIRMED",
+    }
+    spec = _SpringCrudSpec("/api/bookings", payload, "guestName", frozenset({"GET", "POST", "PUT", "DELETE"}))
+    records: list[dict] = []
+    updates: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if request.method == "POST":
+            records[:] = [{**body, "id": 1}]
+            return httpx.Response(201, json=records[0])
+        if request.method == "PUT":
+            updates.append(body)
+            records[:] = [{**body, "id": 1}]
+            return httpx.Response(200, json=records[0])
+        if request.method == "DELETE":
+            records.clear()
+            return httpx.Response(204)
+        return httpx.Response(200, json=records)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ArtifactValidator._probe_spring_crud(client, "http://test", spec)
+
+    assert asyncio.run(exercise()).status == "passed"
+    assert len(updates) == 1
+    assert updates[0]["guestName"] != payload["guestName"]
+    assert {key: updates[0][key] for key in payload if key != "guestName"} == {
+        key: value for key, value in payload.items() if key != "guestName"
+    }
 
 
 def test_maven_test_sources_are_valid_standard_java_layout():
@@ -295,6 +558,34 @@ def test_frontend_backend_route_contract_checks_non_api_prefix():
     assert route.status == "failed"
 
 
+def test_frontend_backend_route_contract_rejects_second_unmatched_entity_path():
+    files = {
+        "src/components/StudentManager.vue": "fetch('/api/students')",
+        "src/components/CourseManager.vue": "fetch('/api/courses')",
+        "src/main/java/StudentController.java": '''
+            @RestController
+            @RequestMapping("/api/students")
+            public class StudentController {
+                @GetMapping public Object list() { return null; }
+            }
+        ''',
+    }
+    check = next(item for item in ArtifactValidator._integration_contract(files)
+                 if item.id == "frontend-backend-route-contract")
+    assert check.status == "failed"
+    assert "/api/courses" in check.message
+    files["src/main/java/CourseController.java"] = '''
+        @RestController
+        @RequestMapping("/api/courses")
+        public class CourseController {
+            @GetMapping public Object list() { return null; }
+        }
+    '''
+    check = next(item for item in ArtifactValidator._integration_contract(files)
+                 if item.id == "frontend-backend-route-contract")
+    assert check.status == "passed"
+
+
 def test_static_html_frontend_repair_never_requires_npm_manifest():
     files = {"index.html": "<!doctype html><html><body>hello</body></html>", "script.js": ""}
     assert ArtifactValidator._targets(files, {"targets": ["frontend"]}) == ()
@@ -305,6 +596,110 @@ def test_static_html_frontend_repair_never_requires_npm_manifest():
 def test_crud_probe_preserves_decimal_string_type_for_bigdecimal():
     assert ArtifactValidator._mutated_contract_value("9.90") == "9.91"
     assert ArtifactValidator._mutated_contract_value("0.01") == "0.02"
+
+
+def test_h2_probe_reports_phase_and_exception_when_transport_message_is_empty():
+    from app.workflow.artifact_validator import _SpringCrudSpec
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("", request=request)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            spec = _SpringCrudSpec("/api/books", {"title": "Probe"}, "title", frozenset({"GET", "POST", "PUT", "DELETE"}))
+            return await ArtifactValidator._probe_spring_crud(client, "http://test", spec)
+
+    check = asyncio.run(exercise())
+    assert check.status == "failed"
+    assert "create" in check.message
+    assert "ReadError" in check.message
+    assert check.evidence == {"phase": "create", "exceptionClass": "ReadError"}
+
+
+def test_browser_crud_hooks_fail_fast_before_launching_browser():
+    contract = {"browser_required": True, "crud_required": True, "backend_stack": "none"}
+    files = {"index.html": '<button id="crud-add">新增</button>'}
+    checks = ArtifactValidator._delivery_contract_structure(files, contract)
+    hooks = next(check for check in checks if check.id == "frontend-ui-hooks")
+    assert hooks.status == "failed"
+    assert "crud-save" in hooks.message
+    assert "index.html" in hooks.output
+
+    files["index.html"] += (
+        '<button data-testid="crud-save">保存</button>'
+        '<div data-testid="crud-row">记录'
+        '<button data-testid="crud-edit">编辑</button>'
+        '<button data-testid="crud-delete">删除</button></div>'
+    )
+    checks = ArtifactValidator._delivery_contract_structure(files, contract)
+    assert next(check for check in checks if check.id == "frontend-ui-hooks").status == "passed"
+
+
+def test_multi_entity_browser_contract_requires_each_visible_panel_marker():
+    contract = {
+        "browser_required": True, "crud_required": True, "backend_stack": "springboot",
+        "api_contract": [
+            {"entity_id": "Student", "methods": ["GET", "POST", "PUT", "DELETE"], "payload": {"name": "A"}},
+            {"entity_id": "Course", "methods": ["GET", "POST", "PUT", "DELETE"], "payload": {"title": "B"}},
+        ],
+    }
+    files = {"src/App.vue": (
+        '<div data-testid="crud-panel-Student"></div>'
+        '<button data-testid="crud-add"></button><button data-testid="crud-save"></button>'
+        '<div data-testid="crud-row"><button data-testid="crud-edit"></button>'
+        '<button data-testid="crud-delete"></button></div>'
+    )}
+    hooks = next(check for check in ArtifactValidator._delivery_contract_structure(files, contract)
+                 if check.id == "frontend-ui-hooks")
+    assert hooks.status == "failed" and "crud-panel-Course" in hooks.message
+    files["src/App.vue"] += '<div data-testid="crud-panel-Course"></div>'
+    hooks = next(check for check in ArtifactValidator._delivery_contract_structure(files, contract)
+                 if check.id == "frontend-ui-hooks")
+    assert hooks.status == "passed"
+
+
+def test_multi_entity_missing_panels_identify_only_responsible_components():
+    contract = {
+        "browser_required": True, "crud_required": True, "backend_stack": "springboot",
+        "api_contract": [
+            {"entity_id": "Student", "methods": ["POST"], "payload": {"name": "A"}},
+            {"entity_id": "Course", "methods": ["POST"], "payload": {"title": "B"}},
+        ],
+    }
+    files = {
+        "vite.config.js": "export default {}",
+        "src/App.vue": "<template><StudentManager/><CourseManager/></template>",
+        "src/components/StudentManager.vue": "<template><div>Students</div></template>",
+        "src/components/CourseManager.vue": "<template><div>Courses</div></template>",
+    }
+    check = next(item for item in ArtifactValidator._delivery_contract_structure(files, contract)
+                 if item.id == "frontend-ui-hooks")
+    assert check.status == "failed"
+    assert check.evidence == {"files": [
+        "src/components/CourseManager.vue", "src/components/StudentManager.vue",
+    ]}
+    owned = [{"name": name, "content": content} for name, content in files.items()]
+    selected = WorkflowExecutor._validation_repair_candidates(
+        owned, f"[{check.label}] {check.message}\n{check.output}", checks=[check],
+    )
+    assert {item["name"] for item in selected} == set(check.evidence["files"])
+
+
+def test_browser_course_phase_repairs_only_course_manager():
+    files = [
+        {"name": "src/App.vue", "content": "<template><StudentManager/><CourseManager/></template>"},
+        {"name": "src/components/StudentManager.vue", "content": "students"},
+        {"name": "src/components/CourseManager.vue", "content": "courses"},
+    ]
+    check = ValidationCheck(
+        "browser-crud", "frontend", "浏览器 CRUD 操作", "failed",
+        "Course 管理面板不可见", evidence={"phase": "Course:panel-visible"},
+    )
+    selected = WorkflowExecutor._validation_repair_candidates(files, check.message, checks=[check])
+    assert [item["name"] for item in selected] == ["src/components/CourseManager.vue"]
+    files[0]["content"] = "<template><StudentManager/></template>"
+    selected = WorkflowExecutor._validation_repair_candidates(files, check.message, checks=[check])
+    assert [item["name"] for item in selected] == ["src/App.vue"]
 
 
 def test_delivery_contract_requires_item_routes_for_update_and_delete():
@@ -943,6 +1338,104 @@ def test_missing_vue_component_is_created_only_in_candidate_state():
                for item in state.context.get("__artifact_files__"))
 
 
+def test_missing_frozen_frontend_file_is_created_from_plan_and_validation_evidence():
+    from app.llm.base import LLMResponse
+
+    class MissingPlannedFileProvider(_TestProvider):
+        async def generate(self, system_prompt, user_prompt, config=None):
+            settings = dict(config or {})
+            self.configs.append(settings)
+            assert settings.get("artifact_name") == "script.js"
+            assert "冻结文件计划明确要求的缺失成果物" in user_prompt
+            assert "筛选" in user_prompt and "localStorage" in user_prompt
+            content = "document.querySelector('#themeToggle').addEventListener('click', () => { document.body.classList.toggle('dark'); localStorage.setItem('theme', document.body.classList.contains('dark') ? 'dark' : 'light'); });"
+            return LLMResponse(content, input_tokens=5, output_tokens=30, finish_reason="stop", message_content=content)
+
+    repository = SQLiteRepository(":memory:")
+    provider = MissingPlannedFileProvider()
+    event_bus = WorkflowEventBus(repository)
+    executor = WorkflowExecutor(AgentRegistry.from_directory("agents"), provider, event_bus, repository)
+    workflow = WorkflowDefinition(
+        id="missing-frozen-static-file",
+        name="missing-frozen-static-file",
+        steps=[StepDefinition("tester", agent_id="tester_agent")],
+    )
+    state = RunState(
+        run_id="missing-frozen-static-file",
+        workflow=workflow,
+        dag=build_dag(workflow),
+        blueprint={"artifact_ownership": {"frontend": ["*.html", "*.css", "*.js"]}},
+        context=WorkflowContext({
+            "requirement": "摄影作品集支持按类别筛选、主题切换，并把主题保存在 localStorage。",
+            "compiled_contract": {
+                "artifact_ownership": {"frontend": ["*.html", "*.css", "*.js"]},
+                "file_plan": [{
+                    "path": "script.js",
+                    "owner": "frontend",
+                    "purpose": "实现作品筛选、主题切换和 localStorage 持久化",
+                }],
+            },
+            "__artifact_files__": [
+                {"step_id": "frontend", "name": "index.html", "content": '<script src="script.js"></script>'},
+                {"step_id": "frontend", "name": "style.css", "content": "body { color: #222; }"},
+            ],
+        }),
+    )
+    validation = ArtifactValidationResult("failed", "script.js missing", ("frontend",), (
+        ValidationCheck(
+            "frozen-file-plan", "frontend", "冻结文件计划", "failed",
+            "frontend 缺少冻结文件 script.js",
+        ),
+    ))
+
+    repaired, _ = asyncio.run(executor._repair_failed_artifacts(state, validation, 1, "tester", 10, 6000))
+
+    assert repaired == ["script.js"]
+    created = next(item for item in state.context.get("__artifact_files__") if item["name"] == "script.js")
+    assert created["step_id"] == "frontend"
+    assert created["mime_type"] == "application/javascript; charset=utf-8"
+    assert "localStorage" in created["content"]
+    assert provider.configs[0]["agent_id"] == "frontend_agent"
+    assert any(
+        event["type"] == "step.validation_missing_artifact"
+        and event["payload"]["fileName"] == "script.js"
+        for event in event_bus._history["missing-frozen-static-file"]
+    )
+
+
+def test_missing_unplanned_file_is_not_created_from_a_guessed_path():
+    repository = SQLiteRepository(":memory:")
+    provider = _TestProvider()
+    executor = WorkflowExecutor(AgentRegistry.from_directory("agents"), provider, WorkflowEventBus(repository), repository)
+    workflow = WorkflowDefinition(
+        id="missing-unplanned-file",
+        name="missing-unplanned-file",
+        steps=[StepDefinition("tester", agent_id="tester_agent")],
+    )
+    state = RunState(
+        run_id="missing-unplanned-file",
+        workflow=workflow,
+        dag=build_dag(workflow),
+        blueprint={"artifact_ownership": {"frontend": ["*.html", "*.css", "*.js"]}},
+        context=WorkflowContext({
+            "compiled_contract": {
+                "artifact_ownership": {"frontend": ["*.html", "*.css", "*.js"]},
+                "file_plan": [{"path": "index.html", "owner": "frontend"}],
+            },
+            "__artifact_files__": [{"step_id": "frontend", "name": "index.html", "content": "<html></html>"}],
+        }),
+    )
+    validation = ArtifactValidationResult("failed", "missing script", ("frontend",), (
+        ValidationCheck("frozen-file-plan", "frontend", "冻结文件计划", "failed", "frontend 缺少冻结文件 script.js"),
+    ))
+
+    repaired, _ = asyncio.run(executor._repair_failed_artifacts(state, validation, 1, "tester", 10, 6000))
+
+    assert repaired == []
+    assert provider.configs == []
+    assert [item["name"] for item in state.context.get("__artifact_files__")] == ["index.html"]
+
+
 def test_compiler_missing_java_class_is_created_without_rewriting_reference():
     from app.llm.base import LLMResponse
 
@@ -1002,6 +1495,37 @@ def test_bundle_repair_includes_every_related_file_or_escalates_safely():
     repaired, _ = asyncio.run(executor._repair_failed_artifacts(state, validation, 1, "tester", 10, 6000, bundle=True))
     assert repaired == []
     assert len(provider.configs) == 9
+
+
+def test_bundle_repair_keeps_precise_multi_entity_maven_scope():
+    repository = SQLiteRepository(":memory:")
+    provider = _TestProvider()
+    executor = WorkflowExecutor(AgentRegistry.from_directory("agents"), provider, WorkflowEventBus(repository), repository)
+    workflow = WorkflowDefinition(id="two-service-repair", name="two-service-repair",
+                                  steps=[StepDefinition("tester", agent_id="tester_agent")])
+    files = [
+        {"step_id": "backend", "name": f"src/main/java/com/example/app/{name}.java", "content": f"class {name} {{}}"}
+        for name in ("StudentService", "CourseService", "StudentController", "CourseController")
+    ]
+    state = RunState(run_id="two-service-repair", workflow=workflow, dag=build_dag(workflow),
+                     context=WorkflowContext({"__artifact_files__": files}))
+    output = (
+        "[ERROR] /tmp/src/main/java/com/example/app/StudentService.java:[31,16] cannot find symbol\n"
+        "[ERROR] symbol: method setId(null)\n"
+        "[ERROR] /tmp/src/main/java/com/example/app/CourseService.java:[28,15] cannot find symbol\n"
+        "[ERROR] symbol: method setId(null)"
+    )
+    validation = ArtifactValidationResult("failed", "Maven compile failed", ("backend",), (
+        ValidationCheck("backend-test", "backend", "Maven", "failed", "compile failed", output=output),
+    ))
+    repaired, _ = asyncio.run(executor._repair_failed_artifacts(
+        state, validation, 2, "tester", 10, 6000, bundle=True,
+    ))
+    assert set(repaired) == {
+        "src/main/java/com/example/app/StudentService.java",
+        "src/main/java/com/example/app/CourseService.java",
+    }
+    assert len(provider.configs) == 2
 
 
 def test_compile_regression_is_not_progress_after_crud_failure():

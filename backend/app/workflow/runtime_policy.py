@@ -192,10 +192,14 @@ class RuntimePolicyResolver:
     def generation_mode(state: RunState, step: StepDefinition) -> str:
         mode = str(step.generation_mode or "single").strip().lower()
         runtime = state.runtime if isinstance(state.runtime, dict) else {}
-        if step.id in {"database", "backend", "frontend"} and (
-            bool(runtime.get("coding_loop"))
+        coding_loop_override = runtime.get("coding_loop")
+        use_coding_loop = (
+            bool(coding_loop_override)
+            if coding_loop_override is not None
+            else mode == "coding_loop"
             or str((state.workspace or {}).get("mode", "")) == "existing_repo"
-        ):
+        )
+        if step.id in {"database", "backend", "frontend"} and use_coding_loop:
             return "coding_loop"
         if step.enforce_artifact_contract and step.id in {
             "database",
@@ -226,4 +230,3 @@ class RuntimePolicyResolver:
         ):
             return "artifacts"
         return "single"
-

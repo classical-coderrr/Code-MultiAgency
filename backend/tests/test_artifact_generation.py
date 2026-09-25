@@ -1,8 +1,13 @@
 import asyncio
 import json
 
+import pytest
+
 from app.agents.registry import AgentRegistry
+from app.code_company.contract_compiler import ContractCompiler
+from app.code_company.dependency_manifest import render_managed_artifact
 from app.llm.base import LLMProvider, LLMResponse, LLMTimeoutError
+from app.llm.base import LLMError
 from app.repositories.sqlite import SQLiteRepository
 from app.services.artifacts import ArtifactService
 from app.workflow.events import WorkflowEventBus
@@ -54,6 +59,65 @@ def test_artifact_transport_retry_keeps_plan_and_retries_only_current_file():
     assert phases == ["artifact_plan", "artifact_file", "artifact_file"]
     assert result.files[0]["name"] == "index.html"
     assert "step.artifact_request_retrying" in events
+
+
+def test_completed_file_checkpoint_is_reused_after_later_file_fails():
+    saved: list[dict[str, str]] = []
+    generated: list[str] = []
+    fail_css = True
+
+    async def request(system, user, config, timeout):
+        nonlocal fail_css
+        if config["generation_phase"] == "artifact_plan":
+            text = json.dumps({"files": [
+                {"name": "index.html", "language": "html", "purpose": "page", "estimated_tokens": 500},
+                {"name": "style.css", "language": "css", "purpose": "style", "estimated_tokens": 500},
+            ]})
+        else:
+            name = config["artifact_name"]
+            generated.append(name)
+            if name == "style.css" and fail_css:
+                fail_css = False
+                raise LLMError("provider failed", retryable=False)
+            text = "<!doctype html><html><body>ok</body></html>" if name == "index.html" else "body { color: teal; }"
+        return LLMResponse(text=text, finish_reason="stop", message_content=text)
+
+    async def checkpoint(item):
+        saved.append(dict(item))
+
+    async def emit(name, payload):
+        pass
+
+    kwargs = dict(
+        system_prompt="test", original_prompt="create page", base_config={"agent_id": "frontend_agent"},
+        request_timeout=30, max_tokens=1000, provider_max_tokens=2000,
+        request=request, record_response=lambda _: None, emit=emit, on_file=checkpoint,
+    )
+    with pytest.raises(LLMError):
+        asyncio.run(generate_artifacts(**kwargs))
+    assert [item["name"] for item in saved] == ["index.html"]
+    result = asyncio.run(generate_artifacts(**kwargs, resume_files=saved))
+    assert generated == ["index.html", "style.css", "style.css"]
+    assert [item["name"] for item in result.files] == ["index.html", "style.css"]
+    assert [item["name"] for item in saved] == ["index.html", "style.css"]
+
+
+def test_frozen_stack_scaffolding_is_generated_without_llm_calls():
+    manifest = ContractCompiler._dependency_manifest({
+        "backend": {"stack": "springboot"},
+        "frontend": {"stack": "vue"},
+        "database": {"mode": "h2"},
+    })
+    assert "src/main/java/com/example/app/Application.java" in manifest["managed_files"]
+    assert "src/main.js" in manifest["managed_files"]
+    assert "index.html" in manifest["managed_files"]
+    application = render_managed_artifact("src/main/java/com/example/app/Application.java", manifest)
+    entry = render_managed_artifact("src/main.js", manifest)
+    html = render_managed_artifact("index.html", manifest)
+    assert "@SpringBootApplication" in application
+    assert "import App from './App.vue'" in entry
+    assert "src/main.js" in html
+    assert render_managed_artifact("src/App.vue", manifest) is None
 
 
 def test_hidden_reasoning_raises_next_file_ceiling_without_forcing_more_output():
@@ -387,6 +451,59 @@ def test_artifact_mode_generates_and_materializes_independent_file(tmp_path):
     assert [item["name"] for item in repository.list_artifacts("run_artifact_mode")] == ["index.html"]
 
 
+def test_failed_run_retries_only_unfinished_file_from_durable_checkpoint(tmp_path):
+    class FailOnceProvider(FilePlanProvider):
+        def __init__(self):
+            super().__init__()
+            self.fail_css = True
+
+        async def generate(self, system_prompt, user_prompt, config=None):
+            settings = config or {}
+            self.configs.append(settings)
+            if settings.get("generation_phase") == "artifact_plan":
+                text = json.dumps({"files": [
+                    {"name": "index.html", "language": "html", "purpose": "page", "estimated_tokens": 600},
+                    {"name": "style.css", "language": "css", "purpose": "style", "estimated_tokens": 600},
+                ]})
+            elif settings.get("artifact_name") == "style.css":
+                if self.fail_css:
+                    self.fail_css = False
+                    raise LLMError("provider refused css", retryable=False)
+                text = "body { color: teal; }"
+            else:
+                text = "<!doctype html><html><body>ready</body></html>"
+            return LLMResponse(text=text, input_tokens=20, output_tokens=40, finish_reason="stop", message_content=text)
+
+    provider = FailOnceProvider()
+    repository = SQLiteRepository(":memory:")
+    workflow = WorkflowDefinition(
+        id="checkpoint-artifact", name="checkpoint-artifact",
+        steps=[StepDefinition("frontend", agent_id="frontend_agent", task_template="{{requirement}}",
+                              output="frontend_result", generation_mode="artifacts", retry_count=0)],
+    )
+    repository.create_run("run_checkpoint_artifact", workflow.id, {}, RunStatus.PENDING.value, "now")
+    executor = WorkflowExecutor(
+        AgentRegistry.from_directory("agents"), provider, WorkflowEventBus(), repository,
+        artifact_service=ArtifactService(repository, tmp_path / "workspaces"),
+    )
+
+    async def scenario():
+        await executor.start("run_checkpoint_artifact", workflow, {"requirement": "simple page"})
+        failed = repository.get_run("run_checkpoint_artifact")
+        assert failed["status"] == RunStatus.FAILED.value
+        progress = failed["state"]["context"]["__artifact_progress__"]["frontend"]
+        assert [item["name"] for item in progress["files"]] == ["index.html"]
+        await executor.retry("run_checkpoint_artifact", workflow)
+        await executor._active["run_checkpoint_artifact"].task
+
+    asyncio.run(scenario())
+    completed = repository.get_run("run_checkpoint_artifact")
+    assert completed["status"] == RunStatus.SUCCESS.value
+    generated = [item.get("artifact_name") for item in provider.configs if item.get("generation_phase") == "artifact_file"]
+    assert generated == ["index.html", "style.css", "style.css"]
+    assert sorted(item["name"] for item in repository.list_artifacts("run_checkpoint_artifact")) == ["index.html", "style.css"]
+
+
 def test_artifact_file_budget_is_not_capped_by_tiny_agent_plan():
     spec = ArtifactFileSpec("style.css", "css", "页面样式", 600)
 
@@ -415,6 +532,202 @@ def test_file_generation_receives_actual_completed_sibling_source():
     ))
     assert len(result.files) == 2
     assert "export function getAllStudents() { return []; }" in prompts[1]
+
+
+def test_file_context_uses_frozen_dependencies_without_replaying_unrelated_source():
+    from app.workflow.artifact_generation import _relevant_completed_source
+    files = [
+        {"name": "src/main/java/app/Room.java", "content": "class Room {}"},
+        {"name": "src/main/java/app/RoomRepository.java", "content": "interface RoomRepository {}"},
+        {"name": "src/main/java/app/Unrelated.java", "content": "x" * 8000},
+    ]
+    compiled = {"file_plan": [{
+        "path": "src/main/java/app/RoomService.java",
+        "depends_on_files": ["src/main/java/app/Room.java", "src/main/java/app/RoomRepository.java"],
+    }]}
+    source = _relevant_completed_source(
+        files, ArtifactFileSpec("src/main/java/app/RoomService.java", "java", "service", 900), compiled,
+    )
+    assert "class Room {}" in source
+    assert "RoomRepository" in source
+    assert "Unrelated" not in source
+
+
+def test_file_prompt_receives_exact_frozen_table_and_route_names():
+    from app.workflow.artifact_generation import _frozen_file_constraints
+    compiled = {
+        "database_schema": {"tables": {"room": {"entity_id": "Room", "columns": {"id": {"sql_type": "BIGINT"}}, "primary_key": "id"}}},
+        "openapi": {"paths": {"/api/rooms": {"get": {"x-entity-id": "Room"}}}},
+        "delivery_requirements": {"crud_required": True},
+    }
+    entity = ArtifactFileSpec("src/main/java/app/Room.java", "java", "entity", 900)
+    schema = ArtifactFileSpec("src/main/resources/schema.sql", "sql", "schema", 900)
+    controller = ArtifactFileSpec("src/main/java/app/RoomController.java", "java", "controller", 900)
+    assert '@Table(name="room")' in _frozen_file_constraints(entity, compiled)
+    assert '"room"' in _frozen_file_constraints(schema, compiled)
+    assert "GET /api/rooms" in _frozen_file_constraints(controller, compiled)
+    frontend = ArtifactFileSpec("src/main/resources/static/index.html", "html", "page", 900, owner="frontend")
+    assert "crud-add" in _frozen_file_constraints(frontend, compiled)
+    assert "crud-field-{JSON field name}" in _frozen_file_constraints(frontend, compiled)
+
+
+def test_order_entity_prompt_quotes_reserved_frozen_table_name():
+    from app.workflow.artifact_generation import _frozen_file_constraints
+
+    compiled = {"database_schema": {"tables": {"order": {"entity_id": "Order", "columns": {"id": {"sql_type": "BIGINT"}}}}}}
+    entity = ArtifactFileSpec("src/main/java/app/Order.java", "java", "entity", 900)
+    prompt = _frozen_file_constraints(entity, compiled)
+    assert r'@Table(name="\"order\"")' in prompt
+    assert "Do not rename the table" in prompt
+
+
+def test_schema_prompt_exposes_spring_physical_column_mapping():
+    from app.workflow.artifact_generation import _frozen_file_constraints
+
+    compiled = {"database_schema": {"tables": {"order": {
+        "entity_id": "Order", "columns": {"productId": {"sql_type": "BIGINT"}},
+    }}}}
+    schema = ArtifactFileSpec("src/main/resources/schema.sql", "sql", "schema", 900)
+    prompt = _frozen_file_constraints(schema, compiled)
+    assert '"productId": "product_id"' in prompt
+    assert '"sql_table_identifier": "\\\"order\\\""' in prompt
+
+
+def test_spring_yaml_prompt_requires_unique_jpa_mapping():
+    from app.workflow.artifact_generation import _frozen_file_constraints
+
+    config = ArtifactFileSpec("src/main/resources/application.yml", "yaml", "config", 600)
+    assert "single spring.jpa block" in _frozen_file_constraints(config, {})
+
+
+def test_generated_primary_key_service_prompt_forbids_unverified_setter():
+    from app.workflow.artifact_generation import _frozen_file_constraints
+
+    service = ArtifactFileSpec("src/main/java/com/example/app/StudentService.java", "java", "service", 900)
+    compiled = {"database_schema": {"tables": {
+        "student": {"entity_id": "Student", "primary_key": "id", "columns": {
+            "id": {"sql_type": "BIGINT", "generated": True},
+        }},
+    }}}
+    prompt = _frozen_file_constraints(service, compiled)
+    assert "setId(null)" in prompt
+    assert "Entity 源码中真实存在" in prompt
+
+
+def test_multi_entity_vue_prompts_are_scoped_to_each_component():
+    from app.workflow.artifact_generation import _frozen_file_constraints, _relevant_completed_source
+
+    compiled = {
+        "file_plan": [
+            {"path": "src/components/StudentManager.vue", "depends_on_files": []},
+            {"path": "src/components/CourseManager.vue", "depends_on_files": []},
+            {"path": "src/App.vue", "depends_on_files": [
+                "src/components/StudentManager.vue", "src/components/CourseManager.vue",
+            ]},
+        ],
+        "openapi": {"paths": {
+            "/api/students": {"get": {"x-entity-id": "Student"}},
+            "/api/courses": {"get": {"x-entity-id": "Course"}},
+        }},
+        "json_schema": {"Student": {"properties": {"name": {"type": "string"}}},
+                        "Course": {"properties": {"title": {"type": "string"}}}},
+        "delivery_requirements": {"crud_required": True},
+    }
+    student = ArtifactFileSpec("src/components/StudentManager.vue", "vue", "Students", 2400, owner="frontend")
+    course = ArtifactFileSpec("src/components/CourseManager.vue", "vue", "Courses", 2400, owner="frontend")
+    root = ArtifactFileSpec("src/App.vue", "vue", "Root", 1000, owner="frontend")
+    student_prompt = _frozen_file_constraints(student, compiled)
+    course_prompt = _frozen_file_constraints(course, compiled)
+    root_prompt = _frozen_file_constraints(root, compiled)
+    assert "GET /api/students" in student_prompt and "/api/courses" not in student_prompt
+    assert "crud-panel-Student" in student_prompt and '"name"' in student_prompt
+    assert "GET /api/courses" in course_prompt and "/api/students" not in course_prompt
+    assert "crud-panel-Course" in course_prompt and '"title"' in course_prompt
+    assert "StudentManager.vue" in root_prompt and "CourseManager.vue" in root_prompt
+    assert "Do not duplicate CRUD/API logic" in root_prompt
+
+    files = [
+        {"name": "src/components/StudentManager.vue", "content": "student-token-" * 1000},
+        {"name": "src/components/CourseManager.vue", "content": "course-token-" * 1000},
+    ]
+    source = _relevant_completed_source(files, root, compiled)
+    assert "StudentManager.vue" in source and "CourseManager.vue" in source
+    assert "student-token-" not in source and "course-token-" not in source
+
+
+def test_frozen_multi_entity_vue_generation_requests_each_manager_before_root():
+    compiled = {
+        "artifact_ownership": {"frontend": ["package.json", "index.html", "src/**"]},
+        "dependency_manifest": {"managed_files": {"package.json": "frontend"}, "frontend": {
+            "manager": "npm", "dependencies": {"vue": "^3.5.0"},
+            "dev_dependencies": {"vite": "^6.0.0", "@vitejs/plugin-vue": "^5.2.0"},
+            "scripts": {"build": "vite build"},
+        }},
+        "openapi": {"paths": {
+            "/api/students": {"get": {"x-entity-id": "Student"}},
+            "/api/courses": {"get": {"x-entity-id": "Course"}},
+        }},
+        "json_schema": {"Student": {"type": "object"}, "Course": {"type": "object"}},
+        "delivery_requirements": {"crud_required": True},
+        "file_plan": [
+            {"path": "package.json", "owner": "frontend", "provides": ["FrontendDependencies"]},
+            {"path": "index.html", "owner": "frontend", "provides": ["FrontendEntry"],
+             "requires": ["FrontendDependencies"], "depends_on_files": ["package.json"]},
+            {"path": "src/components/StudentManager.vue", "owner": "frontend",
+             "provides": ["StudentManagerComponent"], "requires": ["ApiContract"]},
+            {"path": "src/components/CourseManager.vue", "owner": "frontend",
+             "provides": ["CourseManagerComponent"], "requires": ["ApiContract"]},
+            {"path": "src/App.vue", "owner": "frontend", "provides": ["AppComponent"],
+             "requires": ["StudentManagerComponent", "CourseManagerComponent"],
+             "depends_on_files": ["src/components/StudentManager.vue", "src/components/CourseManager.vue"]},
+            {"path": "src/main.js", "owner": "frontend", "provides": ["FrontendBootstrap"],
+             "requires": ["AppComponent"], "depends_on_files": ["src/App.vue"]},
+            {"path": "src/style.css", "owner": "frontend", "provides": ["FrontendStyles"]},
+        ],
+    }
+    requested = []
+
+    async def request(_system, prompt, config, _timeout):
+        if config["generation_phase"] == "artifact_plan":
+            text = json.dumps({"files": [{"name": "src/App.vue", "language": "vue", "estimated_tokens": 3500}]})
+        else:
+            name = config["artifact_name"]
+            requested.append((name, prompt))
+            if name.endswith("Manager.vue"):
+                entity = name.rsplit("/", 1)[-1].removesuffix("Manager.vue")
+                text = f'<template><section data-testid="crud-panel-{entity}">{entity}</section></template>'
+            elif name == "src/App.vue":
+                text = (
+                    "<template><StudentManager/><CourseManager/></template>"
+                    "<script setup>import StudentManager from './components/StudentManager.vue';"
+                    "import CourseManager from './components/CourseManager.vue';</script>"
+                )
+            elif name == "index.html":
+                text = '<!doctype html><html><body><div id="app"></div></body></html>'
+            elif name == "src/main.js":
+                text = "import { createApp } from 'vue'; import App from './App.vue'; createApp(App).mount('#app');"
+            else:
+                text = "body { color: black; }"
+        return LLMResponse(text=text, finish_reason="stop", message_content=text)
+
+    async def emit(_kind, _payload):
+        pass
+
+    result = asyncio.run(generate_artifacts(
+        system_prompt="generate", original_prompt="Build a Vue app with Student and Course CRUD",
+        base_config={"agent_id": "frontend_agent", "compiled_contract": compiled,
+                     "enforce_artifact_contract": True},
+        request_timeout=10, max_tokens=6000, provider_max_tokens=6000,
+        request=request, record_response=lambda _response: None, emit=emit,
+    ))
+    names = [item["name"] for item in result.files]
+    assert names.index("src/components/StudentManager.vue") < names.index("src/App.vue")
+    assert names.index("src/components/CourseManager.vue") < names.index("src/App.vue")
+    prompts = dict(requested)
+    assert "/api/students" in prompts["src/components/StudentManager.vue"]
+    assert "/api/courses" not in prompts["src/components/StudentManager.vue"]
+    assert "StudentManager.vue" in prompts["src/App.vue"]
+    assert "CourseManager.vue" in prompts["src/App.vue"]
 
 
 def test_generated_pom_normalizes_wrong_h2_module_before_publication():

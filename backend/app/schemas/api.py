@@ -21,8 +21,9 @@ class RunRuntimeRequest(BaseModel):
     base_branch: str | None = Field(default=None, max_length=200)
     base_commit_sha: str | None = Field(default=None, max_length=200)
     working_branch: str | None = Field(default=None, max_length=200)
-    coding_loop: bool = False
-    max_tool_steps: int = Field(default=8, ge=1, le=32)
+    # None honors the workflow's declared default; explicit false opts out.
+    coding_loop: bool | None = None
+    max_tool_steps: int = Field(default=16, ge=1, le=32)
 
 
 class RunCreateRequest(BaseModel):

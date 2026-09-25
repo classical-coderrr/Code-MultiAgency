@@ -156,6 +156,56 @@ def test_progressive_repairs_keep_same_candidate_until_full_regression_passes():
     assert outcome.history[1]["resolvedFailureKeys"] == ["missing-class:ProductNotFoundException"]
 
 
+def test_full_regression_new_backend_failure_reassigns_after_frontend_gate_passes():
+    candidate = {"frontend": False, "backend": False}
+    rejected: list[int] = []
+    routes: list[list[str]] = []
+
+    async def repair(plan: dict, attempt: int, _strategy: str):
+        routes.append(list(plan["owners"]))
+        if attempt == 1:
+            assert plan["owners"] == ["frontend"]
+            candidate["frontend"] = True
+            return ["src/components/StudentManager.vue"], []
+        assert plan["owners"] == ["backend"]
+        assert candidate["frontend"] is True  # passed frontend work was retained
+        candidate["backend"] = True
+        return ["src/main/java/com/example/app/StudentService.java"], []
+
+    async def target(plan: dict, _attempt: int) -> ArtifactValidationResult:
+        owner = plan["owners"][0]
+        gate = "frontend-ui-hooks" if owner == "frontend" else "backend-test"
+        return validation(gate, owner, "passed", "target fixed")
+
+    async def full(_attempt: int) -> ArtifactValidationResult:
+        checks = [
+            ValidationCheck("backend-api-contract", "backend", "API contract", "passed", "still valid"),
+            ValidationCheck("frontend-ui-hooks", "frontend", "UI hooks", "passed", "fixed"),
+            ValidationCheck("backend-test", "backend", "Maven", "passed" if candidate["backend"] else "failed",
+                            "compiled" if candidate["backend"] else "setId method missing"),
+        ]
+        status = "passed" if candidate["backend"] else "failed"
+        return ArtifactValidationResult(status, status, ("backend", "frontend"), tuple(checks))
+
+    async def reject(_plan: dict, attempt: int) -> None:
+        rejected.append(attempt)
+
+    initial = ArtifactValidationResult("failed", "UI hooks missing", ("frontend",), (
+        ValidationCheck("backend-api-contract", "backend", "API contract", "passed", "valid"),
+        ValidationCheck("frontend-ui-hooks", "frontend", "UI hooks", "failed", "missing panels"),
+    ))
+    outcome = asyncio.run(RepairCoordinator().coordinate(
+        initial, max_attempts=2, repair=repair, validate_target=target,
+        validate_full=full, reject_candidate=reject,
+    ))
+    assert outcome.passed
+    assert routes == [["frontend"], ["backend"]]
+    assert rejected == []
+    assert outcome.history[0]["fullRegression"] == "FAILED"
+    assert outcome.history[0]["madeProgress"] is True
+    assert outcome.history[1]["fullRegression"] == "PASSED"
+
+
 def test_full_regression_that_breaks_passing_gate_rejects_only_last_round():
     rejected: list[int] = []
 

@@ -41,6 +41,7 @@ class RunState:
     recovery_mode: bool = False
     task: asyncio.Task[Any] | None = None
     resume_task: asyncio.Task[Any] | None = None
+    resume_control_key: str | None = None
     started_perf: float = field(default_factory=time.perf_counter)
     approval_started_perf: float | None = None
     excluded_approval_ms: int = 0
@@ -49,4 +50,5 @@ class RunState:
     workspace: dict[str, Any] | None = None
     execution_status: str = "PENDING"
     delivery_status: str = "NOT_EVALUATED"
-
+    artifact_progress_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    snapshot_revision: int = 0

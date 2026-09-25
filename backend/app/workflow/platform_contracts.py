@@ -275,7 +275,11 @@ def _default_artifact_ownership(
         elif frontend_stack in {"vue", "react"}:
             ownership["frontend"] = [
                 "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-                "vite.config.*", "index.html", "src/**", "public/**", "frontend/**",
+                "vite.config.*", "index.html",
+                "src/*.vue", "src/*.js", "src/*.mjs", "src/*.cjs", "src/*.ts",
+                "src/*.tsx", "src/*.jsx", "src/*.css", "src/*.scss", "src/*.sass",
+                "src/*.less", "src/*.json", "src/*.svg", "src/*.md",
+                "public/**", "frontend/**",
             ]
         else:
             ownership["frontend"] = ["index.html", "style.css", "script.js", "assets/**"]
@@ -321,7 +325,14 @@ def failure_fact_from_check(
         gate=gate,
         file=str(files[0]) if isinstance(files, list) and files else None,
         related_files=[str(item) for item in files if str(item).strip()] if isinstance(files, list) else [],
-        evidence={"check_id": evidence_id, "output": str(check.get("output") or "")[-3000:]},
+        evidence={
+            "check_id": evidence_id,
+            "output": str(check.get("output") or "")[-3000:],
+            "details": {
+                key: value for key, value in (check.get("evidence") or {}).items()
+                if key in {"phase", "screenshotPath", "relatedFiles", "path", "exitCode"}
+            } if isinstance(check.get("evidence"), dict) else {},
+        },
         expected=str(check.get("expected") or ""),
         actual=str(check.get("actual") or check.get("message") or ""),
         evidence_id=evidence_id,

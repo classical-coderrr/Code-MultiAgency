@@ -337,6 +337,37 @@ def evaluate_delivery(context: dict, validation: dict | None,
             record("delivery-contract", "blocked", "API 请求数据必须是包含有效字段名的对象。")
     if checks:
         return result()
+    scope = contract.get("scope_evidence")
+    if scope is not None and not isinstance(scope, dict):
+        record("delivery-scope-evidence", "blocked", "原始需求范围证据格式无效。")
+    elif isinstance(scope, dict):
+        known_entities = {
+            str(item.get("name") or item.get("id") or "").casefold(): item
+            for item in contract.get("entities", []) if isinstance(item, dict)
+        }
+        for source in scope.get("entities") or []:
+            entity = str(source.get("entity") or "").strip() if isinstance(source, dict) else ""
+            if entity and entity.casefold() not in known_entities:
+                record(f"delivery-scope-entity:{entity}", "failed", f"原始需求明确提到实体 {entity}，但冻结实体合同中缺失。")
+        fields_by_entity = scope.get("entity_fields") or {}
+        if not isinstance(fields_by_entity, dict):
+            record("delivery-scope-fields", "blocked", "原始需求字段证据格式无效。")
+        else:
+            for entity, fields in fields_by_entity.items():
+                declared = known_entities.get(str(entity).casefold(), {}).get("fields") or {}
+                missing = set(fields) - set(declared) if isinstance(fields, dict) else set()
+                if missing:
+                    record(f"delivery-scope-fields:{entity}", "failed", f"实体 {entity} 缺少原始需求字段：" + "、".join(sorted(missing)))
+        explicit_paths = scope.get("api_paths") or []
+        frozen_paths = {
+            _path(row.get(key)) for row in api_contract if isinstance(row, dict)
+            for key in ("path", "collection_path", "detail_path") if row.get(key)
+        }
+        for path in explicit_paths:
+            if _path(path) not in frozen_paths:
+                record(f"delivery-scope-api:{path}", "failed", f"冻结 API 合同缺少用户明确指定的路径 {_path(path)}。")
+    if checks:
+        return result()
     try:
         rows = _source_files(context.get("__artifact_files__"))
         fingerprint = _fingerprint(rows)
@@ -443,6 +474,49 @@ def evaluate_delivery(context: dict, validation: dict | None,
             require("delivery-browser-crud", [item for item in evidence
                     if _browser_crud_check(item)
                     and _covered_paths(item) & entries])
+    acceptance_spec = contract.get("acceptance_spec")
+    if acceptance_spec is not None:
+        if (not isinstance(acceptance_spec, dict)
+                or not isinstance(acceptance_spec.get("version"), str)
+                or not isinstance(acceptance_spec.get("checks"), list)):
+            record("delivery-acceptance-spec", "blocked", "验收规范缺少有效版本或检查列表。")
+        else:
+            api_by_entity = {
+                str(item.get("entity_id") or "").casefold(): _path(item.get("path"))
+                for item in api_contract if isinstance(item, dict) and item.get("entity_id")
+            }
+            for assertion in acceptance_spec["checks"]:
+                if not isinstance(assertion, dict):
+                    record("delivery-acceptance-spec", "blocked", "验收项格式无效。")
+                    continue
+                identifier = str(assertion.get("id") or "").strip()
+                kind = str(assertion.get("kind") or "")
+                entity = str(assertion.get("entity_id") or "").casefold()
+                path = _path(assertion.get("api_path"))
+                operations = assertion.get("operations")
+                if (not identifier or kind not in {"crud_lifecycle", "database_roundtrip"}
+                        or not isinstance(operations, list) or not operations
+                        or entity not in api_by_entity or path != api_by_entity.get(entity)):
+                    record("delivery-acceptance:" + (identifier or "invalid"), "blocked",
+                           "验收项必须绑定冻结的实体、API 路径和操作列表。")
+                    continue
+                candidates = [
+                    item for item in evidence
+                    if item["id"] == "spring-h2-crud"
+                    and item["status"] == "passed"
+                    and isinstance(item.get("evidence"), dict)
+                    and _path(item["evidence"].get("path")) == path
+                ]
+                if kind == "database_roundtrip":
+                    candidates = [item for item in candidates
+                                  if item.get("evidence", {}).get("storageVerified") is True
+                                  and item.get("evidence", {}).get("databaseProduct") == "H2"]
+                record(
+                    f"delivery-acceptance:{identifier}",
+                    "passed" if candidates else "blocked",
+                    "合同验收项已由对应的真实 CRUD/数据库验证证据覆盖。" if candidates
+                    else "缺少该实体与 API 路径对应的通过证据；不得以其他实体的验收结果替代。",
+                )
     api_rows = [row for item in evidence if item["status"] == "passed" for row in _api_rows(item)]
     for api in api_contract:
         path = _path(api["path"])

@@ -429,7 +429,7 @@ def _positive_probe(raw: str, terms: tuple[str, ...]) -> tuple[str, str]:
         # Coordinated exclusions such as "无需登录或外部服务" exclude both
         # capabilities. Do not interpret the second item as a new request.
         probe = re.sub(
-            rf"(?:{chinese_prefixes})[^。；;\n]{{0,20}}?(?:或|和|与|、)\s*{escaped}",
+            rf"(?:{chinese_prefixes})[^。；;\n]{{0,20}}?(?:或|和|与|、)\s*(?:任何)?(?:独立|外部|第三方)?\s*{escaped}",
             " ", probe, flags=re.IGNORECASE,
         )
         if re.search(r"[a-z]", term.lower()):

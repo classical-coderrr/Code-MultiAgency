@@ -9,6 +9,9 @@ from app.workflow.architecture_repair import (
     ArchitectureRepairCoordinator, architecture_patch_issue,
     contract_failure_fact, merge_scoped_architecture_patch,
 )
+from app.workflow.architecture_contract import ArchitectureContractService
+from app.workflow.architecture_repair import ArchitectureContractError
+from app.workflow.architecture_validator import ArchitectureValidator
 from app.workflow.capability_router import CapabilityRouter
 from app.workflow.delivery_contract import build_delivery_contract
 from app.code_company.contract_compiler import ContractCompiler
@@ -72,6 +75,72 @@ def test_entity_link_patch_requires_explicit_existing_entity_without_url_guessin
     assert "已有实体" in architecture_patch_issue(candidate, {"api_contract": [_api("/api/students", "Course")]}, fact)
     assert architecture_patch_issue(candidate, {"api_contract": [_api("/api/students", "Student")]}, fact) is None
     assert candidate["delivery_contract"]["api_contract"][0]["entity_id"] is None
+
+
+def test_missing_entity_patch_adds_only_named_entity_case_insensitively():
+    original = _decision([_api("/api/students", "Student")])
+    original["delivery_contract"]["entities"] = [_entity("Student")]
+    fact = contract_failure_fact(ValueError("实体合同缺少原始需求实体：course"), attempt=0)
+    patch = {"entities": [_entity("Course"), _entity("Unrelated")]}
+    assert architecture_patch_issue(original, patch, fact) is None
+    updated = merge_scoped_architecture_patch(
+        original, patch, fact["repair_scope"], error=fact["message"],
+    )
+    assert [entity["name"] for entity in updated["delivery_contract"]["entities"]] == ["Student", "Course"]
+    assert updated["delivery_contract"]["api_contract"] == original["delivery_contract"]["api_contract"]
+    assert architecture_patch_issue(original, {"entities": [_entity("Unrelated")]}, fact)
+
+
+def test_missing_explicit_route_patch_adds_route_and_keeps_existing_api():
+    original = _decision([_api("/api/students", "Student")])
+    fact = contract_failure_fact(
+        ValueError("API 合同缺少原始需求明确指定的路由：/api/courses"), attempt=0,
+    )
+    patch = {"api_contract": [_api("/api/courses", "Course"), _api("/api/unused", "Student")]}
+    assert architecture_patch_issue(original, patch, fact) is None
+    updated = merge_scoped_architecture_patch(original, patch, fact["repair_scope"], error=fact["message"])
+    assert [row["path"] for row in updated["delivery_contract"]["api_contract"]] == [
+        "/api/students", "/api/courses",
+    ]
+    assert architecture_patch_issue(original, {"api_contract": [_api("/api/unused", "Student")]}, fact)
+
+
+def test_named_api_route_is_a_pre_freeze_gate_even_when_not_crud():
+    requirement = (
+        "开发汇率计算演示：Spring Boot REST 后端和 HTML 前端，"
+        "固定汇率通过 /api/convert 提供，不使用数据库，不做 CRUD。"
+    )
+    spec = CapabilityRouter().route(requirement)
+    candidate = {
+        "project_type": "web_app",
+        "backend_required": True,
+        "complexity": "low",
+        "delivery_contract": {
+            "entities": [_entity("User"), _entity("Conversion")],
+            "api_contract": [],
+        },
+    }
+    service = ArchitectureContractService(
+        validator=ArchitectureValidator(),
+        compiler=ContractCompiler(),
+        runtime=None,
+        repository=None,
+    )
+
+    assert spec.primary_entities == []
+    with pytest.raises(ArchitectureContractError, match="/api/convert"):
+        service.validate_candidate(candidate, spec)
+
+    candidate["delivery_contract"]["api_contract"] = [{
+        "path": "/api/convert",
+        "methods": ["POST"],
+        "fields": ["amount", "currency"],
+        "payload": {"amount": 100, "currency": "USD"},
+    }]
+    validated = service.validate_candidate(candidate, spec)
+    assert validated["contract"]["api_contract"][0]["path"] == "/api/convert"
+    assert validated["contract"]["entities"] == []
+    assert validated["contract"]["database_mode"] == "none"
 
 
 def test_file_plan_failure_is_owned_by_architecture_with_bounded_shape_scope():

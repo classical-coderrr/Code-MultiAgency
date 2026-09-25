@@ -49,6 +49,7 @@ class Case:
     requirement: str
     expected_stack: str
     clarification_answers: dict[str, Any] | None = None
+    difficulty: str = ""
 
 
 DEFAULT_CASES = (
@@ -79,13 +80,19 @@ def load_cases(path: Path | None = None) -> tuple[Case, ...]:
         answers = item.get("clarification_answers")
         if answers is not None and (not isinstance(answers, dict) or any(not isinstance(key, str) for key in answers)):
             raise ValueError("clarification_answers must be an object with string keys")
-        case = Case(item.get("id", ""), item.get("requirement", ""), item.get("expected_stack", ""), answers)
+        case = Case(
+            item.get("id", ""), item.get("requirement", ""),
+            item.get("expected_stack", ""), answers,
+            str(item.get("difficulty", "")).strip().upper(),
+        )
         if not isinstance(case.id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", case.id):
             raise ValueError("invalid case id")
         if not isinstance(case.requirement, str) or not case.requirement.strip():
             raise ValueError("case requirement must be nonempty")
         if not isinstance(case.expected_stack, str) or case.expected_stack not in STACKS:
             raise ValueError("unsupported expected_stack")
+        if case.difficulty and not re.fullmatch(r"L[1-9][0-9]*", case.difficulty):
+            raise ValueError("difficulty must use the form L1, L2, ...")
         cases.append(case)
     if len({case.id for case in cases}) != len(cases):
         raise ValueError("duplicate case id")
@@ -97,6 +104,14 @@ def _number(value: Any) -> int:
         return max(0, int(value))
     except (ValueError, TypeError, OverflowError):
         return 0
+
+
+def _decimal(value: Any) -> float:
+    try:
+        number = float(value)
+        return max(0.0, number) if math.isfinite(number) else 0.0
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -121,9 +136,18 @@ def redact(value: Any) -> Any:
 
 
 def write_json(path: Path, value: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(redact(value), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    temporary.replace(path)
+    for attempt in range(8):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as exc:
+            # Windows readers and virus scanners can briefly deny replacement
+            # even though the target is an isolated regression snapshot.
+            if getattr(exc, "winerror", None) not in {5, 32} or attempt == 7:
+                raise
+            time.sleep(min(0.02 * (2 ** attempt), 0.5))
 
 
 def token_metrics(run: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -337,8 +361,33 @@ def measure(case: Case, run: dict[str, Any], events: list[dict[str, Any]], durat
             "deliverable": deliverable, "stack_matches": matched, "failure_summary": redact(str(summary)) if summary else None,
             "duration_seconds": round(max(0, duration), 3), "active_duration_ms": run.get("active_duration_ms"),
             "tokens": token_metrics(run, events), **corrections,
+            "coding_loop": coding_loop_metrics(events),
             "first_pass": _first_pass({"deliverable": deliverable, **corrections}),
-            "delivery_contract": contract, "delivery_gate": gate, "gate_source": gate_source}
+            "delivery_contract": contract, "delivery_gate": gate, "gate_source": gate_source,
+            "difficulty": case.difficulty or None}
+
+
+def coding_loop_metrics(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "iterations": 0, "actions": 0, "action_failures": 0,
+        "repair_candidates": 0, "repair_interruptions": 0, "no_progress_breakers": 0,
+    }
+    for event in events:
+        kind = str(event.get("type") or "")
+        payload = _dict(event.get("payload"))
+        if kind == "coding_loop.iteration_started":
+            counts["iterations"] += 1
+        elif kind == "coding_loop.action_started":
+            counts["actions"] += 1
+        elif kind == "coding_loop.action_completed" and payload.get("success") is False:
+            counts["action_failures"] += 1
+        elif kind == "coding_loop.repair_candidate":
+            counts["repair_candidates"] += 1
+        elif kind == "coding_loop.repair_interrupted":
+            counts["repair_interruptions"] += 1
+        elif kind == "coding_loop.no_progress":
+            counts["no_progress_breakers"] += 1
+    return counts
 
 
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -356,9 +405,53 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "first_pass_unknown_runs": sum(_first_pass(row) is None for row in rows),
                 **{field: sum(_number(row.get(field)) for row in rows) for field in
                    ("repair_count", "generation_repair_count", "validation_repair_count", "retry_count",
-                    "continuation_count", "fallback_count", "recovery_count")}}
+                    "continuation_count", "fallback_count", "recovery_count")},
+                "coding_loop_iterations": sum(_number(_dict(row.get("coding_loop")).get("iterations")) for row in rows),
+                "coding_loop_actions": sum(_number(_dict(row.get("coding_loop")).get("actions")) for row in rows),
+                "coding_loop_repair_candidates": sum(_number(_dict(row.get("coding_loop")).get("repair_candidates")) for row in rows)}
     return {**totals(results), "by_case": {case_id: totals([row for row in results if row["case_id"] == case_id])
                                           for case_id in sorted({row["case_id"] for row in results})}}
+
+
+def render_markdown_report(report: dict[str, Any]) -> str:
+    summary = _dict(report.get("summary"))
+    lines = [
+        "# Agent-Team Coding Agent 难度递增回归报告",
+        "",
+        f"- 模式：{report.get('mode', 'unknown')}",
+        f"- 工作流 SHA-256：{report.get('workflow_sha256', 'unknown')}",
+        f"- 完成数：{summary.get('runs', 0)}",
+        f"- 可交付：{summary.get('deliverables', 0)}/{summary.get('runs', 0)} ({_decimal(summary.get('deliverable_rate')):.1%})",
+        f"- 首轮可交付：{summary.get('first_passes', 0)}/{summary.get('runs', 0)} ({_decimal(summary.get('first_pass_rate')):.1%})",
+        f"- 总耗时：{_decimal(summary.get('duration_seconds')):.1f} 秒；总 Token：{_number(summary.get('total_tokens'))}",
+        f"- 编码循环：{_number(summary.get('coding_loop_iterations'))} 轮、{_number(summary.get('coding_loop_actions'))} 个工具动作、{_number(summary.get('coding_loop_repair_candidates'))} 个修复候选",
+        "",
+        "| 难度 | 场景 | 状态 | 可交付 | 首轮通过 | 修复/重试 | 耗时 | Token | 主要失败原因 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in report.get("results", []):
+        if not isinstance(row, dict):
+            continue
+        repairs = _number(row.get("repair_count")) + _number(row.get("retry_count"))
+        reason = str(row.get("failure_summary") or "—").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+        if len(reason) > 300:
+            reason = reason[:297] + "…"
+        tokens = _number(_dict(row.get("tokens")).get("total_tokens"))
+        first_value = row.get("first_pass")
+        first_pass = "是" if first_value is True else "否" if first_value is False else "未知"
+        delivered = "是" if row.get("deliverable") else "否"
+        lines.append(
+            f"| {row.get('difficulty') or '—'} | {row.get('case_id', '')} | {row.get('status', '')} "
+            f"| {delivered} | {first_pass} | {repairs} | {_decimal(row.get('duration_seconds')):.1f}s | {tokens} | {reason} |"
+        )
+    lines.extend([
+        "",
+        "## 解释",
+        "",
+        "可交付要求工作流成功、技术栈匹配，并且适用的确定性成果物/集成 Gate 有通过证据；Agent 自报完成不计为通过。",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 async def drive_run(executor: Any, repository: Any, run_id: str, workflow: Any, inputs: dict[str, Any],
@@ -413,6 +506,14 @@ async def drive_run(executor: Any, repository: Any, run_id: str, workflow: Any, 
                 if auto_approve and waiting != approved:
                     await executor.approve(run_id, "approve")
                     approved = waiting
+                    if hasattr(executor, "wait_for_control_resolution"):
+                        try:
+                            await asyncio.wait_for(
+                                executor.wait_for_control_resolution(run_id),
+                                timeout=max(0.01, deadline - time.monotonic()),
+                            )
+                        except asyncio.TimeoutError:
+                            return "TIMEOUT"
             elif status == "WAITING_CLARIFICATION":
                 request = _dict(run.get("clarification"))
                 fields = {str(field) for field in request.get("unresolved_fields") or []}
@@ -421,8 +522,19 @@ async def drive_run(executor: Any, repository: Any, run_id: str, workflow: Any, 
                     return "NEEDS_INPUT"
                 request_id = str(request.get("request_id") or "")
                 if request_id and request_id != clarified:
-                    await executor.clarify(run_id, {field: answers[field] for field in fields})
+                    await executor.clarify(
+                        run_id,
+                        {**{field: answers[field] for field in fields}, "request_id": request_id},
+                    )
                     clarified = request_id
+                    if hasattr(executor, "wait_for_control_resolution"):
+                        try:
+                            await asyncio.wait_for(
+                                executor.wait_for_control_resolution(run_id),
+                                timeout=max(0.01, deadline - time.monotonic()),
+                            )
+                        except asyncio.TimeoutError:
+                            return "TIMEOUT"
             else:
                 approved = None
                 clarified = None
@@ -738,7 +850,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--case-id", action="append", default=[], help="run only matching case ID; repeat to select several")
     parser.add_argument("--repeat", type=_bounded_int, default=1)
-    parser.add_argument("--timeout", type=_positive, default=900)
+    parser.add_argument("--timeout", type=_positive, default=1800,
+                        help="maximum wall time for the workflow Run; defaults to 30 minutes for multi-Agent integration Gates")
+    parser.add_argument("--finalize-grace", type=_positive, default=45,
+                        help="bounded time after workflow deadline for durable result and gate evidence to flush")
     parser.add_argument("--cancel-grace", type=_positive, default=2)
     parser.add_argument("--max-retries", type=_bounded_int, default=0,
                         help="bounded core recovery, only with explicit retryable failure evidence")
@@ -795,7 +910,12 @@ def main(argv: list[str] | None = None) -> int:
                     "auto_approve": args.auto_approve, "max_retries": args.max_retries}
             write_json(directory / "spec.json", spec)
             process_result = supervise([rtk, "proxy", sys.executable, str(Path(__file__).resolve()),
-                                        "--worker", str(directory)], directory, timeout=args.timeout,
+                                        "--worker", str(directory)],
+                                       directory,
+                                       # The worker enforces the actual workflow
+                                       # deadline; this outer grace is only for
+                                       # persisting terminal evidence and cleanup.
+                                       timeout=args.timeout + args.finalize_grace,
                                        grace=args.cancel_grace,
                                        cancel_requested=lambda: (suite / "cancel").exists())
             evidence = salvage(directory, spec)
@@ -803,6 +923,23 @@ def main(argv: list[str] | None = None) -> int:
                 result = json.loads((directory / "result.json").read_text(encoding="utf-8"))
                 if process_result["returncode"] != 0:
                     result.update(status="FAILED", success=False, deliverable=False)
+            elif process_result["outcome"] == "TIMEOUT" and str(_dict(evidence.get("run")).get("status") or "") == "SUCCESS":
+                # The workflow deadline and process-finalization deadline are
+                # distinct. Recompute deliverability from durable evidence;
+                # never trust a success flag or infer missing Gate proof.
+                result = measure(
+                    case,
+                    _dict(evidence.get("run")) or {"id": spec["run_id"]},
+                    evidence.get("events", []),
+                    process_result["duration"],
+                )
+                if result.get("deliverable"):
+                    result["supervisor_outcome"] = "TIMEOUT_AFTER_TERMINAL_DELIVERY"
+                    result["finalization_grace_exhausted"] = True
+                else:
+                    result = measure(case, _dict(evidence.get("run")) or {"id": spec["run_id"]},
+                                     evidence.get("events", []), process_result["duration"],
+                                     outcome="TIMEOUT", error="Final delivery evidence was incomplete when the supervisor grace expired")
             else:
                 result = measure(case, _dict(evidence.get("run")) or {"id": spec["run_id"]},
                                  evidence.get("events", []), process_result["duration"],
@@ -811,18 +948,24 @@ def main(argv: list[str] | None = None) -> int:
                                  "Run total timeout" if process_result["outcome"] == "TIMEOUT" else
                                  "Worker failed; inspect result.json, worker.log and supervisor-error.json")
             result.update({"repetition": repetition, "directory": str(directory), "workflow_sha256": digest,
+                           "workflow_duration_seconds": result.get("duration_seconds"),
+                           "supervisor_duration_seconds": round(process_result["duration"], 3),
                            "duration_seconds": round(process_result["duration"], 3)})
             result["first_pass"] = _first_pass(result)
             write_json(directory / "result.json", result)
             results.append(result)
             report = {"mode": "live", "workflow_sha256": digest, "workflow_snapshot": snapshot,
+                      "execution_timeout_seconds": args.timeout,
+                      "finalize_grace_seconds": args.finalize_grace,
                       "metric_definitions": {"first_pass": "deliverable with zero repairs, retries, continuations, fallback and Run recovery across all attempts; null if attempt evidence is unavailable",
                                              "first_pass_rate": "confirmed first-pass deliverables divided by all Runs (including failures and unknowns)",
                                              "repair_count": "file/part generation repair attempts plus validation repair rounds, deduplicated per node execution",
                                              "retry_count": "node retries, excluding separately counted artifact repairs and continuations",
-                                             "recovery_count": "Run recovery count, reported separately from node retries"},
+                                             "recovery_count": "Run recovery count, reported separately from node retries",
+                                             "coding_loop": "persisted Plan/Act turns, bounded tool actions, and isolated repair candidates"},
                       "auto_approve": args.auto_approve, "results": results, "summary": aggregate(results)}
             write_json(suite / "report.json", report)
+            (suite / "report.md").write_text(render_markdown_report(report), encoding="utf-8")
             print(f"{case.id} #{repetition}: {result['status']} deliverable={result['deliverable']}", flush=True)
             summary = report["summary"]
             print(f"Cumulative success={summary['successes']}/{summary['runs']} ({summary['success_rate']:.1%}); "
@@ -834,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         if cancelled:
             break
     print(f"Report: {suite / 'report.json'}")
+    print(f"Markdown: {suite / 'report.md'}")
     return 130 if cancelled else 0 if all(row["deliverable"] for row in results) else 1
 
 

@@ -1,0 +1,72 @@
+[
+  {
+    "id": "swe-l1-cafe",
+    "difficulty": "L1",
+    "requirement": "做一个可直接打开的咖啡店宣传单页，使用纯 HTML/CSS/JavaScript。展示品牌简介、营业时间、地址和三款饮品；响应式排版、中文文案。不需要后端、数据库、登录或外部 API，交付完整源码。",
+    "expected_stack": "static_html",
+    "clarification_answers": {"primary_entity": "CafePage", "backend_required": false, "frontend_stack": "html", "database_mode": "none"}
+  },
+  {
+    "id": "swe-l2-gallery",
+    "difficulty": "L2",
+    "requirement": "开发摄影作品集静态网页，纯 HTML/CSS/JavaScript。至少展示六张本地 CSS 占位作品卡片，支持按风景/人像筛选、明暗主题切换，并将主题偏好保存在 localStorage。无需后端、数据库或外部图片服务。",
+    "expected_stack": "static_html",
+    "clarification_answers": {"primary_entity": "Photo", "backend_required": false, "frontend_stack": "html", "database_mode": "localStorage"}
+  },
+  {
+    "id": "swe-l3-todo",
+    "difficulty": "L3",
+    "requirement": "制作一个待办事项应用，使用纯 HTML/CSS/JavaScript 并直接在浏览器运行。任务字段为 id、title、completed；支持新增、列表、修改标题、完成切换、删除和空状态；数据存 localStorage。明确不需要后端和独立数据库。",
+    "expected_stack": "static_html",
+    "clarification_answers": {"primary_entity": "Task", "backend_required": false, "frontend_stack": "html", "database_mode": "localStorage"}
+  },
+  {
+    "id": "swe-l4-converter",
+    "difficulty": "L4",
+    "requirement": "开发可运行的汇率计算演示：Spring Boot REST 后端 + 原生 HTML/CSS/JavaScript 页面由 Spring Boot static 提供。用户输入金额和两种币种，后端用代码内固定汇率提供 /api/convert，不接外部 API、不使用数据库、不做 CRUD；补充 Maven 测试和启动说明。",
+    "expected_stack": "springboot_html",
+    "clarification_answers": {"primary_entity": "Conversion", "backend_required": true, "frontend_stack": "html", "database_mode": "none"}
+  },
+  {
+    "id": "swe-l5-notes",
+    "difficulty": "L5",
+    "requirement": "开发便签管理系统，Spring Boot 3 + 原生 HTML/CSS/JavaScript，同源页面放在 static 目录。Note 字段 id(Long)、title(String)、content(String)；使用 JPA/H2，实现列表、详情、新增、修改、删除，前端真实调用 /api/notes 和 /api/notes/{id}。不要登录或外部服务，交付 Maven 测试和启动说明。",
+    "expected_stack": "springboot_html",
+    "clarification_answers": {"primary_entity": "Note", "backend_required": true, "frontend_stack": "html", "database_mode": "h2"}
+  },
+  {
+    "id": "swe-l6-contacts",
+    "difficulty": "L6",
+    "requirement": "开发联系人管理系统：Spring Boot REST + Vue 3/Vite + JPA/H2。Contact 字段 id(Long)、name(String)、phone(String)、email(String)，提供 /api/contacts 与 /api/contacts/{id} 的列表、详情、新增、修改、删除；页面真实联调 API，包含表单校验、搜索和错误提示，Vite 配置 /api 代理。不要登录或外部服务。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Contact", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "swe-l7-inventory",
+    "difficulty": "L7",
+    "requirement": "开发库存商品管理系统：Spring Boot 3 + Vue 3/Vite + JPA/H2。Product 字段 id(Long)、name(String)、sku(String)、stock(Integer)、price(BigDecimal)，SKU 唯一；完成真实 CRUD、名称筛选、库存不可为负校验和 API 错误提示。路径为 /api/products、/api/products/{id}，Vite 代理 /api；交付可构建运行源码和测试。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Product", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "swe-l8-student-courses",
+    "difficulty": "L8",
+    "requirement": "开发课程与学生管理系统：Spring Boot + Vue 3/Vite + JPA/H2。Student(id Long,name String,email String) 和 Course(id Long,title String,teacher String) 是两个独立实体；分别实现各自的列表、详情、新增、修改、删除 API 与 Vue 管理视图，不需要选课关系、登录或外部服务。要求字段/API 一致、Vite /api 代理、Maven 测试和前端构建。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Student and Course", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "swe-l9-orders",
+    "difficulty": "L9",
+    "requirement": "开发商品与订单管理系统：Spring Boot + Vue 3/Vite + JPA/H2。Product(id Long,name String,price BigDecimal,stock Integer) 与 Order(id Long,productId Long,quantity Integer,status String) 分别有 CRUD；创建订单时检查商品存在、数量为正且库存足够，并在同一事务内扣库存。前端管理商品和订单并显示校验错误；不做支付、登录或外部服务。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Product and Order", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  },
+  {
+    "id": "swe-l10-hotel-bookings",
+    "difficulty": "L10",
+    "requirement": "开发酒店客房与预订管理系统：Spring Boot + Vue 3/Vite + JPA/H2。Room(id Long,number String,type String,nightlyPrice BigDecimal,status String) 与 Booking(id Long,roomId Long,guestName String,checkIn LocalDate,checkOut LocalDate,status String) 都提供完整 CRUD。创建或修改预订时校验客房存在、退房晚于入住，且同一客房有效预订日期不能重叠；页面真实联调两类 CRUD、展示校验错误。不要登录、支付或外部服务；交付 Maven 测试、npm 构建及启动说明。",
+    "expected_stack": "springboot_vue",
+    "clarification_answers": {"primary_entity": "Room and Booking", "backend_required": true, "frontend_stack": "vue", "database_mode": "h2"}
+  }
+]

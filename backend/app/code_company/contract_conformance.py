@@ -12,12 +12,18 @@ from pathlib import PurePosixPath
 from typing import Any
 
 
-def _check(check_id: str, target: str, label: str, errors: list[str], success: str) -> dict[str, str]:
-    return {
+def _check(
+    check_id: str, target: str, label: str, errors: list[str], success: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
         "id": check_id, "target": target, "label": label,
         "status": "failed" if errors else "passed",
         "message": "；".join(errors[:12]) if errors else success,
     }
+    if evidence:
+        result["evidence"] = evidence
+    return result
 
 
 def _normalize_api_path(path: str) -> str:
@@ -63,7 +69,7 @@ def _frontend_paths(files: dict[str, dict[str, Any]], allowed_paths: set[str]) -
         if str(item.get("step_id") or item.get("owner")) != "frontend":
             continue
         source = str(item.get("content") or "")
-        for match in re.finditer(r"[\'\"`](/[A-Za-z0-9_./{}$-]+)", source):
+        for match in re.finditer(r"[\'\"`](/[A-Za-z0-9_./{}$()-]+)", source):
             api_path = _normalize_api_path(match.group(1))
             first_segment = "/" + api_path.strip("/").split("/", 1)[0]
             expected_segment = any(
@@ -240,10 +246,57 @@ def check_contract_conformance(compiled: dict[str, Any], raw_files: list[dict[st
             for field in (definition.get("columns") or {}):
                 if str(field).lower() not in actual_columns and _snake(str(field)) not in actual_columns:
                     schema_errors.append(f"表 {table} 缺少实体字段 {field}")
-        checks.append(_check("database-entity-contract", "database", "实体与数据库字段", schema_errors, "SQL 表和字段覆盖冻结实体合同。"))
+        checks.append(_check("database-entity-contract", "database", "实体与数据库字段", schema_errors, "SQL 表和字段覆盖冻结实体合同。", {
+            "relatedFiles": ["src/main/resources/schema.sql"],
+            "expected": ", ".join(str(table) for table in expected_tables),
+            "actual": ", ".join(sorted(tables)),
+        }))
+
+    # Spring Boot's default physical naming converts Java camelCase fields to
+    # snake_case columns. The logical contract accepts either spelling, but a
+    # generated unquoted schema with productId will not satisfy product_id at
+    # runtime. Detect this before the slower Maven/startup gate.
+    config_source = "\n".join(
+        str(item.get("content") or "")
+        for path, item in files.items()
+        if PurePosixPath(path).name in {"application.yml", "application.yaml", "application.properties"}
+    )
+    if expected_tables and schema and not re.search(r"physical[-.]strategy", config_source, re.I):
+        physical_errors: list[str] = []
+        for table, definition in expected_tables.items():
+            if not isinstance(definition, dict):
+                continue
+            actual_columns = tables.get(str(table).lower()) or set()
+            entity_id = str(definition.get("entity_id") or "")
+            entity_sources = [
+                str(item.get("content") or "")
+                for path, item in files.items()
+                if str(item.get("step_id") or item.get("owner")) == "backend"
+                and PurePosixPath(path).name in {f"{entity_id}.java", f"{entity_id}Entity.java"}
+            ]
+            if not entity_sources:
+                continue
+            for field in (definition.get("columns") or {}):
+                field = str(field)
+                physical = _snake(field)
+                if (
+                    physical != field.lower()
+                    and field.lower() in actual_columns
+                    and physical not in actual_columns
+                    and re.search(r"\b" + re.escape(field) + r"\s*;", entity_sources[0])
+                ):
+                    physical_errors.append(
+                        f"schema.sql 表 {table} 的列 {field} 与 Spring JPA 默认物理列名 {physical} 不一致"
+                    )
+        checks.append(_check(
+            "database-physical-column-contract", "database", "SQL 与 JPA 物理列名",
+            physical_errors, "SQL 列名与 Spring JPA 默认命名策略一致。",
+            {"relatedFiles": ["src/main/resources/schema.sql"]},
+        ))
 
     entity_errors: list[str] = []
     table_errors: list[str] = []
+    reserved_table_errors: list[str] = []
     checked_entities = 0
     expected_entity_tables = {
         str(definition.get("entity_id")): str(table)
@@ -260,10 +313,25 @@ def check_contract_conformance(compiled: dict[str, Any], raw_files: list[dict[st
         expected_table = expected_entity_tables.get(str(entity_name))
         if expected_table:
             annotation = re.search(r"@(?:[A-Za-z_]\w*\.)*Table\s*\(([^)]*)\)", source)
-            declared = re.search(r'\bname\s*=\s*"([^"]+)"', annotation.group(1)) if annotation else None
-            if declared and declared.group(1).lower() != expected_table.lower():
+            declared = re.search(r'\bname\s*=\s*"((?:\\.|[^"\\])*)"', annotation.group(1)) if annotation else None
+            raw_table_name = declared.group(1) if declared else ""
+            normalized_table_name = raw_table_name.replace('\\"', '"').strip('"`')
+            if declared and normalized_table_name.lower() != expected_table.lower():
                 table_errors.append(
                     f"{path} @Table(name=\"{declared.group(1)}\") 与冻结表 {expected_table} 不一致"
+                )
+            if (
+                expected_table.lower() == "order"
+                and (
+                    not declared
+                    or (
+                        normalized_table_name.lower() == "order"
+                        and not (raw_table_name.startswith('\\"') or raw_table_name.startswith('`'))
+                    )
+                )
+            ):
+                reserved_table_errors.append(
+                    f"{path} 的 order 是 SQL 关键字；保留冻结表名，并在 @Table 中引用标识符"
                 )
         actual_fields = _entity_fields_with_mapped_superclass(path, source, files)
         expected_fields = {field: java_type for java_type, field in re.findall(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?:,|\))", str(dto_source))}
@@ -276,6 +344,20 @@ def check_contract_conformance(compiled: dict[str, Any], raw_files: list[dict[st
     if checked_entities:
         checks.append(_check("backend-entity-contract", "backend", "后端实体字段", entity_errors, "Java Entity 字段与冻结实体合同一致。"))
         if expected_entity_tables:
-            checks.append(_check("backend-table-contract", "backend", "后端实体表名合同", table_errors, "Java Entity 显式表名与冻结数据库合同一致。"))
+            checks.append(_check("backend-table-contract", "backend", "后端实体表名合同", table_errors, "Java Entity 显式表名与冻结数据库合同一致。", {
+                "relatedFiles": [
+                    path for path in files
+                    if any(error.startswith(path + " ") for error in table_errors)
+                ],
+                "expected": ", ".join(f"{entity}={table}" for entity, table in expected_entity_tables.items()),
+            }))
+            checks.append(_check(
+                "backend-reserved-table-contract", "backend", "JPA 保留字表名",
+                reserved_table_errors, "JPA 保留字表名已正确引用。",
+                {"relatedFiles": [
+                    path for path in files
+                    if any(error.startswith(path + " ") for error in reserved_table_errors)
+                ]},
+            ))
 
     return checks

@@ -1115,6 +1115,43 @@ function handleEvent(event: Record<string, any>) {
   const type = event.type as string
   const payload = event.payload ?? {}
   const stepId = payload.stepId as string | undefined
+  if (type.startsWith('coding_loop.')) {
+    const toolLabels: Record<string, string> = {
+      'repo.tree': '查看目录', 'repo.search': '搜索代码', 'repo.read': '读取文件',
+      'git.status': '查看 Git 状态', 'git.diff': '查看代码差异', 'git.log': '查看提交记录',
+      'fs.create': '创建文件', 'fs.patch': '定点修改', 'fs.append': '分块追加',
+    }
+    const tool = toolLabels[String(payload.tool ?? '')] ?? String(payload.tool ?? '工具动作')
+    const filePath = String(payload.metadata?.path ?? '')
+    const actionNumber = Number(payload.sequence ?? 0)
+    const actionSuffix = actionNumber ? ' · 动作 ' + actionNumber : ''
+    if (type === 'coding_loop.iteration_started') {
+      addLog((stepId ?? '编码 Agent') + ' 开始编码循环第 ' + Number(payload.iteration ?? 0) + ' 轮', 'step', 'running', stepId)
+    } else if (type === 'coding_loop.action_started') {
+      addLog((stepId ?? '编码 Agent') + ' 正在' + tool + actionSuffix, 'step', 'running', stepId, filePath)
+    } else if (type === 'coding_loop.action_completed') {
+      const success = Boolean(payload.success)
+      addLog((stepId ?? '编码 Agent') + ' ' + tool + (success ? '已完成' : '失败') + actionSuffix, 'step', success ? 'success' : 'waiting', stepId, [filePath, payload.error].filter(Boolean).join(' · '))
+    } else if (type === 'coding_loop.action_reconciled') {
+      const complete = String(payload.status ?? '') === 'COMPLETED'
+      addLog((stepId ?? '编码 Agent') + ' 已核对中断动作 · ' + tool + actionSuffix, 'step', complete ? 'success' : 'waiting', stepId, [filePath, payload.reason].filter(Boolean).join(' · '))
+    } else if (type === 'coding_loop.action_rejected') {
+      addLog((stepId ?? '编码 Agent') + ' 请求的' + tool + '被安全策略拒绝', 'step', 'waiting', stepId, String(payload.reason ?? ''))
+    } else if (type === 'coding_loop.action_limit') {
+      addLog((stepId ?? '编码 Agent') + ' 已达到工具动作上限', 'step', 'waiting', stepId, '上限：' + Number(payload.maxToolActions ?? 0) + ' 次')
+    } else if (type === 'coding_loop.protocol_error') {
+      addLog((stepId ?? '编码 Agent') + ' 输出格式未符合工具协议', 'step', 'waiting', stepId, String(payload.reason ?? ''))
+    } else if (type === 'coding_loop.no_progress') {
+      addLog((stepId ?? '编码 Agent') + ' 重复动作无进展 · 已熔断', 'step', 'failed', stepId, String(payload.reason ?? ''))
+    } else if (type === 'coding_loop.final_pending_validation') {
+      addLog((stepId ?? '编码 Agent') + ' 已提交候选结果 · 等待外层验证', 'step', 'waiting', stepId, String(payload.message ?? '模型自报完成不代表验证通过'))
+    } else if (type === 'coding_loop.repair_candidate') {
+      const files = Array.isArray(payload.files) ? payload.files.join('、') : ''
+      addLog((stepId ?? '编码 Agent') + ' 已在隔离候选中修复 · 等待目标 Gate', 'step', 'waiting', stepId, files)
+    } else if (type === 'coding_loop.repair_interrupted') {
+      addLog((stepId ?? '编码 Agent') + ' 工具式修复未完成 · 将回退到受控修复流程', 'step', 'waiting', stepId, String(payload.reason ?? ''))
+    }
+  }
   if (stepId) {
     const status = (payload.status ?? type.split('.')[1]?.toUpperCase()) as Status
     if (['PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'SKIPPED', 'WAITING_APPROVAL', 'WAITING_CLARIFICATION'].includes(status)) updateNode(stepId, status)
@@ -1521,6 +1558,15 @@ async function connectToRun(id: string) {
   eventTypes.push('delivery.repair_started', 'delivery.repair_completed', 'delivery.archive_rebuild_started', 'delivery.archive_rebuild_completed')
   eventTypes.push('collaboration.started', 'collaboration.message', 'collaboration.completed', 'collaboration.unavailable')
   eventTypes.push('worker.lease_acquired', 'worker.lease_released', 'worker.lease_lost', 'worker.execution_error', 'worker.control_applied', 'worker.control_rejected')
+  const codingEventTypes = [
+    'coding_loop.action_started', 'coding_loop.action_completed', 'coding_loop.action_reconciled',
+    'coding_loop.action_rejected', 'coding_loop.action_limit', 'coding_loop.protocol_error',
+    'coding_loop.no_progress', 'coding_loop.final_pending_validation',
+    'coding_loop.repair_candidate', 'coding_loop.repair_interrupted',
+  ]
+  codingEventTypes.forEach((eventType) => source.addEventListener(eventType, (message) => {
+    parseEventMessage(message as MessageEvent)
+  }))
   eventTypes.forEach((eventType) => source.addEventListener(eventType, (message) => {
     parseEventMessage(message as MessageEvent)
   }))

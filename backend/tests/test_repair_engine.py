@@ -267,6 +267,46 @@ def test_owner_reexecution_allows_owned_file_changes_only():
     ) == []
 
 
+def test_routed_owner_receives_cross_layer_evidence_and_table_owners_are_precise():
+    route = ValidationCheck(
+        "frontend-backend-route-contract", "frontend", "前后端路由合同", "failed",
+        "/api/rooms=HTTP 404",
+    )
+    browser = ValidationCheck(
+        "browser-crud", "frontend", "浏览器 CRUD 操作", "failed", "新增后无记录",
+        evidence={"networkEvents": [{"resourceType": "fetch", "url": "http://127.0.0.1/api/rooms", "status": 404}]},
+    )
+    schema = ValidationCheck("database-entity-contract", "database", "数据库表合同", "failed", "缺少 room 表")
+    table = ValidationCheck("backend-table-contract", "backend", "实体表名合同", "failed", "Room.java 使用 rooms")
+    validation = ArtifactValidationResult("failed", "合同不一致", ("frontend", "backend"), (route, browser, schema, table))
+    engine = RepairEngine()
+    assert {check.id for check in engine.checks_for_owner(validation, "backend")} == {
+        "frontend-backend-route-contract", "browser-crud", "backend-table-contract",
+    }
+    assert {check.id for check in engine.checks_for_owner(validation, "database")} == {"database-entity-contract"}
+    assert engine.targets(validation) == ["backend", "frontend", "database"]
+
+
+def test_table_annotation_repair_requires_reported_file_and_frozen_mapping():
+    candidate = {"name": "src/main/java/com/example/Room.java", "content": '@Entity @Table(name="rooms") class Room {}'}
+    compiled = {"database_schema": {"tables": {"room": {"entity_id": "Room", "columns": {}}}}}
+    mismatch = ValidationCheck("backend-table-contract", "backend", "后端实体表名合同", "failed",
+                               'src/main/java/com/example/Room.java @Table(name="rooms") 与冻结表 room 不一致')
+    assert WorkflowExecutor._frozen_table_annotation_repair(candidate, [mismatch], compiled) == (
+        '@Entity @Table(name="room") class Room {}'
+    )
+    assert WorkflowExecutor._frozen_table_annotation_repair(candidate, [], compiled) is None
+    assert WorkflowExecutor._frozen_table_annotation_repair(candidate, [mismatch],
+        {"database_schema": {"tables": {"other": {"entity_id": "Room"}}}}) is None
+
+
+def test_database_contract_repair_selects_schema_file():
+    schema = {"name": "src/main/resources/schema.sql", "content": "CREATE TABLE room(id BIGINT);"}
+    files = [schema, {"name": "src/main/resources/data.sql", "content": ""}]
+    check = ValidationCheck("database-entity-contract", "database", "实体与数据库字段", "failed", "缺少表 booking")
+    assert WorkflowExecutor._validation_repair_candidates(files, check.message, checks=[check]) == [schema]
+
+
 def test_no_progress_opens_repair_circuit_after_two_rounds():
     engine = RepairEngine()
     validation = failed("backend-build", "backend", "compile failed")
@@ -361,6 +401,41 @@ def test_resolving_one_missing_symbol_can_progress_to_next_at_same_build_gate():
         return ArtifactValidationResult("failed", "编译失败", ("backend",), (check,))
     assert RepairEngine.made_progress(failed_symbol("FirstException"), failed_symbol("SecondException"))
     assert not RepairEngine.made_progress(failed_symbol("FirstException"), failed_symbol("FirstException"))
+
+
+def test_new_fail_fast_gate_is_progress_only_when_old_failed_gate_explicitly_passes():
+    before = ArtifactValidationResult("failed", "UI hooks missing", ("frontend",), (
+        ValidationCheck("frontend-ui-hooks", "frontend", "UI hooks", "failed", "missing panels"),
+    ))
+    uncovered_backend = ArtifactValidationResult("failed", "Maven compile", ("backend",), (
+        ValidationCheck("frontend-ui-hooks", "frontend", "UI hooks", "passed", "fixed"),
+        ValidationCheck("backend-test", "backend", "Maven", "failed", "setId missing"),
+    ))
+    not_rechecked = ArtifactValidationResult("failed", "Maven compile", ("backend",), (
+        ValidationCheck("backend-test", "backend", "Maven", "failed", "setId missing"),
+    ))
+    assert RepairEngine.made_progress(before, uncovered_backend)
+    assert not RepairEngine.made_progress(before, not_rechecked)
+
+
+def test_multi_entity_maven_errors_select_both_service_files_for_backend_repair():
+    files = [
+        {"name": "src/main/java/com/example/app/StudentService.java", "content": "student.setId(null);"},
+        {"name": "src/main/java/com/example/app/CourseService.java", "content": "course.setId(null);"},
+        {"name": "src/main/java/com/example/app/Student.java", "content": "class Student {}"},
+        {"name": "src/main/java/com/example/app/Course.java", "content": "class Course {}"},
+    ]
+    log = (
+        "[ERROR] /tmp/src/main/java/com/example/app/CourseService.java:[28,15] cannot find symbol\n"
+        "[ERROR] symbol: method setId(null)\n"
+        "[ERROR] /tmp/src/main/java/com/example/app/StudentService.java:[31,16] cannot find symbol\n"
+        "[ERROR] symbol: method setId(null)"
+    )
+    selected = WorkflowExecutor._validation_repair_candidates(files, log)
+    assert {item["name"] for item in selected} == {
+        "src/main/java/com/example/app/StudentService.java",
+        "src/main/java/com/example/app/CourseService.java",
+    }
 
 
 def test_progressive_compilation_tracks_missing_methods_and_type_errors():

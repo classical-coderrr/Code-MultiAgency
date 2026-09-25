@@ -38,6 +38,10 @@ class ContractCompiler:
         blueprint = self.enrich_blueprint(blueprint)
         entities = [item for item in blueprint.get("entities", []) if isinstance(item, dict)]
         api_rows = [item for item in blueprint.get("api_contract", []) if isinstance(item, dict)]
+        stateless_api = (
+            str((blueprint.get("database") or {}).get("mode") or "none") == "none"
+            and not bool((blueprint.get("delivery_requirements") or {}).get("crud_required"))
+        )
         schemas: dict[str, Any] = {}
         java_dto: dict[str, str] = {}
         frontend_types: dict[str, str] = {}
@@ -78,25 +82,27 @@ class ContractCompiler:
             collection_path = str(row.get("collection_path") or row.get("path") or "").rstrip("/")
             if not collection_path:
                 continue
-            entity_name = self._resolve_entity(row, entities)
+            entity_name = self._resolve_entity(row, entities, allow_unbound=stateless_api)
             identity = str(row.get("identity_field") or "id")
             detail_path = str(row.get("detail_path") or f"{collection_path}/{{{identity}}}")
-            schema_ref = {"$ref": f"#/components/schemas/{entity_name}"} if entity_name else {"type": "object"}
+            entity_schema = {"$ref": f"#/components/schemas/{entity_name}"} if entity_name else None
+            request_schema = entity_schema or self._inline_api_schema(row, "request_schema", use_payload=True)
+            response_schema = entity_schema or self._inline_api_schema(row, "response_schema", use_payload=False)
             fields = list(row.get("fields") or [])
             for method in row.get("methods") or []:
                 verb = str(method).lower()
                 target_path = detail_path if verb in {"put", "patch", "delete"} else collection_path
                 operation: dict[str, Any] = {"operationId": f"{verb}_{self._snake_case(entity_name or 'operation')}", "x-entity-id": entity_name}
                 if verb in {"post", "put", "patch"}:
-                    operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": schema_ref}}}
+                    operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": request_schema}}}
                 if verb == "delete":
                     operation["responses"] = {"204": {"description": "Deleted"}}
                     expected_status = 204
                 else:
-                    response_schema: dict[str, Any] = schema_ref
-                    if verb == "get" and target_path == collection_path and str(row.get("collection_response") or "array") == "array":
-                        response_schema = {"type": "array", "items": schema_ref}
-                    operation["responses"] = {"200": {"description": "OK", "content": {"application/json": {"schema": response_schema}}}}
+                    response_shape = response_schema
+                    if entity_name and verb == "get" and target_path == collection_path and str(row.get("collection_response") or "array") == "array":
+                        response_shape = {"type": "array", "items": entity_schema}
+                    operation["responses"] = {"200": {"description": "OK", "content": {"application/json": {"schema": response_shape}}}}
                     expected_status = 200
                 paths.setdefault(target_path, {})[verb] = operation
                 validator_rules.append({"entityId": entity_name, "path": target_path, "method": str(method).upper(), "requiredFields": fields})
@@ -105,7 +111,7 @@ class ContractCompiler:
                     detail_operation = {
                         "operationId": f"get_{self._snake_case(entity_name or 'operation')}_by_id",
                         "x-entity-id": entity_name,
-                        "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": schema_ref}}}},
+                        "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": response_schema}}}},
                     }
                     paths.setdefault(detail_path, {})["get"] = detail_operation
                     validator_rules.append({"entityId": entity_name, "path": detail_path, "method": "GET", "requiredFields": fields})
@@ -146,7 +152,13 @@ class ContractCompiler:
             skip.append("database")
         return {"skip_steps": skip, "source": "frozen_blueprint"}
 
-    def _resolve_entity(self, row: dict[str, Any], entities: list[dict[str, Any]]) -> str | None:
+    def _resolve_entity(
+        self,
+        row: dict[str, Any],
+        entities: list[dict[str, Any]],
+        *,
+        allow_unbound: bool = False,
+    ) -> str | None:
         explicit = str(row.get("entity_id") or row.get("entity") or "").strip()
         if explicit:
             resolved = self._type_name(explicit)
@@ -156,9 +168,35 @@ class ContractCompiler:
             return resolved
         path = str(row.get("collection_path") or row.get("path") or "")
         methods = {str(item).upper() for item in row.get("methods") or []}
+        if allow_unbound:
+            return None
         if row.get("fields") or row.get("payload") or methods & {"POST", "PUT", "PATCH", "DELETE"}:
             raise ValueError(f"API 合同 {path or '<unknown>'} 缺少明确 entity_id，禁止通过 URL 模糊推断")
         return None
+
+    @staticmethod
+    def _inline_api_schema(
+        row: dict[str, Any], schema_field: str, *, use_payload: bool,
+    ) -> dict[str, Any]:
+        declared = row.get(schema_field)
+        if isinstance(declared, dict) and declared.get("type"):
+            return deepcopy(declared)
+        payload = row.get("payload") if use_payload and isinstance(row.get("payload"), dict) else {}
+        fields = list(row.get("fields") or [])
+        names = list(dict.fromkeys([*fields, *payload.keys()])) if use_payload else []
+        properties: dict[str, Any] = {}
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, bool):
+                value_type = "boolean"
+            elif isinstance(value, int):
+                value_type = "integer"
+            elif isinstance(value, float):
+                value_type = "number"
+            else:
+                value_type = "string"
+            properties[str(name)] = {"type": value_type}
+        return {"type": "object", "properties": properties}
 
     @staticmethod
     def _dependency_manifest(blueprint: dict[str, Any]) -> dict[str, Any]:
@@ -181,6 +219,7 @@ class ContractCompiler:
                     dependencies.append({"group": "com.mysql", "name": "mysql-connector-j", "scope": "runtime"})
             result["backend"] = {"manager": "maven", "java_version": "17", "spring_boot_version": "3.3.5", "dependencies": dependencies, "plugins": ["spring-boot-maven-plugin"]}
             result["managed_files"]["pom.xml"] = "backend"
+            result["managed_files"]["src/main/java/com/example/app/Application.java"] = "backend"
         if frontend_stack == "vue":
             result["frontend"] = {
                 "manager": "npm", "node_version": ">=18",
@@ -189,6 +228,8 @@ class ContractCompiler:
                 "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
             }
             result["managed_files"]["package.json"] = "frontend"
+            result["managed_files"]["index.html"] = "frontend"
+            result["managed_files"]["src/main.js"] = "frontend"
         return result
 
     @staticmethod
@@ -222,8 +263,8 @@ class ContractCompiler:
                 controller_path = f"{package_root}/{name}Controller.java"
                 add(entity_path, "backend", [name], ["DatabaseSchema"] if database_mode != "none" else [])
                 add(repository_path, "backend", [f"{name}Repository"], [name], [entity_path])
-                add(service_path, "backend", [f"{name}Service"], [f"{name}Repository"], [repository_path])
-                add(controller_path, "backend", [f"{name}Controller"], [f"{name}Service", "ApiContract"], [service_path])
+                add(service_path, "backend", [f"{name}Service"], [name, f"{name}Repository"], [entity_path, repository_path])
+                add(controller_path, "backend", [f"{name}Controller"], [name, f"{name}Service", "ApiContract"], [entity_path, service_path])
         elif backend_stack == "python":
             add("requirements.txt", "backend", ["BackendDependencies"])
             add("models.py", "backend", ["BackendModels"], ["DatabaseSchema"] if database_mode != "none" else [])
@@ -233,13 +274,44 @@ class ContractCompiler:
             add("package.json", "frontend", ["FrontendDependencies"])
             add("index.html", "frontend", ["FrontendEntry"], ["FrontendDependencies"], ["package.json"])
             add("src/main.js", "frontend", ["FrontendBootstrap"], ["FrontendDependencies", "AppComponent"], ["package.json", "src/App.vue"])
-            add("src/App.vue", "frontend", ["AppComponent"], ["ApiContract"])
+            entities = [row for row in blueprint.get("entities") or [] if isinstance(row, dict)]
+            if len(entities) > 1:
+                component_paths: list[str] = []
+                component_symbols: list[str] = []
+                for entity in entities:
+                    name = self._type_name(entity.get("id") or entity.get("name") or "Entity")
+                    path = f"src/components/{name}Manager.vue"
+                    symbol = f"{name}ManagerComponent"
+                    add(path, "frontend", [symbol], ["ApiContract"])
+                    component_paths.append(path)
+                    component_symbols.append(symbol)
+                add("src/App.vue", "frontend", ["AppComponent"], component_symbols, component_paths)
+            else:
+                add("src/App.vue", "frontend", ["AppComponent"], ["ApiContract"])
             add("src/style.css", "frontend", ["FrontendStyles"])
         elif frontend_stack != "none":
             root = "src/main/resources/static/" if backend_stack == "springboot" and page_mode != "static" else ""
             add(f"{root}index.html", "frontend", ["FrontendEntry"], ["ApiContract"] if backend_stack != "none" else [])
             add(f"{root}style.css", "frontend", ["FrontendStyles"])
             add(f"{root}script.js", "frontend", ["FrontendBehavior"], ["ApiContract"] if backend_stack != "none" else [])
+
+        # A frozen manifest is the source of truth for all downstream agents.
+        # Reject both same-owner duplicates and cross-owner collisions here,
+        # before parallel generation can create two competing artifacts.
+        seen_paths: dict[str, dict[str, Any]] = {}
+        for row in plan:
+            path = str(row.get("path") or "").replace("\\", "/").strip("/")
+            key = path.casefold()
+            previous = seen_paths.get(key)
+            if previous is not None:
+                previous_path = str(previous.get("path") or "")
+                previous_owner = str(previous.get("owner") or "unknown")
+                owner = str(row.get("owner") or "unknown")
+                raise ValueError(
+                    f"Frozen artifact file plan contains duplicate path {path!r} "
+                    f"(owners: {previous_owner}, {owner}; first path: {previous_path!r})"
+                )
+            seen_paths[key] = row
         return plan
 
     @staticmethod

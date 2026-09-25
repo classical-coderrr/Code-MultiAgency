@@ -117,7 +117,9 @@ class AgentTeamWorker:
         # long-lived Worker remains alive. Reload the non-secret process config
         # before every new Run; keys never enter Redis payloads.
         load_dotenv(BACKEND_DIR / ".env", override=True)
-        self.executor.provider = ProviderFactory.create_from_env()
+        provider = ProviderFactory.create_from_env()
+        self.executor.provider = provider
+        self.executor.model_invocation.set_provider(provider)
         if job.action == "retry":
             await self.executor.retry(job.run_id, workflow)
         elif job.action == "approve":
@@ -178,7 +180,8 @@ class AgentTeamWorker:
         await self.event_bus.emit("worker.lease_acquired", job.run_id, {
             "workerId": self.worker_id, "leaseToken": lease.token[:8], "action": job.action,
         })
-        execution = asyncio.create_task(self._execute(job))
+        with self.repository.lease_fence(job.run_id, lease.token):
+            execution = asyncio.create_task(self._execute(job))
         control_cursor = "0-0"
         last_heartbeat = 0.0
         release_reason = "completed"
@@ -195,14 +198,16 @@ class AgentTeamWorker:
                         await self.executor.abandon_for_lease_loss(job.run_id)
                         await self.event_bus.emit("worker.lease_lost", job.run_id, {"workerId": self.worker_id})
                         return False
-                    self.repository.update_run(job.run_id, heartbeat_at=utc_now())
+                    with self.repository.lease_fence(job.run_id, lease.token):
+                        self.repository.update_run(job.run_id, heartbeat_at=utc_now())
                     last_heartbeat = now
 
                 control_cursor, controls = await self.coordinator.read_controls(
                     job.run_id, control_cursor, block_ms=500
                 )
                 for control in controls:
-                    await self._apply_control(job.run_id, lease, control)
+                    with self.repository.lease_fence(job.run_id, lease.token):
+                        await self._apply_control(job.run_id, lease, control)
 
                 if execution.done():
                     with suppress(asyncio.CancelledError):

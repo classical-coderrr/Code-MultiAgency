@@ -63,7 +63,7 @@ steps:
     # Architecture 的 Auto 启动预算会根据需求难度在 2200/3600/5200 之间规划。
     max_tokens: 6000
     skills: [architecture-routing]
-    depends_on: [token_estimator]
+    depends_on: [requirement]
     task: |
       Routing guard: a business/data management system or CRUD requirement must keep both Backend and Frontend unless the original user request explicitly allows pure frontend, browser-only, no backend, or localStorage. Do not classify a student/user/order/product management system as static_html just because it is simple, a demo, an MVP, or does not mention an API/database. If the scope is ambiguous, preserve the implementation branches and list the ambiguity in risks.
       Architecture should also report required_capabilities, optional_capabilities, evidence, needs_clarification, and clarification_questions. Prefer capability names such as frontend, backend, persistence, authentication, external_api, tool, rag, artifact, human_approval, and async. Do not invent or select a company-specific route from these fields.
@@ -80,12 +80,12 @@ steps:
 
   - id: database
     agent: database_agent
-    timeout: 120s
+    timeout: 600s
     generation_mode: artifacts
     enforce_artifact_contract: true
     max_tokens: 6000
     skills: [artifact-file-generation]
-    depends_on: [architecture_approval]
+    depends_on: [architecture_approval, token_estimator]
     task: |
       当前 Agent 的冻结角色合同：{{role_contract}}
       SQL 列类型必须严格匹配冻结 Entity Contract；数据库表/字段定义要明确写进文件和数据库说明，不得改变实体、字段或主键类型。
@@ -95,13 +95,13 @@ steps:
 
   - id: backend
     agent: backend_agent
-    timeout: 120s
-    generation_mode: auto
+    timeout: 600s
+    generation_mode: artifacts
     enforce_artifact_contract: true
     # Auto 由 Runtime Plan Agent 与 Architecture 策略共同规划；6000 是安全上限。
     max_tokens: 6000
     skills: [backend-api-contract, artifact-file-generation]
-    depends_on: [architecture_approval]
+    depends_on: [architecture_approval, database]
     task: |
       当前 Agent 的冻结角色合同：{{role_contract}}
       原始需求（仅用于审计和文案追踪，发生冲突时不得覆盖冻结合同）：{{requirement}}
@@ -114,12 +114,12 @@ steps:
 
   - id: frontend
     agent: frontend_agent
-    timeout: 120s
-    generation_mode: auto
+    timeout: 600s
+    generation_mode: artifacts
     enforce_artifact_contract: true
     max_tokens: 6000
     skills: [frontend-vue-implementation, artifact-file-generation]
-    depends_on: [architecture_approval]
+    depends_on: [architecture_approval, token_estimator]
     thinking: auto
     task: |
       当前 Agent 的冻结角色合同：{{role_contract}}
@@ -165,6 +165,7 @@ steps:
     max_tokens: 6000
     skills: [delivery-review]
     depends_on: [tester]
+    failure_policy: continue
     task: |
       冻结交付合同（真实验收依据，不允许放宽）：{{delivery_contract}}
       对整个软件开发方案进行最终审查，生成 final_report：

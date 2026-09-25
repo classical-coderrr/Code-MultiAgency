@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import contextvars
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -13,6 +15,13 @@ from typing import Any, Callable, TypeVar, cast
 
 
 T = TypeVar("T")
+_run_lease_context: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "agent_team_repository_lease", default=None
+)
+
+
+class StaleRunLeaseError(RuntimeError):
+    """Raised when a worker attempts to write after its Run lease was fenced."""
 
 
 def utc_now() -> str:
@@ -26,6 +35,10 @@ def _sqlite_retry(function: Callable[..., T]) -> Callable[..., T]:
         for attempt in range(8):
             try:
                 with self._lock:
+                    lease = _run_lease_context.get()
+                    read_prefixes = ("get_", "list_", "find_", "has_", "count_", "is_")
+                    if lease and not function.__name__.startswith(read_prefixes):
+                        self._assert_current_lease(*lease)
                     return function(self, *args, **kwargs)
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc).lower() or attempt == 7:
@@ -83,6 +96,21 @@ class SQLiteRepository:
                 run_id TEXT NOT NULL, event_type TEXT NOT NULL,
                 timestamp TEXT NOT NULL, payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS coding_tool_actions (
+                run_id TEXT NOT NULL, step_id TEXT NOT NULL, action_id TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL, tool TEXT NOT NULL, arguments_hash TEXT NOT NULL,
+                intent_json TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, step_id, action_id),
+                UNIQUE (run_id, step_id, sequence_no)
+            );
+            CREATE TABLE IF NOT EXISTS coding_loop_turns (
+                run_id TEXT NOT NULL, step_id TEXT NOT NULL, turn_no INTEGER NOT NULL,
+                requested_max_tokens INTEGER NOT NULL, status TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                finish_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, step_id, turn_no)
+            );
             CREATE TABLE IF NOT EXISTS artifact_versions (
                 id TEXT PRIMARY KEY, run_id TEXT NOT NULL, name TEXT NOT NULL,
                 version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
@@ -117,6 +145,10 @@ class SQLiteRepository:
             CREATE INDEX IF NOT EXISTS idx_collaboration_run_conversation
                 ON collaboration_messages(run_id, conversation_id, round_number, created_at);
             CREATE INDEX IF NOT EXISTS idx_run_events_run_id_id ON run_events(run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_coding_actions_run_step_sequence
+                ON coding_tool_actions(run_id, step_id, sequence_no);
+            CREATE INDEX IF NOT EXISTS idx_coding_turns_run_step_turn
+                ON coding_loop_turns(run_id, step_id, turn_no);
             CREATE INDEX IF NOT EXISTS idx_run_attempts_run_step ON run_attempts(run_id, step_id, attempt_index);
             CREATE INDEX IF NOT EXISTS idx_run_worker_leases_run ON run_worker_leases(run_id, id);
             """
@@ -124,12 +156,33 @@ class SQLiteRepository:
         self._ensure_run_columns()
         self._ensure_step_columns()
         self._ensure_artifact_columns()
-        self._connection.commit()
+
+    @contextmanager
+    def lease_fence(self, run_id: str, lease_token: str):
+        """Fence repository writes issued by a Redis Worker execution task."""
+        token = _run_lease_context.set((str(run_id), str(lease_token)))
+        try:
+            yield
+        finally:
+            _run_lease_context.reset(token)
+
+    def _assert_current_lease(self, run_id: str, lease_token: str) -> None:
+        row = self._connection.execute(
+            "SELECT lease_token, released_at FROM run_worker_leases WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        # Runs executed outside Redis Worker mode have no lease row and remain
+        # governed by the normal local executor lifecycle.
+        if row is None:
+            return
+        if str(row["lease_token"] or "") != lease_token or row["released_at"] is not None:
+            raise StaleRunLeaseError(f"Run lease lost; fenced writes rejected for {run_id}")
 
     def _ensure_run_columns(self) -> None:
         existing = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(workflow_runs)").fetchall()}
         columns = {
             "state_json": "TEXT",
+            "state_revision": "INTEGER NOT NULL DEFAULT 0",
             "workflow_snapshot_json": "TEXT",
             "heartbeat_at": "TEXT",
             "recovery_count": "INTEGER NOT NULL DEFAULT 0",
@@ -200,18 +253,20 @@ class SQLiteRepository:
         snapshot: dict[str, Any],
         *,
         heartbeat_at: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Persist the resumable domain state beside LangGraph's checkpoint.
 
         The LangGraph checkpoint is the execution engine's state.  This copy is
         intentionally small in scope and gives the platform a provider-neutral
         recovery record when a process is restarted or a checkpoint is missing.
         """
-        self._connection.execute(
-            "UPDATE workflow_runs SET state_json = ?, heartbeat_at = COALESCE(?, heartbeat_at) WHERE id = ?",
-            (json.dumps(snapshot, ensure_ascii=False, default=str), heartbeat_at or utc_now(), run_id),
+        revision = max(1, int(snapshot.get("snapshot_revision") or 1))
+        cursor = self._connection.execute(
+            "UPDATE workflow_runs SET state_json = ?, state_revision = ?, heartbeat_at = COALESCE(?, heartbeat_at) WHERE id = ? AND state_revision < ?",
+            (json.dumps(snapshot, ensure_ascii=False, default=str), revision, heartbeat_at or utc_now(), run_id, revision),
         )
         self._connection.commit()
+        return cursor.rowcount == 1
 
     @_sqlite_retry
     def save_workflow_snapshot(self, run_id: str, snapshot: dict[str, Any]) -> None:
@@ -259,6 +314,185 @@ class SQLiteRepository:
             }
             for row in rows
         ]
+
+    @_sqlite_retry
+    def start_coding_action(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        action_id: str,
+        sequence_no: int,
+        tool: str,
+        arguments_hash: str,
+        intent: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably record an idempotent action intent before its side effect."""
+        sequence = max(1, int(sequence_no))
+        intent_json = json.dumps(intent, ensure_ascii=False, sort_keys=True, default=str)
+        now = utc_now()
+        existing = self._connection.execute(
+            "SELECT * FROM coding_tool_actions WHERE run_id = ? AND step_id = ? AND action_id = ?",
+            (run_id, step_id, action_id),
+        ).fetchone()
+        if existing:
+            if (
+                int(existing["sequence_no"]) != sequence
+                or str(existing["tool"]) != tool
+                or str(existing["arguments_hash"]) != arguments_hash
+            ):
+                raise ValueError("Coding tool action id was reused with different input")
+            return self._decode_coding_action(existing)
+        pending = self._connection.execute(
+            """SELECT action_id FROM coding_tool_actions
+               WHERE run_id = ? AND step_id = ? AND status = 'RUNNING' LIMIT 1""",
+            (run_id, step_id),
+        ).fetchone()
+        if pending:
+            raise RuntimeError("Another coding tool action is still in progress for this step")
+        collision = self._connection.execute(
+            "SELECT action_id FROM coding_tool_actions WHERE run_id = ? AND step_id = ? AND sequence_no = ?",
+            (run_id, step_id, sequence),
+        ).fetchone()
+        if collision:
+            raise ValueError("Coding tool action sequence is already occupied")
+        self._connection.execute(
+            """INSERT INTO coding_tool_actions
+                (run_id, step_id, action_id, sequence_no, tool, arguments_hash,
+                 intent_json, status, result_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', NULL, ?, ?)""",
+            (run_id, step_id, action_id, sequence, tool, arguments_hash, intent_json, now, now),
+        )
+        self._connection.commit()
+        row = self._connection.execute(
+            "SELECT * FROM coding_tool_actions WHERE run_id = ? AND step_id = ? AND action_id = ?",
+            (run_id, step_id, action_id),
+        ).fetchone()
+        return self._decode_coding_action(row)
+
+    @_sqlite_retry
+    def finish_coding_action(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        action_id: str,
+        status: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        terminal_status = str(status).upper()
+        if terminal_status not in {"COMPLETED", "UNKNOWN", "FAILED"}:
+            raise ValueError("Coding tool action status must be terminal")
+        result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+        row = self._connection.execute(
+            "SELECT * FROM coding_tool_actions WHERE run_id = ? AND step_id = ? AND action_id = ?",
+            (run_id, step_id, action_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("Coding tool action intent does not exist")
+        if str(row["status"]) != "RUNNING":
+            if str(row["status"]) == terminal_status and str(row["result_json"] or "") == result_json:
+                return self._decode_coding_action(row)
+            raise ValueError("Coding tool action was already resolved")
+        self._connection.execute(
+            """UPDATE coding_tool_actions SET status = ?, result_json = ?, updated_at = ?
+               WHERE run_id = ? AND step_id = ? AND action_id = ? AND status = 'RUNNING'""",
+            (terminal_status, result_json, utc_now(), run_id, step_id, action_id),
+        )
+        self._connection.commit()
+        resolved = self._connection.execute(
+            "SELECT * FROM coding_tool_actions WHERE run_id = ? AND step_id = ? AND action_id = ?",
+            (run_id, step_id, action_id),
+        ).fetchone()
+        return self._decode_coding_action(resolved)
+
+    @_sqlite_retry
+    def list_coding_actions(self, run_id: str, step_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            """SELECT * FROM coding_tool_actions
+               WHERE run_id = ? AND step_id = ? ORDER BY sequence_no""",
+            (run_id, step_id),
+        ).fetchall()
+        return [self._decode_coding_action(row) for row in rows]
+
+    @_sqlite_retry
+    def start_coding_turn(
+        self, *, run_id: str, step_id: str, turn_no: int, requested_max_tokens: int,
+    ) -> dict[str, Any]:
+        """Reserve one bounded model turn before the external request starts."""
+        turn = max(1, int(turn_no))
+        now = utc_now()
+        self._connection.execute(
+            """INSERT OR IGNORE INTO coding_loop_turns
+               (run_id, step_id, turn_no, requested_max_tokens, status,
+                input_tokens, output_tokens, finish_reason, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'RUNNING', 0, 0, NULL, ?, ?)""",
+            (run_id, step_id, turn, max(1, int(requested_max_tokens)), now, now),
+        )
+        self._connection.commit()
+        row = self._connection.execute(
+            "SELECT * FROM coding_loop_turns WHERE run_id = ? AND step_id = ? AND turn_no = ?",
+            (run_id, step_id, turn),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Coding model turn reservation was not persisted")
+        result = dict(row)
+        if int(result["requested_max_tokens"]) != max(1, int(requested_max_tokens)):
+            raise ValueError("Coding model turn number was reused with a different token reservation")
+        return result
+
+    @_sqlite_retry
+    def finish_coding_turn(
+        self, *, run_id: str, step_id: str, turn_no: int, status: str,
+        input_tokens: int = 0, output_tokens: int = 0, finish_reason: str | None = None,
+    ) -> dict[str, Any]:
+        terminal_status = str(status).upper()
+        if terminal_status not in {"COMPLETED", "FAILED", "INTERRUPTED"}:
+            raise ValueError("Coding model turn status must be terminal")
+        row = self._connection.execute(
+            "SELECT * FROM coding_loop_turns WHERE run_id = ? AND step_id = ? AND turn_no = ?",
+            (run_id, step_id, max(1, int(turn_no))),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Coding model turn reservation does not exist")
+        if str(row["status"]) != "RUNNING":
+            result = dict(row)
+            if str(result["status"]) == terminal_status:
+                return result
+            raise ValueError("Coding model turn was already resolved")
+        self._connection.execute(
+            """UPDATE coding_loop_turns SET status = ?, input_tokens = ?, output_tokens = ?,
+               finish_reason = ?, updated_at = ? WHERE run_id = ? AND step_id = ? AND turn_no = ?
+               AND status = 'RUNNING'""",
+            (terminal_status, max(0, int(input_tokens)), max(0, int(output_tokens)),
+             str(finish_reason)[:100] if finish_reason else None, utc_now(),
+             run_id, step_id, max(1, int(turn_no))),
+        )
+        self._connection.commit()
+        resolved = self._connection.execute(
+            "SELECT * FROM coding_loop_turns WHERE run_id = ? AND step_id = ? AND turn_no = ?",
+            (run_id, step_id, max(1, int(turn_no))),
+        ).fetchone()
+        return dict(resolved)
+
+    @_sqlite_retry
+    def list_coding_turns(self, run_id: str, step_id: str) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            """SELECT * FROM coding_loop_turns WHERE run_id = ? AND step_id = ?
+               ORDER BY turn_no""",
+            (run_id, step_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _decode_coding_action(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise ValueError("Coding tool action was not persisted")
+        result = dict(row)
+        result["sequence_no"] = int(result["sequence_no"])
+        result["intent"] = _decode_json(result.pop("intent_json", None), {})
+        result["result"] = _decode_json(result.pop("result_json", None), {})
+        return result
 
     @_sqlite_retry
     def append_collaboration_message(

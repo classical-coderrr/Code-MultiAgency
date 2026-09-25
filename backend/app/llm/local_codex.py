@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -86,15 +87,36 @@ class LocalCodexProvider(LLMProvider):
         if self.model_name not in {"", "codex-default", "local"}:
             command.extend(["--model", self.model_name])
 
-        stdout, stderr, returncode = await _run_process(
-            command,
-            cwd=self.working_directory,
-            timeout=total_timeout,
-            input_data=prompt.encode("utf-8"),
-            timeout_message=f"本地 Codex 执行超时（{total_timeout:g}s）",
-        )
+        schema = settings.get("response_schema")
+        temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        last_message_path: Path | None = None
+        if isinstance(schema, dict):
+            temp_dir = tempfile.TemporaryDirectory(prefix="agent-team-codex-output-")
+            schema_path = Path(temp_dir.name) / "response-schema.json"
+            last_message_path = Path(temp_dir.name) / "last-message.txt"
+            schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+            command.extend(["--output-schema", str(schema_path), "--output-last-message", str(last_message_path)])
+
+        final_message = ""
+        try:
+            stdout, stderr, returncode = await _run_process(
+                command,
+                cwd=self.working_directory,
+                timeout=total_timeout,
+                input_data=prompt.encode("utf-8"),
+                timeout_message=f"本地 Codex 执行超时（{total_timeout:g}s）",
+            )
+            if last_message_path and last_message_path.is_file():
+                final_message = last_message_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            if temp_dir is not None:
+                temp_dir.cleanup()
 
         text, reasoning, usage, finish_reason, event_error = _parse_jsonl(stdout)
+        if final_message.strip():
+            # The JSONL stream can contain intermediate assistant messages.
+            # Prefer Codex's dedicated final-message file for one protocol turn.
+            text = final_message.strip()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if returncode != 0:
             detail = event_error or stderr_text or "本地 Codex 返回非零退出码"
@@ -127,6 +149,7 @@ class LocalCodexProvider(LLMProvider):
                 "ephemeral": True,
                 "requested_max_tokens": max_tokens,
                 "token_control": "soft_prompt_only",
+                "structured_output": "codex_output_schema" if isinstance(schema, dict) else "none",
             },
         )
 
