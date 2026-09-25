@@ -55,6 +55,7 @@ class LLMProvider(ABC):
             "provider": "unknown",
             "model": "unknown",
             "supportsThinking": False,
+            "supportsJsonMode": False,
             "supportedLevels": ["off"],
             "defaultLevel": "off",
             "maxTokens": {"min": 1, "max": 6000},

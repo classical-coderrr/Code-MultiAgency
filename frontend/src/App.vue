@@ -1222,6 +1222,10 @@ function handleEvent(event: Record<string, any>) {
     const actionSuffix = actionNumber ? ' · 动作 ' + actionNumber : ''
     if (type === 'coding_loop.iteration_started') {
       addLog((stepId ?? '编码 Agent') + ' 开始编码循环第 ' + Number(payload.iteration ?? 0) + ' 轮', 'step', 'running', stepId)
+    } else if (type === 'coding_loop.protocol_mode') {
+      addLog((stepId ?? '编码 Agent') + ' 已选择 ' + (payload.mode === 'json_mode' ? 'JSON 输出模式' : '通用 JSON 协议'), 'step', 'running', stepId, String(payload.reason ?? ''))
+    } else if (type === 'coding_loop.completed') {
+      addLog((stepId ?? '编码 Agent') + ' 工具循环结束 · ' + Number(payload.toolCount ?? 0) + ' 个动作 · ' + Number(payload.successfulMutations ?? 0) + ' 次源码修改', 'step', 'waiting', stepId, '候选仍须通过目标 Gate 和完整回归')
     } else if (type === 'coding_loop.action_started') {
       addLog((stepId ?? '编码 Agent') + ' 正在' + tool + actionSuffix, 'step', 'running', stepId, filePath)
     } else if (type === 'coding_loop.action_completed') {
@@ -1654,6 +1658,7 @@ async function connectToRun(id: string) {
   eventTypes.push('collaboration.started', 'collaboration.message', 'collaboration.completed', 'collaboration.unavailable')
   eventTypes.push('worker.lease_acquired', 'worker.lease_released', 'worker.lease_lost', 'worker.execution_error', 'worker.control_applied', 'worker.control_rejected')
   const codingEventTypes = [
+    'coding_loop.protocol_mode', 'coding_loop.completed',
     'coding_loop.action_started', 'coding_loop.action_completed', 'coding_loop.action_reconciled',
     'coding_loop.action_rejected', 'coding_loop.action_limit', 'coding_loop.protocol_error',
     'coding_loop.no_progress', 'coding_loop.final_pending_validation',

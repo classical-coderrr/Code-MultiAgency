@@ -1559,3 +1559,13 @@ Agent Team 错误分析记录（历史重总结版）
 3. 保留原始验证失败、候选隔离和回归逻辑；没有改 Gate 或伪造修复成功。
 4. 更新过时的图往返测试，使其断言依赖关系与原始 Workflow 一致，并断言 Architecture 在 Requirement 之后执行。
 验证结果：定位修复用例通过；阶段二相关回归 378 项通过；更新后全量后端测试 822 通过、0 失败、1 跳过。Python compileall、前端 `npm run build` 和 `git diff --check` 通过；Executor 为 3,159 行。改动留在 `codex/latency-optimization`，尚未提交。
+
+【2026-09-25】工具型候选修复被本地 Codex 的严格 JSON Schema 拒绝（已修复，待确认）
+错误要点：此前复杂场景回归中，SWE 风格编码循环记录为 0 个工具动作。修复协调器已创建隔离 Candidate Workspace 并调用责任 Agent，但本地 Codex CLI 在模型生成工具动作前拒绝请求；随后退回单次整文件修复，因此工具循环没有真正参与修复。
+关键证据：历史 L5、L8、L9 的 `evidence.json` 记录 `coding_loop.repair_interrupted`；Provider 响应为 `invalid_json_schema`，明确指出 `properties.arguments` 必须为严格对象并声明 `additionalProperties: false`。该字段是动态工具参数对象，不能简单关闭额外属性，否则会破坏通用工具协议。
+根因分析：编码循环无条件向每个 Provider 提交 `response_schema`。云端兼容 Provider 可使用 JSON 输出模式，但本地 Codex CLI 的严格 schema 不能表达开放字段的动态 `arguments` 对象；Provider 能力没有暴露 JSON 模式支持情况，导致不兼容请求先失败、工具动作未启动。
+解决步骤：
+1. 为 Provider 能力增加 `supportsJsonMode`；未知和本地 Codex 默认关闭，显式支持 JSON 模式的模型配置才开启，编码循环据此选择带 Schema 的 JSON 模式或通用 JSON 提示协议。
+2. 无 JSON 模式的 Provider 不再收到 `response_schema`；仍由编码循环解析单个 JSON 对象、校验动作类型/参数、限制每轮一个工具动作并熔断重复无效响应。原候选隔离、责任 Agent 路由、SHA-256 精确补丁、目标 Gate、完整回归和晋升/撤回边界保持不变；验证器或合同缺陷仍归平台/架构处理，不派给代码 Agent。
+3. 增加 Candidate Workspace + CodingAgentLoop + RepairCoordinator 集成测试：Agent 读取错误文件后精确修补；验证目标 Gate 和完整回归前稳定成果不变，仅两道 Gate 通过后晋升候选。前端日志同步显示选择的协议模式和受控工具动作计数。
+验证结果：`backend/tests/test_repair_coordinator.py`、`test_coding_loop.py`、`test_provider_factory.py` 聚焦回归 37 项通过；后端全量测试 824 通过、0 失败、1 跳过；前端 `npm run build` 和 `git diff --check` 通过。未调用真实云端模型重跑历史 L5/L8/L9，真实 Provider 实际工具修复效果仍需回归 Run 验证。本功能在 `codex/tool-based-repair` 分支实现，尚未提交，等待用户确认。

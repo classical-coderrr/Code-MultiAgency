@@ -36,6 +36,7 @@ class ModelProfile:
             "modelFamily": self.family,
             "model": model_name,
             "supportsThinking": self.supports_thinking,
+            "supportsJsonMode": self.supports_json_mode,
             "supportedLevels": list(self.supported_levels),
             "defaultLevel": self.default_level if self.default_level in self.supported_levels else "off",
             "maxTokens": {"min": 1, "max": self.max_output_tokens},

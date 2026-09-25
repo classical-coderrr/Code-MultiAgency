@@ -133,6 +133,13 @@ class CodingAgentLoop:
         composed_system = self._system_prompt(
             role, self.gateway.policy.allowed_tools, self.gateway.policy.verification_gates,
         )
+        supports_json_mode = bool(self.provider.capabilities().get("supportsJsonMode", False))
+        if emit:
+            await emit("coding_loop.protocol_mode", {
+                "mode": "json_mode" if supports_json_mode else "prompt_only",
+                "schemaSent": supports_json_mode,
+                "reason": "模型支持 JSON 输出模式。" if supports_json_mode else "使用通用 JSON 提示协议；动态工具参数由编码循环校验。",
+            })
         if self.gateway.policy.exact_write_paths:
             composed_system += (
                 "\nCreating an owner-owned helper file outside the frozen file plan requires "
@@ -180,18 +187,20 @@ class CodingAgentLoop:
                     requested_max_tokens=request_tokens,
                 )
             try:
+                request_config = {
+                    "agent_id": "coding_agent_loop",
+                    "max_tokens": request_tokens,
+                    "effective_thinking": settings.thinking,
+                    "reasoning_effort": settings.thinking,
+                    "request_timeout": remaining_time,
+                }
+                if supports_json_mode:
+                    request_config["response_schema"] = self._response_schema(self.gateway.policy.allowed_tools)
                 response = await asyncio.wait_for(
                     self.provider.generate(
                         composed_system,
                         self._prompt(task, history, iteration, max_iterations),
-                        {
-                            "agent_id": "coding_agent_loop",
-                            "max_tokens": request_tokens,
-                            "effective_thinking": settings.thinking,
-                            "reasoning_effort": settings.thinking,
-                            "request_timeout": remaining_time,
-                            "response_schema": self._response_schema(self.gateway.policy.allowed_tools),
-                        },
+                        request_config,
                     ),
                     timeout=remaining_time,
                 )
@@ -468,7 +477,18 @@ class CodingAgentLoop:
                     })
             else:
                 raise CodingLoopError("达到轮数上限，未收到符合协议的 final；中间输出不作为成功。")
-        return CodingLoopResult(final_output, responses, tool_results, max(turn_no, iteration if 'iteration' in locals() else 0), False)
+        iterations = max(turn_no, iteration if 'iteration' in locals() else 0)
+        if emit:
+            await emit("coding_loop.completed", {
+                "iterations": iterations,
+                "toolCount": len(tool_results),
+                "successfulMutations": sum(
+                    1 for item in tool_results
+                    if item.success and item.tool in {"fs.create", "fs.patch", "fs.append"}
+                ),
+                "status": "pending_outer_validation",
+            })
+        return CodingLoopResult(final_output, responses, tool_results, iterations, False)
 
     def _missing_required_artifacts(
         self,

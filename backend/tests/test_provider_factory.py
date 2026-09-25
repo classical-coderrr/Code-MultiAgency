@@ -65,6 +65,7 @@ def test_qwen38_supports_thinking_levels_and_maps_auto_to_xhigh():
     assert capabilities["supportsThinking"] is True
     assert capabilities["supportedLevels"] == ["off", "low", "high", "max"]
     assert capabilities["defaultLevel"] == "max"
+    assert capabilities["supportsJsonMode"] is True
     assert provider.resolve_thinking("low") == ("low", None)
     assert provider.resolve_thinking("high") == ("high", None)
     assert provider.resolve_thinking("auto") == ("max", None)
@@ -129,6 +130,7 @@ def test_deepseek_auto_resolves_to_native_default():
     provider = ProviderFactory.create("deepseek", "https://api.deepseek.com", "test-key", "deepseek-chat")
 
     assert provider.resolve_thinking("auto") == ("high", None)
+    assert provider.capabilities()["supportsJsonMode"] is True
 
 
 def test_unknown_openai_compatible_model_downgrades_thinking():
@@ -208,6 +210,7 @@ def test_chatgpt_local_provider_uses_local_codex_runner_without_api_key():
     assert capabilities["transport"] == "codex_cli"
     assert capabilities["authentication"] == "local_login"
     assert capabilities["supportsThinking"] is False
+    assert capabilities["supportsJsonMode"] is False
 
 
 def test_local_codex_jsonl_parser_extracts_message_reasoning_and_usage():

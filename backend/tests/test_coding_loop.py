@@ -84,9 +84,12 @@ def test_coding_loop_creates_files_then_submits_unverified_candidate(tmp_path: P
         _response({"type": "final", "content": "Created index.html."}),
     ])
     events: list[str] = []
+    summaries: list[dict[str, Any]] = []
 
     async def emit(kind: str, payload: dict[str, Any]) -> None:
         events.append(kind)
+        if kind in {"coding_loop.protocol_mode", "coding_loop.completed"}:
+            summaries.append({"type": kind, **payload})
 
     result = asyncio.run(CodingAgentLoop(provider, gateway).run(
         workspace,
@@ -100,6 +103,33 @@ def test_coding_loop_creates_files_then_submits_unverified_candidate(tmp_path: P
     assert result.iterations == 3
     assert "coding_loop.protocol_error" in events
     assert "coding_loop.final_pending_validation" in events
+    assert all("response_schema" not in config for config in provider.configs)
+    assert summaries[0]["mode"] == "prompt_only"
+    assert summaries[-1]["toolCount"] == 1
+    assert summaries[-1]["successfulMutations"] == 1
+
+
+def test_coding_loop_only_sends_schema_when_provider_advertises_json_mode(tmp_path: Path) -> None:
+    workspace, gateway = _runtime(tmp_path)
+
+    class JsonModeProvider(ScriptedProvider):
+        def capabilities(self) -> dict[str, Any]:
+            return {**super().capabilities(), "supportsJsonMode": True}
+
+    provider = JsonModeProvider([
+        _response({"type": "tool_call", "tool": "fs.create", "arguments": {
+            "path": "index.html", "content": "<main>JSON mode</main>",
+        }}),
+        _response({"type": "final", "content": "Created the page."}),
+    ])
+    result = asyncio.run(CodingAgentLoop(provider, gateway).run(
+        workspace, "Create the page.",
+        config=CodingLoopConfig(max_iterations=3, max_tool_actions=2, max_tokens=100),
+    ))
+
+    assert result.tool_results[0].success
+    schema = provider.configs[0]["response_schema"]
+    assert schema["properties"]["arguments"]["type"] == "object"
 
 
 def test_coding_loop_can_repair_after_fixed_owner_verification(tmp_path: Path, monkeypatch) -> None:

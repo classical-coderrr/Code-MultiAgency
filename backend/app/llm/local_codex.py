@@ -40,6 +40,7 @@ class LocalCodexProvider(LLMProvider):
             "modelFamily": "codex",
             "model": self.model_name,
             "supportsThinking": False,
+            "supportsJsonMode": False,
             "supportedLevels": ["off"],
             "defaultLevel": "off",
             "maxTokens": {"min": 1, "max": 6000},

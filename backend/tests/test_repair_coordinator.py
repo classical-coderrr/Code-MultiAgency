@@ -1,8 +1,13 @@
 import asyncio
+import hashlib
+import json
 from pathlib import Path
 
+from app.code_company.coding_loop import CodingAgentLoop, CodingLoopConfig
 from app.code_company.failure_classifier import FailureClassifier
 from app.code_company.repair_coordinator import RepairCoordinator
+from app.llm.base import LLMProvider, LLMResponse
+from app.platform.tool_gateway import LocalToolGateway, ToolPolicy
 from app.platform.workspace import LocalWorkspaceService
 from app.workflow.artifact_validator import ArtifactValidationResult, ValidationCheck
 
@@ -324,3 +329,95 @@ def test_candidate_workspace_isolated_promoted_and_discarded(tmp_path: Path):
     discarded = service.discard_candidate(candidate)
     assert discarded.status == "REJECTED"
     assert not Path(candidate.worktree_path).exists()
+
+
+def test_coding_tool_repair_runs_inside_candidate_then_target_and_full_gates(tmp_path: Path):
+    service = LocalWorkspaceService(tmp_path / "workspaces")
+    stable = service.create_for_run("run-tool-repair")
+    original = 'class App { String value = "broken"; }'
+    stable_file = Path(stable.worktree_path) / "src" / "App.java"
+    stable_file.parent.mkdir(parents=True)
+    stable_file.write_text(original, encoding="utf-8")
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    events: list[str] = []
+    candidate_refs = []
+
+    class RepairProvider(LLMProvider):
+        def __init__(self):
+            self.outputs = [
+                {"type": "tool_call", "tool": "repo.read", "arguments": {"path": "src/App.java"}},
+                {"type": "tool_call", "tool": "fs.patch", "arguments": {
+                    "path": "src/App.java", "old_text": "broken", "new_text": "fixed",
+                    "expected_sha256": digest,
+                }},
+                {"type": "final", "content": "修复了编译器指出的字段值。"},
+            ]
+
+        async def generate(self, system_prompt, user_prompt, config=None):
+            return LLMResponse(
+                text=json.dumps(self.outputs.pop(0), ensure_ascii=False),
+                input_tokens=5,
+                output_tokens=10,
+                finish_reason="stop",
+            )
+
+    async def emit(event_type: str, payload: dict):
+        events.append(event_type)
+
+    async def prepare_candidate(plan: dict, attempt: int):
+        candidate = service.create_candidate(stable, f"repair-{attempt}", plan["owners"])
+        service.stage_candidate(candidate, [{"name": "src/App.java", "content": original}])
+        candidate_refs.append(candidate)
+
+    async def repair(plan: dict, attempt: int, strategy: str):
+        candidate = candidate_refs[-1]
+        gateway = LocalToolGateway(
+            service,
+            ToolPolicy.coding_loop(mutable_path_globs=("src/**",)),
+        )
+        result = await CodingAgentLoop(RepairProvider(), gateway).run(
+            candidate.as_dict(),
+            "依据编译器证据修复 src/App.java 中的 broken 字段值。",
+            config=CodingLoopConfig(
+                max_iterations=4,
+                max_tool_actions=2,
+                max_tokens=100,
+                required_artifacts=("src/App.java",),
+            ),
+            emit=emit,
+        )
+        assert result.verified is False  # Coding Agent cannot self-approve its repair.
+        assert [tool.tool for tool in result.tool_results] == ["repo.read", "fs.patch"]
+        assert stable_file.read_text(encoding="utf-8") == original
+        return ["src/App.java"], result.responses
+
+    async def validate_target(plan: dict, attempt: int) -> ArtifactValidationResult:
+        candidate_file = Path(candidate_refs[-1].worktree_path) / "src" / "App.java"
+        assert "fixed" in candidate_file.read_text(encoding="utf-8")
+        return validation("backend-compile", "backend", "passed", "目标编译 Gate 通过")
+
+    async def validate_full(attempt: int) -> ArtifactValidationResult:
+        candidate_file = Path(candidate_refs[-1].worktree_path) / "src" / "App.java"
+        assert "fixed" in candidate_file.read_text(encoding="utf-8")
+        assert stable_file.read_text(encoding="utf-8") == original
+        return validation("integration-api-contract", "backend", "passed", "完整回归通过")
+
+    async def commit_candidate(plan: dict, attempt: int):
+        service.promote_candidate(candidate_refs[-1])
+
+    outcome = asyncio.run(RepairCoordinator().coordinate(
+        validation("backend-compile", "backend", "failed", "编译失败：App.java 字段值错误"),
+        max_attempts=2,
+        repair=repair,
+        validate_target=validate_target,
+        validate_full=validate_full,
+        prepare_candidate=prepare_candidate,
+        commit_candidate=commit_candidate,
+        emit=emit,
+    ))
+
+    assert outcome.passed is True
+    assert outcome.attempts == 1
+    assert stable_file.read_text(encoding="utf-8") == 'class App { String value = "fixed"; }'
+    assert events.index("coding_loop.action_completed") < events.index("repair.target_gate_completed")
+    assert events.index("repair.target_gate_completed") < events.index("repair.full_regression_completed")
